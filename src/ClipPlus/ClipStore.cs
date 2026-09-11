@@ -577,14 +577,14 @@ internal sealed class ClipStore : IDisposable
 
     private static string HashOf(ClipKind kind, byte[] payload)
     {
-        using var sha = SHA256.Create();
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
 
         Span<byte> prefix = stackalloc byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(prefix, (int)kind);
 
-        sha.AppendData(prefix);
-        sha.AppendData(payload);
+        hash.AppendData(prefix);
+        hash.AppendData(payload);
 
-        return Convert.ToHexString(sha.GetHashAndReset());
+        return Convert.ToHexString(hash.GetHashAndReset());
     }
 }
