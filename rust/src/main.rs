@@ -36,6 +36,14 @@ fn main() {
 
     if !win::acquire_single_instance(&win::wide(INSTANCE_MUTEX)) {
         log::warn("another ClipPlus instance owns the single-instance mutex; exiting");
+        // Silent exit is the worst possible outcome here: the C# build and this
+        // one share the mutex on purpose, so "nothing happened" is almost always
+        // the tray instance still running.
+        win::message_box(
+            "ClipPlus",
+            "另一个 ClipPlus 正在运行，本次启动已退出。\n\nC# 版和 Rust 版共用同一个单实例锁，写的是同一个历史目录，\n同时运行会把每条剪贴捕获两遍。请先在托盘里退出那一个。",
+            win::MB_OK | win::MB_ICONWARNING,
+        );
         return;
     }
 
@@ -52,10 +60,9 @@ fn main() {
     );
 
     if hwnd == 0 {
-        log::error(&format!(
-            "CreateWindowExW failed, err {}",
-            win::last_error()
-        ));
+        let detail = format!("CreateWindowExW failed, err {}", win::last_error());
+        log::error(&detail);
+        win::message_box("ClipPlus", &detail, win::MB_OK | win::MB_ICONERROR);
         return;
     }
     log::info(&format!("message window ready (hwnd {hwnd:#x})"));
@@ -100,11 +107,13 @@ fn register_hotkey(hwnd: win::HWND) {
     ) {
         log::info(&format!("hotkey registered: {}", settings.hotkey));
     } else {
-        log::error(&format!(
-            "RegisterHotKey failed for '{}', err {} (most likely already taken)",
+        let detail = format!(
+            "RegisterHotKey failed for '{}', err {} (most likely already taken by another program)",
             settings.hotkey,
             win::last_error()
-        ));
+        );
+        log::error(&detail);
+        win::message_box("ClipPlus", &detail, win::MB_OK | win::MB_ICONERROR);
     }
 }
 

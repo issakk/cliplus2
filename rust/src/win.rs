@@ -55,6 +55,12 @@ pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
 pub const ERROR_ALREADY_EXISTS: u32 = 183;
 
+pub const MB_OK: u32 = 0x0000_0000;
+pub const MB_ICONERROR: u32 = 0x0000_0010;
+pub const MB_ICONWARNING: u32 = 0x0000_0030;
+pub const MB_SETFOREGROUND: u32 = 0x0001_0000;
+pub const MB_TOPMOST: u32 = 0x0004_0000;
+
 // --------------------------------------------------------------------- structs
 
 #[repr(C)]
@@ -255,6 +261,7 @@ extern "system" {
 
     fn SendInput(cInputs: u32, pInputs: *const INPUT, cbSize: i32) -> u32;
     fn SetProcessDpiAwarenessContext(value: HANDLE) -> i32;
+    fn MessageBoxW(hWnd: HWND, lpText: PCWSTR, lpCaption: PCWSTR, uType: u32) -> i32;
 }
 
 // ---------------------------------------------------------------- kernel32.dll
@@ -426,6 +433,21 @@ pub fn def_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> 
 
 pub fn post_quit_message(code: i32) {
     unsafe { PostQuitMessage(code) };
+}
+
+/// A daemon has no window to fail in front of, so a fatal startup problem would
+/// otherwise be completely invisible to whoever just double-clicked the exe.
+pub fn message_box(title: &str, text: &str, flags: u32) {
+    let title = wide(title);
+    let text = wide(text);
+    unsafe {
+        MessageBoxW(
+            0,
+            text.as_ptr(),
+            title.as_ptr(),
+            flags | MB_SETFOREGROUND | MB_TOPMOST,
+        );
+    }
 }
 
 pub fn destroy_window(hwnd: HWND) {
