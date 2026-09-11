@@ -71,7 +71,10 @@ fn read_locked() -> Option<ClipPayload> {
 }
 
 fn available(format: u32) -> bool {
-    unsafe { win::IsClipboardFormatAvailable(format) } != 0
+    // Bound first: a bare `unsafe { .. } != 0` tail expression parses as a
+    // statement followed by junk, not as a comparison.
+    let present = unsafe { win::IsClipboardFormatAvailable(format) };
+    present != 0
 }
 
 fn read_text() -> Option<String> {
