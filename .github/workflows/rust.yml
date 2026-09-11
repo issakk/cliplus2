@@ -39,7 +39,7 @@ jobs:
       # are public. rustc's diagnostics are not emitted in the GitHub format the
       # .NET SDK uses, so translate them here.
       - name: Surface rustc diagnostics as annotations
-        if: failure()
+        if: always()
         shell: bash
         run: |
           python - "$RUNNER_TEMP/build.log" <<'PY'
