@@ -20,6 +20,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
+// `watch` lives on the Watcher trait, not on the concrete watcher type.
+use notify::Watcher as _;
 use sha2::{Digest, Sha256};
 
 use crate::clip::{ClipKind, ClipPayload, ClipRecord};
