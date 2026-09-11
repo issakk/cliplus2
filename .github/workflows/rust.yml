@@ -1,0 +1,70 @@
+name: rust
+
+# Every push builds, so a broken commit never lingers unnoticed.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        working-directory: rust
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+
+      - name: Build
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # Workflow-run logs need repo admin to download, but check-run annotations
+      # are public. rustc's diagnostics are not emitted in the GitHub format the
+      # .NET SDK uses, so translate them here.
+      - name: Surface rustc diagnostics as annotations
+        if: failure()
+        shell: bash
+        run: |
+          python - "$RUNNER_TEMP/build.log" <<'PY'
+          import re, sys
+          log = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+          pattern = re.compile(
+              r'^(?P<lvl>error|warning)(?:\[[^\]]+\])?: (?P<msg>.+?)\n'
+              r'\s*-->\s*(?P<file>[^\s:]+):(?P<line>\d+):(?P<col>\d+)',
+              re.M)
+          seen = set()
+          for m in pattern.finditer(log):
+              lvl = 'error' if m['lvl'] == 'error' else 'warning'
+              key = (lvl, m['file'], m['line'], m['msg'])
+              if key in seen:
+                  continue
+              seen.add(key)
+              print(f"::{lvl} file={m['file']},line={m['line']},col={m['col']}::{m['msg']}")
+          print(f"surfaced {len(seen)} diagnostic(s)", file=sys.stderr)
+          PY
+
+      - name: Upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipPlus-rs-win-x64
+          path: rust/target/release/ClipPlus.exe
+          if-no-files-found: error
+          retention-days: 30

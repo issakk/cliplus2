@@ -7,6 +7,7 @@ obj/
 *.sln.docstates
 .vs/
 artifacts/
+target/
 dist/
 
 ## ReSharper / Rider
