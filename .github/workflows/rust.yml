@@ -14,7 +14,9 @@ env:
   CARGO_TERM_COLOR: never
 
 jobs:
-  build:
+  # Distinct from the .NET workflow's job name so check runs stay tellable
+  # apart by name alone.
+  rust-build:
     runs-on: windows-latest
 
     defaults:

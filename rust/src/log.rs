@@ -18,10 +18,6 @@ pub fn init(app_dir: &Path) {
     let _ = LOG_PATH.set(app_dir.join("clipplus.log"));
 }
 
-pub fn path() -> Option<&'static Path> {
-    LOG_PATH.get().map(PathBuf::as_path)
-}
-
 pub fn info(message: &str) {
     write("INFO ", message);
 }

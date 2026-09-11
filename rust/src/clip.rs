@@ -24,6 +24,8 @@ impl ClipKind {
         }
     }
 
+    /// Used when reading existing records back off disk.
+    #[allow(dead_code)]
     pub fn from_name(name: &str) -> ClipKind {
         match name {
             "image" => ClipKind::Image,
