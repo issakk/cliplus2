@@ -1,8 +1,13 @@
 #![windows_subsystem = "windows"]
 
+mod clip;
+mod clipboard;
 mod log;
 mod settings;
+mod store;
 mod win;
+
+use crate::clip::ClipPayload;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
@@ -16,6 +21,7 @@ const HOTKEY_ID: i32 = 0xC1A0;
 
 static SETTINGS: OnceLock<settings::Settings> = OnceLock::new();
 static LAST_CLIPBOARD_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+static STORE: OnceLock<store::Store> = OnceLock::new();
 
 fn main() {
     log::init(&settings::app_dir());
@@ -32,7 +38,7 @@ fn main() {
         settings.sync_root.display(),
         settings.hotkey
     ));
-    let _ = SETTINGS.set(settings);
+    let _ = SETTINGS.set(settings.clone());
 
     if !win::acquire_single_instance(&win::wide(INSTANCE_MUTEX)) {
         log::warn("another ClipPlus instance owns the single-instance mutex; exiting");
@@ -46,6 +52,19 @@ fn main() {
         );
         return;
     }
+
+    // Only now that we know we are the single running instance: building the
+    // store walks the whole history folder, which would be wasted work for a
+    // second launch that is about to exit.
+    let _ = STORE.set(store::Store::new(settings));
+
+    // Hashing and disk I/O live on this thread, so the window thread never
+    // blocks on either.
+    std::thread::spawn(|| {
+        if let Some(store) = STORE.get() {
+            store.run_writer();
+        }
+    });
 
     win::set_per_monitor_dpi_aware();
 
@@ -129,7 +148,15 @@ extern "system" fn wnd_proc(
             // several; the sequence number filters those for free.
             let sequence = win::clipboard_sequence_number();
             if LAST_CLIPBOARD_SEQUENCE.swap(sequence, Ordering::SeqCst) != sequence {
-                log::info(&format!("clipboard changed (sequence {sequence})"));
+                if let Some(payload) = clipboard::read() {
+                    let description = match &payload {
+                        ClipPayload::Text(text) => format!("text, {} chars", text.chars().count()),
+                        ClipPayload::Files(paths) => format!("{} file(s)", paths.len()),
+                        ClipPayload::Image(png) => format!("image, {} PNG bytes", png.len()),
+                    };
+                    log::info(&format!("captured {description}"));
+                    store::enqueue(payload);
+                }
             }
             0
         }

@@ -240,15 +240,14 @@ extern "system" {
     fn AddClipboardFormatListener(hwnd: HWND) -> i32;
     fn RemoveClipboardFormatListener(hwnd: HWND) -> i32;
     fn GetClipboardSequenceNumber() -> u32;
-
-    fn OpenClipboard(hWndNewOwner: HWND) -> i32;
-    fn CloseClipboard() -> i32;
-    fn EmptyClipboard() -> i32;
-    fn IsClipboardFormatAvailable(format: u32) -> i32;
-    fn GetClipboardData(uFormat: u32) -> HANDLE;
-    fn SetClipboardData(uFormat: u32, hMem: HANDLE) -> HANDLE;
-    fn RegisterClipboardFormatW(lpszFormat: PCWSTR) -> u32;
-    fn EnumClipboardFormats(format: u32) -> u32;
+    pub fn OpenClipboard(hWndNewOwner: HWND) -> i32;
+    pub fn CloseClipboard() -> i32;
+    pub fn IsClipboardFormatAvailable(format: u32) -> i32;
+    pub fn GetClipboardData(uFormat: u32) -> HANDLE;
+    pub fn SetClipboardData(uFormat: u32, hMem: HANDLE) -> HANDLE;
+    pub fn RegisterClipboardFormatW(lpszFormat: PCWSTR) -> u32;
+    pub fn EnumClipboardFormats(format: u32) -> u32;
+    pub fn EmptyClipboard() -> i32;
 
     fn GetForegroundWindow() -> HWND;
     fn SetForegroundWindow(hWnd: HWND) -> i32;
@@ -273,9 +272,9 @@ extern "system" {
     fn GetLocalTime(lpSystemTime: *mut SYSTEMTIME);
     fn GlobalAlloc(uFlags: u32, dwBytes: usize) -> HGLOBAL;
     fn GlobalFree(hMem: HGLOBAL) -> HGLOBAL;
-    fn GlobalLock(hMem: HGLOBAL) -> *mut c_void;
-    fn GlobalUnlock(hMem: HGLOBAL) -> i32;
-    fn GlobalSize(hMem: HGLOBAL) -> usize;
+    pub fn GlobalLock(hMem: HGLOBAL) -> *mut c_void;
+    pub fn GlobalUnlock(hMem: HGLOBAL) -> i32;
+    pub fn GlobalSize(hMem: HGLOBAL) -> usize;
     fn CreateMutexW(
         lpMutexAttributes: *const c_void,
         bInitialOwner: i32,
@@ -289,6 +288,13 @@ extern "system" {
         lpUniversalTime: *const SYSTEMTIME,
         lpLocalTime: *mut SYSTEMTIME,
     ) -> i32;
+}
+
+// ---------------------------------------------------------------- shell32.dll
+
+#[link(name = "shell32")]
+extern "system" {
+    pub fn DragQueryFileW(hDrop: HANDLE, iFile: u32, lpszFile: *mut u16, cch: u32) -> u32;
 }
 
 // ------------------------------------------------------------------- helpers
