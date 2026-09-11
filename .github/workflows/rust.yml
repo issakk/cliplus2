@@ -1,6 +1,5 @@
 name: rust
 
-# Every push builds, so a broken commit never lingers unnoticed.
 on:
   push:
   pull_request:
@@ -10,7 +9,9 @@ permissions:
   contents: read
 
 env:
-  CARGO_TERM_COLOR: always
+  # Forced colour puts ANSI escapes into the captured log, which both breaks the
+  # diagnostic parser below and makes the log unreadable on its own.
+  CARGO_TERM_COLOR: never
 
 jobs:
   build:
@@ -36,28 +37,67 @@ jobs:
           cargo build --release 2>&1 | tee "$RUNNER_TEMP/build.log"
 
       # Workflow-run logs need repo admin to download, but check-run annotations
-      # are public. rustc's diagnostics are not emitted in the GitHub format the
-      # .NET SDK uses, so translate them here.
-      - name: Surface rustc diagnostics as annotations
+      # are public. rustc does not emit GitHub-format diagnostics the way the
+      # .NET SDK does, so translate them here. The tail fallback exists so a
+      # failing build can never be invisible just because the parse missed.
+      - name: Surface rustc diagnostics
         if: always()
         shell: bash
         run: |
-          python - "$RUNNER_TEMP/build.log" <<'PY'
-          import re, sys
-          log = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+          LOG="$RUNNER_TEMP/build.log"
+
+          if ! command -v python >/dev/null 2>&1; then
+            echo "::warning::python unavailable; falling back to raw grep"
+            grep -nE '^(error|warning)' "$LOG" | head -40 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 0
+          fi
+
+          python - "$LOG" <<'PY'
+          import io
+          import re
+          import sys
+
+          def escape(text):
+              return text.replace("%", "%25").replace("\r", "").replace("\n", " ")
+
+          path = sys.argv[1]
+          try:
+              raw = io.open(path, encoding="utf-8", errors="replace").read()
+          except OSError as err:
+              print(f"::error::build log unreadable: {escape(str(err))}")
+              raise SystemExit(0)
+
+          log = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw)
+
           pattern = re.compile(
-              r'^(?P<lvl>error|warning)(?:\[[^\]]+\])?: (?P<msg>.+?)\n'
-              r'\s*-->\s*(?P<file>[^\s:]+):(?P<line>\d+):(?P<col>\d+)',
-              re.M)
+              r"^(?P<lvl>error|warning)(?:\[[^\]]+\])?: (?P<msg>.+?)\n"
+              r"\s*-->\s*(?P<file>[^\s:]+):(?P<line>\d+):(?P<col>\d+)",
+              re.M,
+          )
+
           seen = set()
-          for m in pattern.finditer(log):
-              lvl = 'error' if m['lvl'] == 'error' else 'warning'
-              key = (lvl, m['file'], m['line'], m['msg'])
+          for match in pattern.finditer(log):
+              level = "error" if match["lvl"] == "error" else "warning"
+              key = (level, match["file"], match["line"], match["msg"])
               if key in seen:
                   continue
               seen.add(key)
-              print(f"::{lvl} file={m['file']},line={m['line']},col={m['col']}::{m['msg']}")
-          print(f"surfaced {len(seen)} diagnostic(s)", file=sys.stderr)
+              print(
+                  "::{} file={},line={},col={}::{}".format(
+                      level,
+                      escape(match["file"]),
+                      match["line"],
+                      match["col"],
+                      escape(match["msg"]),
+                  )
+              )
+
+          if not seen:
+              lines = [line for line in log.strip().splitlines() if line.strip()]
+              for line in lines[-25:]:
+                  print(f"::error::log| {escape(line[:400])}")
           PY
 
       - name: Upload artifact
