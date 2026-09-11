@@ -2,6 +2,7 @@
 
 mod clip;
 mod clipboard;
+mod index;
 mod log;
 mod settings;
 mod store;
@@ -10,7 +11,7 @@ mod win;
 use crate::clip::ClipPayload;
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// Deliberately the same name the C# build uses. Both versions write into the
 /// same machine-sharded history folder, so letting them run together would
@@ -21,7 +22,7 @@ const HOTKEY_ID: i32 = 0xC1A0;
 
 static SETTINGS: OnceLock<settings::Settings> = OnceLock::new();
 static LAST_CLIPBOARD_SEQUENCE: AtomicU32 = AtomicU32::new(0);
-static STORE: OnceLock<store::Store> = OnceLock::new();
+static STORE: OnceLock<Arc<store::Store>> = OnceLock::new();
 
 fn main() {
     log::init(&settings::app_dir());
@@ -56,15 +57,26 @@ fn main() {
     // Only now that we know we are the single running instance: building the
     // store walks the whole history folder, which would be wasted work for a
     // second launch that is about to exit.
-    let _ = STORE.set(store::Store::new(settings));
+    let store = Arc::new(store::Store::new(settings));
+    let _ = STORE.set(Arc::clone(&store));
 
-    // Hashing and disk I/O live on this thread, so the window thread never
-    // blocks on either.
-    std::thread::spawn(|| {
-        if let Some(store) = STORE.get() {
-            store.run_writer();
-        }
-    });
+    // Hashing and disk I/O never touch the window thread.
+    {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || store.run_writer());
+    }
+    {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || store.run_rescan_loop());
+    }
+    {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || store.run_retention_loop());
+    }
+
+    // Bound to a named variable on purpose: dropping the watcher silently stops
+    // every filesystem event, and `let _ =` would drop it right here.
+    let _watcher = store.start_watcher();
 
     win::set_per_monitor_dpi_aware();
 
@@ -155,7 +167,9 @@ extern "system" fn wnd_proc(
                         ClipPayload::Image(png) => format!("image, {} PNG bytes", png.len()),
                     };
                     log::info(&format!("captured {description}"));
-                    store::enqueue(payload);
+                    if let Some(store) = STORE.get() {
+                        store.enqueue(payload);
+                    }
                 }
             }
             0

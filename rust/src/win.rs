@@ -332,14 +332,19 @@ pub fn unix_ms_to_file_time(ms: i64) -> FILETIME {
 /// Done through Win32 rather than a date crate on purpose: the history folder
 /// is bucketed by LOCAL year-month because the C# build wrote it that way, and
 /// getting a correct local offset is the one thing time crates are awkward at.
-pub fn local_year_month(ms: i64) -> (u16, u16) {
+/// Local wall-clock time for a unix timestamp.
+///
+/// Done through Win32 rather than a date crate on purpose: the history folder
+/// is bucketed by LOCAL year-month because the C# build wrote it that way, and
+/// getting a correct local offset is the one thing time crates are awkward at.
+pub fn local_datetime(ms: i64) -> SYSTEMTIME {
     let file_time = unix_ms_to_file_time(ms);
     let mut utc = SYSTEMTIME::default();
     let mut local = SYSTEMTIME::default();
 
     unsafe {
         if FileTimeToSystemTime(&file_time, &mut utc) == 0 {
-            return (1970, 1);
+            return SYSTEMTIME::default();
         }
 
         if SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) == 0 {
@@ -348,7 +353,16 @@ pub fn local_year_month(ms: i64) -> (u16, u16) {
         }
     }
 
-    (local.year, local.month)
+    local
+}
+
+pub fn local_year_month(ms: i64) -> (u16, u16) {
+    let local = local_datetime(ms);
+    if local.year == 0 {
+        (1970, 1)
+    } else {
+        (local.year, local.month)
+    }
 }
 
 pub fn set_per_monitor_dpi_aware() {
