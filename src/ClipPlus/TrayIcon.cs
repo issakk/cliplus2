@@ -15,12 +15,13 @@ internal sealed class TrayIcon : IDisposable
     private readonly System.Windows.Forms.NotifyIcon _notifyIcon;
     private readonly Icon _icon;
 
-    public TrayIcon(Action openHistory, Action openSyncFolder, Action rescan, Action exit)
+    public TrayIcon(Action openHistory, Action openSettings, Action openSyncFolder, Action rescan, Action exit)
     {
         _icon = BuildIcon();
 
         var menu = new System.Windows.Forms.ContextMenuStrip();
         menu.Items.Add("打开剪贴板历史", null, (_, _) => openHistory());
+        menu.Items.Add("设置…", null, (_, _) => openSettings());
         menu.Items.Add("重新扫描同步目录", null, (_, _) => rescan());
         menu.Items.Add("打开同步文件夹", null, (_, _) => openSyncFolder());
 

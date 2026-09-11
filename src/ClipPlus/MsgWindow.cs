@@ -59,6 +59,18 @@ internal sealed class MsgWindow : IDisposable
         return _hotkeyRegistered;
     }
 
+    /// <summary>Swaps the hotkey without restarting the app.</summary>
+    public bool ReregisterHotkey(uint modifiers, uint key)
+    {
+        if (_hotkeyRegistered)
+        {
+            Native.UnregisterHotKey(_source.Handle, HotkeyId);
+            _hotkeyRegistered = false;
+        }
+
+        return RegisterHotkey(modifiers, key);
+    }
+
     public void Dispose()
     {
         Native.RemoveClipboardFormatListener(_source.Handle);

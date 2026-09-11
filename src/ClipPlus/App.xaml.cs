@@ -57,7 +57,7 @@ public partial class App : Application
         var hotkeyOk = _settings.ParseHotkey() is { } hotkey
                        && _msg.RegisterHotkey(hotkey.Mods, hotkey.Vk);
 
-        _tray = new TrayIcon(ShowPopup, OpenSyncFolder, _store.Rescan, ExitApp);
+        _tray = new TrayIcon(ShowPopup, OpenSettings, OpenSyncFolder, _store.Rescan, ExitApp);
 
         _tray.Notify(
             "ClipPlus",
@@ -173,6 +173,47 @@ public partial class App : Application
         catch (Exception ex)
         {
             Log.Error("cannot open sync folder: " + _settings.SyncRoot, ex);
+        }
+    }
+
+    private void OpenSettings()
+    {
+        // The popup is topmost; it would sit on top of the dialog.
+        _popup.Hide();
+
+        var previousOverride = _settings.SyncRootOverride;
+
+        var window = new SettingsWindow(_settings);
+        if (window.ShowDialog() != true)
+        {
+            return;
+        }
+
+        _settings.Save();
+
+        // The hotkey can be swapped live. Everything else is read at use time,
+        // except the sync root, which is baked into the running store.
+        var hotkeyOk = _settings.ParseHotkey() is { } hotkey
+                       && _msg.ReregisterHotkey(hotkey.Mods, hotkey.Vk);
+
+        var rootChanged = !string.Equals(
+            previousOverride,
+            _settings.SyncRootOverride,
+            StringComparison.OrdinalIgnoreCase);
+
+        Log.Info($"settings saved (hotkeyOk={hotkeyOk}, syncRootChanged={rootChanged})");
+
+        if (rootChanged)
+        {
+            _tray.Notify("ClipPlus", "同步目录已保存，重启 ClipPlus 后生效");
+        }
+        else if (hotkeyOk)
+        {
+            _tray.Notify("ClipPlus", $"设置已保存，热键 {_settings.Hotkey}");
+        }
+        else
+        {
+            _tray.Notify("ClipPlus", $"热键 {_settings.Hotkey} 注册失败，换一个再试", isError: true);
         }
     }
 

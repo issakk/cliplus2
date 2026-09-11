@@ -31,6 +31,7 @@ internal sealed class ClipStore : IDisposable
 {
     private const string JsonSuffix = ".clip.json";
     private const string BinSuffix = ".bin";
+    private const string PinSuffix = ".pin";
 
     private const int PreviewChars = 160;
     private const int RetainedChars = 512;
@@ -54,12 +55,14 @@ internal sealed class ClipStore : IDisposable
 
     private readonly ConcurrentQueue<string> _pendingPaths = new();
     private readonly ConcurrentDictionary<string, byte> _pendingSeen = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentQueue<string> _pendingDeletes = new();
     private readonly CancellationTokenSource _cts = new();
 
     private FileSystemWatcher? _watcher;
     private Task? _writeLoop;
     private Task? _ingestLoop;
     private Task? _rescanLoop;
+    private Task? _retentionLoop;
 
     public ClipStore(Settings settings) => _settings = settings;
 
@@ -97,6 +100,7 @@ internal sealed class ClipStore : IDisposable
         _writeLoop = Task.Run(WriteLoopAsync);
         _ingestLoop = Task.Run(IngestLoopAsync);
         _rescanLoop = Task.Run(RescanLoopAsync);
+        _retentionLoop = Task.Run(RetentionLoopAsync);
 
         try
         {
@@ -111,6 +115,7 @@ internal sealed class ClipStore : IDisposable
             _watcher.Created += (_, e) => Enqueue(e.FullPath);
             _watcher.Changed += (_, e) => Enqueue(e.FullPath);
             _watcher.Renamed += (_, e) => Enqueue(e.FullPath);
+            _watcher.Deleted += (_, e) => EnqueueDeletion(e.FullPath);
             _watcher.Error += (_, e) => Log.Warn("watcher error: " + e.GetException().Message);
             _watcher.EnableRaisingEvents = true;
         }
@@ -135,10 +140,26 @@ internal sealed class ClipStore : IDisposable
 
             // Enumerate everything and filter in code: Directory.EnumerateFiles
             // pattern matching goes through 8.3 short names and can false-positive.
+            // Pin state is a set of empty marker files. Rebuilding the whole set on
+            // every pass is what lets a pin toggled on another machine show up here.
+            var pinned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var path in Directory.EnumerateFiles(_settings.SyncRoot, "*", SearchOption.AllDirectories))
             {
+                if (path.EndsWith(PinSuffix, StringComparison.OrdinalIgnoreCase))
+                {
+                    var pinnedStem = StemOf(path, PinSuffix);
+                    if (pinnedStem.Length > 0)
+                    {
+                        pinned.Add(pinnedStem);
+                    }
+
+                    continue;
+                }
+
                 Enqueue(path);
             }
+
+            ApplyPinState(pinned);
         }
         catch (Exception ex)
         {
@@ -157,9 +178,25 @@ internal sealed class ClipStore : IDisposable
         lock (_gate)
         {
             var result = new List<ClipItem>(Math.Min(limit, _items.Count));
+            // Pinned rows first, then newest first. Two passes rather than a sort,
+            // so the stored list can stay purely time-ordered.
             foreach (var item in _items)
             {
-                if (searching && !Matches(item, needle!))
+                if (!item.IsPinned || (searching && !Matches(item, needle!)))
+                {
+                    continue;
+                }
+
+                result.Add(item);
+                if (result.Count >= limit)
+                {
+                    return result;
+                }
+            }
+
+            foreach (var item in _items)
+            {
+                if (item.IsPinned || (searching && !Matches(item, needle!)))
                 {
                     continue;
                 }
@@ -203,6 +240,44 @@ internal sealed class ClipStore : IDisposable
         }
     }
 
+    /// <summary>
+    /// Pins or unpins a clip by creating or removing its empty .pin marker.
+    ///
+    /// The marker lives in the synced folder on purpose: pinning is most useful
+    /// for exactly the snippets you want on every machine, so it has to travel.
+    /// Two machines creating the same marker write identical (empty) content,
+    /// which no sync client treats as a conflict. Only "A unpins while B pins"
+    /// can resurrect a pin, and unpinning again is a one-key fix.
+    /// </summary>
+    public bool SetPinned(ClipItem item, bool pinned)
+    {
+        if (item.PinPath.Length == 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (pinned)
+            {
+                File.WriteAllBytes(item.PinPath, Array.Empty<byte>());
+            }
+            else if (File.Exists(item.PinPath))
+            {
+                File.Delete(item.PinPath);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error("pin marker write failed: " + item.PinPath, ex);
+            return false;
+        }
+
+        item.IsPinned = pinned;
+        Log.Info((pinned ? "pinned " : "unpinned ") + item.Stem);
+        return true;
+    }
+
     public void Dispose()
     {
         // Drain queued captures first: the write loop exits once the channel completes.
@@ -228,7 +303,7 @@ internal sealed class ClipStore : IDisposable
             // nothing useful to do while exiting
         }
 
-        foreach (var loop in new[] { _ingestLoop, _rescanLoop })
+        foreach (var loop in new[] { _ingestLoop, _rescanLoop, _retentionLoop })
         {
             try
             {
@@ -245,6 +320,20 @@ internal sealed class ClipStore : IDisposable
     }
 
     // ------------------------------------------------------------------ internals
+
+    private void EnqueueDeletion(string path)
+    {
+        if (!path.EndsWith(JsonSuffix, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var stem = StemOf(path, JsonSuffix);
+        if (stem.Length > 0)
+        {
+            _pendingDeletes.Enqueue(stem);
+        }
+    }
 
     private void Enqueue(string path)
     {
@@ -297,6 +386,14 @@ internal sealed class ClipStore : IDisposable
             // Cleared before draining so anything enqueued during the drain is retried.
             _pendingSeen.Clear();
 
+            // Deletions arrive either from our own retention pass or from the sync
+            // client applying a delete made elsewhere. Dropping the row matters:
+            // otherwise the list offers clips whose files are already gone.
+            while (_pendingDeletes.TryDequeue(out var deletedStem))
+            {
+                ForgetStem(deletedStem);
+            }
+
             while (_pendingPaths.TryDequeue(out var path))
             {
                 try
@@ -331,7 +428,7 @@ internal sealed class ClipStore : IDisposable
 
     private void TryIndex(string path)
     {
-        var stem = StemOf(path);
+        var stem = StemOf(path, JsonSuffix);
         if (stem.Length == 0)
         {
             return;
@@ -363,6 +460,7 @@ internal sealed class ClipStore : IDisposable
 
         var kind = ParseKind(record.kind);
         var hasBlob = !string.IsNullOrEmpty(record.blob);
+        var pinPath = PinPathOf(path);
         var item = new ClipItem(record.id, record.at, record.machine, kind, record.hash ?? "", path)
         {
             Text = record.text ?? "",
@@ -370,6 +468,8 @@ internal sealed class ClipStore : IDisposable
             BlobPath = hasBlob ? Path.Combine(Path.GetDirectoryName(path) ?? "", record.blob!) : "",
             Preview = BuildPreview(kind, record.text),
             Meta = BuildMeta(kind, record.at, record.machine, hasBlob),
+            PinPath = pinPath,
+            IsPinned = File.Exists(pinPath),
         };
 
         lock (_gate)
@@ -482,6 +582,158 @@ internal sealed class ClipStore : IDisposable
         }
     }
 
+    private static string PinPathOf(string jsonPath)
+        => jsonPath.EndsWith(JsonSuffix, StringComparison.OrdinalIgnoreCase)
+            ? jsonPath[..^JsonSuffix.Length] + PinSuffix
+            : "";
+
+    /// <summary>Re-applies the authoritative pin set gathered by a full scan.</summary>
+    private void ApplyPinState(HashSet<string> pinned)
+    {
+        lock (_gate)
+        {
+            foreach (var item in _items)
+            {
+                item.IsPinned = pinned.Contains(item.Stem);
+            }
+        }
+    }
+
+    private void ForgetStem(string stem)
+    {
+        if (stem.Length == 0)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (!_byStem.Remove(stem, out var item))
+            {
+                return;
+            }
+
+            _items.Remove(item);
+
+            // Only drop the hash entry when it points at this exact clip: another
+            // machine may hold a duplicate with the same content that still owns it.
+            if (_byHash.TryGetValue(item.Hash, out var cached) && ReferenceEquals(cached, item))
+            {
+                _byHash.Remove(item.Hash);
+            }
+        }
+    }
+
+    private static void DeleteFiles(ClipItem item)
+    {
+        DeleteFile(item.JsonPath);
+
+        if (item.HasBlob && item.BlobPath.Length > 0)
+        {
+            DeleteFile(item.BlobPath);
+        }
+
+        if (item.PinPath.Length > 0)
+        {
+            DeleteFile(item.PinPath);
+        }
+    }
+
+    private static void DeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error("delete failed: " + path, ex);
+        }
+    }
+
+    /// <summary>
+    /// Retention. Deliberately confined to THIS machine's own directory: the
+    /// single-writer-per-directory invariant is what makes the folder conflict
+    /// free, and it is worth more than reclaiming a retired machine's disk.
+    /// Pinned clips are never eligible.
+    /// </summary>
+    private void PruneOldClips()
+    {
+        var days = _settings.RetentionDays;
+        if (days <= 0)
+        {
+            return;
+        }
+
+        var cutoff = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                     - (long)TimeSpan.FromDays(days).TotalMilliseconds;
+
+        var doomed = new List<ClipItem>();
+        lock (_gate)
+        {
+            foreach (var item in _items)
+            {
+                if (item.At < cutoff && !item.IsPinned && item.Machine == Settings.MachineId)
+                {
+                    doomed.Add(item);
+                }
+            }
+        }
+
+        foreach (var item in doomed)
+        {
+            DeleteFiles(item);
+            ForgetStem(item.Stem);
+        }
+
+        if (doomed.Count > 0)
+        {
+            Log.Info($"retention removed {doomed.Count} clip(s) older than {days} day(s)");
+        }
+    }
+
+    private async Task RetentionLoopAsync()
+    {
+        // Let the first scan settle before deleting anything.
+        if (!await DelayAsync(TimeSpan.FromMinutes(1)).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        while (!_cts.IsCancellationRequested)
+        {
+            try
+            {
+                PruneOldClips();
+            }
+            catch (Exception ex)
+            {
+                Log.Error("retention failed", ex);
+            }
+
+            if (!await DelayAsync(TimeSpan.FromHours(6)).ConfigureAwait(false))
+            {
+                return;
+            }
+        }
+    }
+
+    private async Task<bool> DelayAsync(TimeSpan span)
+    {
+        try
+        {
+            await Task.Delay(span, _cts.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+    }
+
     private void InsertSorted(ClipItem item) => InsertSortedCore(_items, item);
 
     /// <summary>Binary search keeps <paramref name="items"/> descending by At without re-sorting on every query.</summary>
@@ -509,11 +761,11 @@ internal sealed class ClipStore : IDisposable
         => item.Text.Contains(needle, StringComparison.OrdinalIgnoreCase)
            || item.Meta.Contains(needle, StringComparison.OrdinalIgnoreCase);
 
-    private static string StemOf(string path)
+    private static string StemOf(string path, string suffix)
     {
         var name = Path.GetFileName(path);
-        return name.EndsWith(JsonSuffix, StringComparison.OrdinalIgnoreCase)
-            ? name[..^JsonSuffix.Length]
+        return name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)
+            ? name[..^suffix.Length]
             : "";
     }
 

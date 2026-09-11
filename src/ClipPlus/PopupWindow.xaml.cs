@@ -150,6 +150,13 @@ public partial class PopupWindow : Window
 
     private void OnPreviewKeyDown(object? sender, KeyEventArgs e)
     {
+        if (e.Key == Key.P && (Keyboard.Modifiers & ModifierKeys.Control) != 0)
+        {
+            e.Handled = true;
+            TogglePin();
+            return;
+        }
+
         switch (e.Key)
         {
             case Key.Escape:
@@ -206,6 +213,28 @@ public partial class PopupWindow : Window
         if (ResultList.SelectedItem is ClipItem item)
         {
             Commit?.Invoke(item);
+        }
+    }
+
+    private void TogglePin()
+    {
+        if (ResultList.SelectedItem is not ClipItem item)
+        {
+            return;
+        }
+
+        if (!_store.SetPinned(item, !item.IsPinned))
+        {
+            return;
+        }
+
+        // Pinning moves the row to the top, so follow the item rather than the index.
+        Reload();
+        var moved = ResultList.Items.IndexOf(item);
+        if (moved >= 0)
+        {
+            ResultList.SelectedIndex = moved;
+            ResultList.ScrollIntoView(item);
         }
     }
 }

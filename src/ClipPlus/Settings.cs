@@ -32,6 +32,13 @@ internal sealed class Settings
     /// <summary>Safety-net re-scan period for missed filesystem watcher events.</summary>
     public int RescanSeconds { get; set; } = 60;
 
+    /// <summary>
+    /// Delete this machine's own clips older than N days. 0 disables it: a
+    /// background process that deletes user data stays opt-in. Pinned clips are
+    /// never touched regardless of age.
+    /// </summary>
+    public int RetentionDays { get; set; }
+
     public bool CaptureText { get; set; } = true;
     public bool CaptureImages { get; set; } = true;
     public bool CaptureFiles { get; set; } = true;
@@ -100,12 +107,14 @@ internal sealed class Settings
         File.WriteAllText(SettingsPath, JsonSerializer.Serialize(this, JsonOpts));
     }
 
+    public (uint Mods, uint Vk)? ParseHotkey() => ParseHotkeyText(Hotkey);
+
     /// <summary>Returns null when the hotkey string is unusable.</summary>
-    public (uint Mods, uint Vk)? ParseHotkey()
+    public static (uint Mods, uint Vk)? ParseHotkeyText(string? text)
     {
         uint mods = 0;
         uint vk = 0;
-        var parts = (Hotkey ?? "").Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var parts = (text ?? "").Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         if (parts.Length == 0)
         {
             return null;

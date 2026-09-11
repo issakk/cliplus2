@@ -99,4 +99,17 @@ public sealed class ClipItem
 
     /// <summary>Secondary line: kind, time, origin.</summary>
     public string Meta { get; set; } = "";
+
+    /// <summary>Path of the empty marker file whose existence means "pinned".</summary>
+    public string PinPath { get; set; } = "";
+
+    /// <summary>
+    /// True when the sibling .pin marker exists. Pin state lives in its own
+    /// empty file rather than a field on the clip, so the clip itself stays
+    /// immutable — pinning never rewrites a file that is already synced.
+    /// </summary>
+    public bool IsPinned { get; set; }
+
+    /// <summary>Rendered as a star in the list. Refreshed when the list reloads.</summary>
+    public string PinMark => IsPinned ? "★" : "";
 }

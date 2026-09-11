@@ -1,0 +1,83 @@
+<Window x:Class="ClipPlus.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="ClipPlus 设置"
+        Width="540"
+        SizeToContent="Height"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen"
+        FontFamily="Segoe UI, Microsoft YaHei UI"
+        FontSize="13"
+        Background="#FF1E1E1E"
+        Foreground="#FFE6E6E6">
+
+  <StackPanel Margin="20">
+
+    <TextBlock Text="热键" FontWeight="SemiBold" />
+    <TextBox x:Name="HotkeyBox"
+             Margin="0,5,0,0"
+             Padding="7,5"
+             BorderThickness="0"
+             Background="#26FFFFFF"
+             Foreground="#F0F0F0"
+             CaretBrush="#F0F0F0"
+             SelectionBrush="#5470B0" />
+    <TextBlock Text="Ctrl / Alt / Shift / Win 里至少一个，加一个键（A-Z、0-9、F1-F24）。例如 Win+Alt+V。保存后立即生效。"
+               Foreground="#99FFFFFF"
+               FontSize="11"
+               TextWrapping="Wrap"
+               Margin="0,5,0,16" />
+
+    <TextBlock Text="自动清理（天）" FontWeight="SemiBold" />
+    <TextBox x:Name="RetentionBox"
+             Width="100"
+             HorizontalAlignment="Left"
+             Margin="0,5,0,0"
+             Padding="7,5"
+             BorderThickness="0"
+             Background="#26FFFFFF"
+             Foreground="#F0F0F0"
+             CaretBrush="#F0F0F0"
+             SelectionBrush="#5470B0" />
+    <TextBlock Text="删除本机超过 N 天的记录，默认 0 = 不清理。固定（Ctrl+P）过的条目永远不会被删。只会清理本机自己的目录，不动别的机器。"
+               Foreground="#99FFFFFF"
+               FontSize="11"
+               TextWrapping="Wrap"
+               Margin="0,5,0,16" />
+
+    <TextBlock Text="同步目录" FontWeight="SemiBold" />
+    <TextBox x:Name="SyncRootBox"
+             Margin="0,5,0,0"
+             Padding="7,5"
+             BorderThickness="0"
+             Background="#26FFFFFF"
+             Foreground="#F0F0F0"
+             CaretBrush="#F0F0F0"
+             SelectionBrush="#5470B0" />
+    <TextBlock Text="留空则自动探测 OneDrive\ClipPlus。改动需要重启才生效。"
+               Foreground="#99FFFFFF"
+               FontSize="11"
+               TextWrapping="Wrap"
+               Margin="0,5,0,16" />
+
+    <TextBlock Text="捕获类型" FontWeight="SemiBold" Margin="0,0,0,5" />
+    <CheckBox x:Name="CaptureTextBox" Content="文本" Foreground="#FFE6E6E6" Margin="0,3" />
+    <CheckBox x:Name="CaptureImageBox" Content="图片" Foreground="#FFE6E6E6" Margin="0,3" />
+    <CheckBox x:Name="CaptureFileBox" Content="文件" Foreground="#FFE6E6E6" Margin="0,3" />
+    <CheckBox x:Name="AutoStartBox" Content="开机自启动" Foreground="#FFE6E6E6" Margin="0,10,0,3" />
+
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,20,0,0">
+      <Button Content="取消"
+              Width="92"
+              Height="30"
+              Margin="0,0,8,0"
+              IsCancel="True" />
+      <Button Content="保存"
+              Width="92"
+              Height="30"
+              IsDefault="True"
+              Click="OnSave" />
+    </StackPanel>
+
+  </StackPanel>
+</Window>

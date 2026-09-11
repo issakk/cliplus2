@@ -57,10 +57,15 @@
           <DataTemplate>
             <StackPanel>
               <TextBlock Text="{Binding Preview}" TextTrimming="CharacterEllipsis" />
-              <TextBlock Text="{Binding Meta}"
-                         Foreground="#8CFFFFFF"
-                         FontSize="11"
-                         Margin="0,3,0,0" />
+              <StackPanel Orientation="Horizontal" Margin="0,3,0,0">
+                <TextBlock Text="{Binding PinMark}"
+                           Foreground="#FFD24A"
+                           FontSize="11"
+                           Margin="0,0,4,0" />
+                <TextBlock Text="{Binding Meta}"
+                           Foreground="#8CFFFFFF"
+                           FontSize="11" />
+              </StackPanel>
             </StackPanel>
           </DataTemplate>
         </ListBox.ItemTemplate>
