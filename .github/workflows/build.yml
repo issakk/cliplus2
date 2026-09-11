@@ -1,0 +1,54 @@
+name: build
+
+# Every push builds, so a broken commit never lingers unnoticed.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  PROJECT: src/ClipPlus/ClipPlus.csproj
+
+jobs:
+  build:
+    # WPF needs the Windows Desktop targeting pack, so this cannot run on Linux.
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore ${{ env.PROJECT }}
+
+      - name: Build
+        run: dotnet build ${{ env.PROJECT }} -c Release --no-restore
+
+      # Framework-dependent by default: ~1 MB artifact, needs the .NET 8 Desktop
+      # Runtime installed. For a self-contained ~160 MB build that runs anywhere,
+      # flip --self-contained to true and drop the -r flag's host requirement.
+      - name: Publish
+        run: >
+          dotnet publish ${{ env.PROJECT }}
+          -c Release
+          -r win-x64
+          --self-contained false
+          -p:ContinuousIntegrationBuild=true
+          -o dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipPlus-win-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

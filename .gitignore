@@ -1,0 +1,22 @@
+## .NET / Visual Studio
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+artifacts/
+dist/
+
+## ReSharper / Rider
+.idea/
+*.DotSettings.user
+
+## OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+## Local scratch
+*.log

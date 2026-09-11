@@ -1,0 +1,71 @@
+<Window x:Class="ClipPlus.PopupWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="ClipPlus"
+        Width="600"
+        Height="440"
+        WindowStyle="None"
+        ResizeMode="NoResize"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ShowInTaskbar="False"
+        Topmost="True"
+        WindowStartupLocation="Manual"
+        UseLayoutRounding="True"
+        TextOptions.TextFormattingMode="Display"
+        FontFamily="Segoe UI, Microsoft YaHei UI"
+        FontSize="13"
+        PreviewKeyDown="OnPreviewKeyDown"
+        Deactivated="OnDeactivated">
+
+  <Border Background="#F21E1E1E"
+          BorderBrush="#33FFFFFF"
+          BorderThickness="1"
+          CornerRadius="8"
+          Padding="10">
+    <DockPanel>
+
+      <TextBox x:Name="SearchBox"
+               DockPanel.Dock="Top"
+               Margin="0,0,0,10"
+               Padding="8,6"
+               FontSize="14"
+               BorderThickness="0"
+               Background="#26FFFFFF"
+               Foreground="#F0F0F0"
+               CaretBrush="#F0F0F0"
+               SelectionBrush="#5470B0" />
+
+      <ListBox x:Name="ResultList"
+               Background="Transparent"
+               BorderThickness="0"
+               Foreground="#E6E6E6"
+               HorizontalContentAlignment="Stretch"
+               ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+               VirtualizingPanel.IsVirtualizing="True"
+               VirtualizingPanel.VirtualizationMode="Recycling"
+               VirtualizingPanel.ScrollUnit="Pixel"
+               SelectionChanged="OnSelectionChanged"
+               MouseDoubleClick="OnResultDoubleClick">
+        <ListBox.ItemContainerStyle>
+          <Style TargetType="ListBoxItem">
+            <Setter Property="Padding" Value="7,5" />
+            <Setter Property="Margin" Value="0,1" />
+          </Style>
+        </ListBox.ItemContainerStyle>
+        <ListBox.ItemTemplate>
+          <DataTemplate>
+            <StackPanel>
+              <TextBlock Text="{Binding Preview}" TextTrimming="CharacterEllipsis" />
+              <TextBlock Text="{Binding Meta}"
+                         Foreground="#8CFFFFFF"
+                         FontSize="11"
+                         Margin="0,3,0,0" />
+            </StackPanel>
+          </DataTemplate>
+        </ListBox.ItemTemplate>
+      </ListBox>
+
+    </DockPanel>
+  </Border>
+</Window>
