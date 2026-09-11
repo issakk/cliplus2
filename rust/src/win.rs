@@ -54,6 +54,8 @@ pub const VK_V: u16 = 0x56;
 pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
 pub const ERROR_ALREADY_EXISTS: u32 = 183;
+/// GlobalAlloc flag: the block can move, which is what the clipboard requires.
+pub const GMEM_MOVEABLE: u32 = 0x0002;
 
 pub const MB_OK: u32 = 0x0000_0000;
 pub const MB_ICONERROR: u32 = 0x0000_0010;

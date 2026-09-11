@@ -329,6 +329,203 @@ pub fn decode_dib(bytes: &[u8]) -> Option<DecodedImage> {
     })
 }
 
+// ------------------------------------------------------------------ writing
+
+/// Replaces the clipboard contents with `payload`.
+///
+/// Every failure path frees the buffer it allocated: once `SetClipboardData`
+/// succeeds the system owns the block, and only then must we keep our hands off
+/// it. Getting that backwards is a memory leak on every paste.
+pub fn write(payload: &ClipPayload) -> bool {
+    match payload {
+        ClipPayload::Text(text) => write_unicode_text(text),
+        ClipPayload::Files(paths) => write_file_drop(paths),
+        ClipPayload::Image(png) => write_dib(png),
+    }
+}
+
+fn write_unicode_text(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+
+    let mut bytes = Vec::with_capacity(text.len() * 2 + 2);
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+
+    place(CF_UNICODETEXT, &bytes)
+}
+
+/// `CF_HDROP` is a DROPFILES header followed by a double-NUL-terminated list of
+/// wide paths. Built byte by byte so there is no struct-packing assumption.
+fn write_file_drop(paths: &[String]) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&20u32.to_le_bytes()); // pFiles: offset of the list
+    bytes.extend_from_slice(&0i32.to_le_bytes()); // pt.x
+    bytes.extend_from_slice(&0i32.to_le_bytes()); // pt.y
+    bytes.extend_from_slice(&0i32.to_le_bytes()); // fNC
+    bytes.extend_from_slice(&1i32.to_le_bytes()); // fWide: paths are UTF-16
+
+    for path in paths {
+        for unit in path.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // terminating NUL
+
+    place(CF_HDROP, &bytes)
+}
+
+/// Decodes our stored PNG back to pixels and re-publishes it as `CF_DIB`.
+///
+/// Only RGBA and RGB inputs are accepted. Our own blobs are always RGBA, so
+/// anything else means a foreign file, and refusing is better than writing a
+/// DIB whose channel order we guessed wrong.
+fn write_dib(png_bytes: &[u8]) -> bool {
+    let decoder = png::Decoder::new(png_bytes);
+    let mut reader = match decoder.read_info() {
+        Ok(reader) => reader,
+        Err(err) => {
+            log::error(&format!("PNG header unreadable: {err}"));
+            return false;
+        }
+    };
+
+    let mut buffer = vec![0u8; reader.output_buffer_size()];
+    let info = match reader.next_frame(&mut buffer) {
+        Ok(info) => info,
+        Err(err) => {
+            log::error(&format!("PNG decode failed: {err}"));
+            return false;
+        }
+    };
+
+    let pixels = &buffer[..info.buffer_size()];
+    let (width, height) = (info.width, info.height);
+    if width == 0 || height == 0 {
+        return false;
+    }
+
+    let mut bgra = Vec::with_capacity(width as usize * height as usize * 4);
+    match info.color_type {
+        png::ColorType::Rgba => {
+            for pixel in pixels.chunks_exact(4) {
+                bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+            }
+        }
+        png::ColorType::Rgb => {
+            for pixel in pixels.chunks_exact(3) {
+                bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+            }
+        }
+        other => {
+            log::warn(&format!("unsupported PNG colour type {other:?}"));
+            return false;
+        }
+    }
+
+    let header_size = 40u32;
+    let image_size = (width * height * 4) as u32;
+    let stride = (width * 4) as usize;
+
+    let mut bytes = Vec::with_capacity(header_size as usize + image_size as usize);
+    bytes.extend_from_slice(&header_size.to_le_bytes()); // biSize
+    bytes.extend_from_slice(&(width as i32).to_le_bytes());
+    bytes.extend_from_slice(&(height as i32).to_le_bytes()); // positive: bottom-up
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    bytes.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+    bytes.extend_from_slice(&image_size.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+    bytes.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+
+    // DIB rows run bottom-up unless the height is negative.
+    for row in (0..height as usize).rev() {
+        let start = row * stride;
+        bytes.extend_from_slice(&bgra[start..start + stride]);
+    }
+
+    place(CF_DIB, &bytes)
+}
+
+/// Copies `bytes` into a moveable global block and hands it to the clipboard
+/// under `format`.
+fn place(format: u32, bytes: &[u8]) -> bool {
+    let handle = global_from_bytes(bytes);
+    if handle == 0 {
+        return false;
+    }
+
+    let placed = with_open_clipboard(|| {
+        let stored = unsafe { win::SetClipboardData(format, handle) };
+        stored != 0
+    });
+
+    if !placed {
+        // The system only takes ownership on success.
+        unsafe {
+            win::GlobalFree(handle);
+        }
+    }
+
+    placed
+}
+
+fn global_from_bytes(bytes: &[u8]) -> win::HGLOBAL {
+    unsafe {
+        let handle = win::GlobalAlloc(win::GMEM_MOVEABLE, bytes.len().max(1));
+        if handle == 0 {
+            return 0;
+        }
+
+        let pointer = win::GlobalLock(handle) as *mut u8;
+        if pointer.is_null() {
+            win::GlobalFree(handle);
+            return 0;
+        }
+
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len());
+        win::GlobalUnlock(handle);
+        handle
+    }
+}
+
+/// Opens the clipboard, empties it and runs `action`, retrying while other
+/// applications hold it open.
+fn with_open_clipboard<F: FnOnce() -> bool>(action: F) -> bool {
+    for attempt in 0..OPEN_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(RETRY_DELAY);
+        }
+
+        let opened = unsafe { win::OpenClipboard(0) };
+        if opened == 0 {
+            continue;
+        }
+
+        let cleared = unsafe { win::EmptyClipboard() } != 0;
+        let ok = cleared && action();
+
+        unsafe {
+            win::CloseClipboard();
+        }
+
+        return ok;
+    }
+
+    log::warn("clipboard stayed busy; nothing was written");
+    false
+}
+
 fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     {
