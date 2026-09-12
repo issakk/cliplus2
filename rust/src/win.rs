@@ -425,6 +425,7 @@ extern "system" {
 // ---------------------------------------------------------------- shell32.dll
 
 #[link(name = "shell32")]
+extern "system" {
     pub fn Shell_NotifyIconW(dwMessage: u32, lpData: *mut NOTIFYICONDATAW) -> i32;
     pub fn ShellExecuteW(
         hwnd: HWND,
@@ -434,7 +435,6 @@ extern "system" {
         lpDirectory: PCWSTR,
         nShowCmd: i32,
     ) -> HINSTANCE;
-extern "system" {
     pub fn DragQueryFileW(hDrop: HANDLE, iFile: u32, lpszFile: *mut u16, cch: u32) -> u32;
 }
 
@@ -748,11 +748,11 @@ pub fn def_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> 
 }
 
 pub fn post_quit_message(code: i32) {
+    unsafe { PostQuitMessage(code) };
+}
 
 pub fn post_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
     unsafe { PostMessageW(hwnd, msg, wparam, lparam) != 0 }
-}
-    unsafe { PostQuitMessage(code) };
 }
 
 /// A daemon has no window to fail in front of, so a fatal startup problem would

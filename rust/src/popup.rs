@@ -690,7 +690,7 @@ fn draw_item(lparam: LPARAM) {
 
         let mut left = rect.left + inset;
 
-        let mut line1 = win::RECT {
+        let line1 = win::RECT {
             left,
             top: rect.top + line1_top,
             right: rect.right - inset,
