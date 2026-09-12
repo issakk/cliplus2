@@ -27,6 +27,7 @@ pub type HFONT = isize;
 pub type HGDIOBJ = isize;
 pub type HGLOBAL = isize;
 pub type HANDLE = isize;
+pub type HKEY = isize;
 pub type WPARAM = usize;
 pub type LPARAM = isize;
 pub type LRESULT = isize;
@@ -59,6 +60,36 @@ pub const VK_V: u16 = 0x56;
 pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
 pub const ERROR_ALREADY_EXISTS: u32 = 183;
+
+// --- tray icon ---
+pub const NIM_ADD: u32 = 0;
+pub const NIM_MODIFY: u32 = 1;
+pub const NIM_DELETE: u32 = 2;
+pub const NIF_MESSAGE: u32 = 0x0001;
+pub const NIF_ICON: u32 = 0x0002;
+pub const NIF_TIP: u32 = 0x0004;
+
+pub const WM_APP: u32 = 0x8000;
+pub const WM_NULL: u32 = 0x0000;
+pub const WM_LBUTTONUP: u32 = 0x0202;
+pub const WM_RBUTTONUP: u32 = 0x0205;
+
+pub const MF_STRING: u32 = 0x0000;
+pub const MF_SEPARATOR: u32 = 0x0800;
+pub const MF_CHECKED: u32 = 0x0008;
+pub const TPM_RIGHTBUTTON: u32 = 0x0002;
+pub const TPM_RETURNCMD: u32 = 0x0100;
+
+/// MAKEINTRESOURCE(IDI_APPLICATION), the generic application icon.
+pub const IMI_APPLICATION: u16 = 32512;
+pub const SW_SHOWNORMAL: i32 = 1;
+
+// --- registry ---
+pub const HKEY_CURRENT_USER: HKEY = 0x8000_0001u32 as i32 as isize;
+pub const KEY_QUERY_VALUE: u32 = 0x0001;
+pub const KEY_SET_VALUE: u32 = 0x0002;
+pub const REG_SZ: u32 = 1;
+pub const ERROR_SUCCESS: i32 = 0;
 /// GlobalAlloc flag: the block can move, which is what the clipboard requires.
 pub const GMEM_MOVEABLE: u32 = 0x0002;
 
@@ -346,6 +377,22 @@ extern "system" {
     pub fn GetClientRect(hWnd: HWND, lpRect: *mut RECT) -> i32;
     pub fn InvalidateRect(hWnd: HWND, lpRect: *const RECT, bErase: i32) -> i32;
     pub fn GetDpiForWindow(hwnd: HWND) -> u32;
+
+    // --- tray icon and its menu ---
+    pub fn CreatePopupMenu() -> HMENU;
+    pub fn DestroyMenu(hMenu: HMENU) -> i32;
+    pub fn AppendMenuW(hMenu: HMENU, uFlags: u32, uIDNewItem: usize, lpNewItem: PCWSTR) -> i32;
+    pub fn TrackPopupMenu(
+        hMenu: HMENU,
+        uFlags: u32,
+        x: i32,
+        y: i32,
+        nReserved: i32,
+        hWnd: HWND,
+        prcRect: *const RECT,
+    ) -> i32;
+    pub fn LoadIconW(hInstance: HINSTANCE, lpIconName: PCWSTR) -> HICON;
+    pub fn GetModuleFileNameW(hModule: HINSTANCE, lpFilename: *mut u16, nSize: u32) -> u32;
 }
 
 // ---------------------------------------------------------------- kernel32.dll
@@ -378,6 +425,15 @@ extern "system" {
 // ---------------------------------------------------------------- shell32.dll
 
 #[link(name = "shell32")]
+    pub fn Shell_NotifyIconW(dwMessage: u32, lpData: *mut NOTIFYICONDATAW) -> i32;
+    pub fn ShellExecuteW(
+        hwnd: HWND,
+        lpOperation: PCWSTR,
+        lpFile: PCWSTR,
+        lpParameters: PCWSTR,
+        lpDirectory: PCWSTR,
+        nShowCmd: i32,
+    ) -> HINSTANCE;
 extern "system" {
     pub fn DragQueryFileW(hDrop: HANDLE, iFile: u32, lpszFile: *mut u16, cch: u32) -> u32;
 }
@@ -440,6 +496,74 @@ pub struct DRAWITEMSTRUCT {
     pub hdc: HDC,
     pub rc_item: RECT,
     pub item_data: usize,
+}
+
+// ---------------------------------------------------------------- advapi32.dll
+
+#[link(name = "advapi32")]
+extern "system" {
+    pub fn RegOpenKeyExW(
+        hKey: HKEY,
+        lpSubKey: PCWSTR,
+        ulOptions: u32,
+        samDesired: u32,
+        phkResult: *mut HKEY,
+    ) -> i32;
+    pub fn RegQueryValueExW(
+        hKey: HKEY,
+        lpValueName: PCWSTR,
+        lpReserved: *mut u32,
+        lpType: *mut u32,
+        lpData: *mut u8,
+        lpcbData: *mut u32,
+    ) -> i32;
+    pub fn RegSetValueExW(
+        hKey: HKEY,
+        lpValueName: PCWSTR,
+        Reserved: u32,
+        dwType: u32,
+        lpData: *const u8,
+        cbData: u32,
+    ) -> i32;
+    pub fn RegDeleteValueW(hKey: HKEY, lpValueName: PCWSTR) -> i32;
+    pub fn RegCloseKey(hKey: HKEY) -> i32;
+}
+
+pub const TIP_CHARS: usize = 128;
+pub const INFO_CHARS: usize = 256;
+pub const INFO_TITLE_CHARS: usize = 64;
+
+/// Tray icon payload. Declared field by field so the compiler inserts the same
+/// padding the C header relies on:
+/// cbSize(4) pad(4) hWnd(8) uID(4) uFlags(4) uCallbackMessage(4) pad(4)
+/// hIcon(8) szTip(256) dwState(4) dwStateMask(4) szInfo(512) uTimeout(4)
+/// szInfoTitle(128) dwInfoFlags(4) guidItem(16) hBalloonIcon(8) = 976 bytes.
+#[repr(C)]
+pub struct NOTIFYICONDATAW {
+    pub cb_size: u32,
+    pub hwnd: HWND,
+    pub id: u32,
+    pub flags: u32,
+    pub callback_message: u32,
+    pub icon: HICON,
+    pub tip: [u16; TIP_CHARS],
+    pub state: u32,
+    pub state_mask: u32,
+    pub info: [u16; INFO_CHARS],
+    pub timeout_or_version: u32,
+    pub info_title: [u16; INFO_TITLE_CHARS],
+    pub info_flags: u32,
+    pub guid_item: GUID,
+    pub balloon_icon: HICON,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct GUID {
+    pub data1: u32,
+    pub data2: u16,
+    pub data3: u16,
+    pub data4: [u8; 8],
 }
 
 // ------------------------------------------------------------------- helpers
@@ -624,6 +748,10 @@ pub fn def_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> 
 }
 
 pub fn post_quit_message(code: i32) {
+
+pub fn post_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
+    unsafe { PostMessageW(hwnd, msg, wparam, lparam) != 0 }
+}
     unsafe { PostQuitMessage(code) };
 }
 

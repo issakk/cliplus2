@@ -12,6 +12,10 @@ env:
   # Forced colour puts ANSI escapes into the captured log, which both breaks the
   # diagnostic parser below and makes the log unreadable on its own.
   CARGO_TERM_COLOR: never
+  # Statically link the MSVC CRT so the exe runs on a clean Windows install
+  # with no Visual C++ redistributable. That is the whole point of this port,
+  # and it is a link-time decision, so it cannot be verified locally.
+  RUSTFLAGS: -C target-feature=+crt-static
 
 jobs:
   # Distinct from the .NET workflow's job name so check runs stay tellable

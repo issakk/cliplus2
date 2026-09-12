@@ -1,10 +1,12 @@
 #![windows_subsystem = "windows"]
 
+mod autostart;
 mod clip;
 mod clipboard;
 mod index;
 mod log;
 mod popup;
+mod tray;
 mod settings;
 mod store;
 mod win;
@@ -32,7 +34,6 @@ fn main() {
     std::panic::set_hook(Box::new(|info| log::error(&format!("panic: {info}"))));
 
     log::info("=== ClipPlus (rust) starting ===");
-
     let settings = settings::Settings::load();
     log::info(&format!(
         "machine={} syncRoot={} hotkey={}",
@@ -122,9 +123,15 @@ fn main() {
         ));
     }
 
+    if let Some(settings) = SETTINGS.get() {
+        tray::add(hwnd, settings);
+    }
     log::info("entering message loop");
     win::run_message_loop();
 
+    // The tray had to be removed before the loop ended for the menu's Quit
+    // path; repeating it here is harmless and covers a WM_CLOSE shutdown.
+    tray::remove();
     win::remove_clipboard_listener(hwnd);
     win::destroy_window(hwnd);
     log::info("=== ClipPlus stopping ===");
@@ -185,6 +192,11 @@ extern "system" fn wnd_proc(
                     }
                 }
             }
+            0
+        }
+
+        tray::CALLBACK_MESSAGE => {
+            tray::handle_callback(lparam);
             0
         }
 
