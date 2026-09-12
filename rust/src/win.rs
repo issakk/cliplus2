@@ -272,8 +272,8 @@ extern "system" {
     fn GetModuleHandleW(lpModuleName: PCWSTR) -> HINSTANCE;
     fn GetCurrentThreadId() -> u32;
     fn GetLocalTime(lpSystemTime: *mut SYSTEMTIME);
-    fn GlobalAlloc(uFlags: u32, dwBytes: usize) -> HGLOBAL;
-    fn GlobalFree(hMem: HGLOBAL) -> HGLOBAL;
+    pub fn GlobalAlloc(uFlags: u32, dwBytes: usize) -> HGLOBAL;
+    pub fn GlobalFree(hMem: HGLOBAL) -> HGLOBAL;
     pub fn GlobalLock(hMem: HGLOBAL) -> *mut c_void;
     pub fn GlobalUnlock(hMem: HGLOBAL) -> i32;
     pub fn GlobalSize(hMem: HGLOBAL) -> usize;
