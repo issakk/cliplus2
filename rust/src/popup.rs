@@ -536,7 +536,8 @@ extern "system" fn search_proc(
 ) -> LRESULT {
     if message == win::WM_KEYDOWN {
         let key = wparam as i32;
-        let control_down = unsafe { win::GetKeyState(win::VK_CONTROL) } < 0;
+        // VK_CONTROL is declared as u16 for SendInput; GetKeyState wants i32.
+        let control_down = unsafe { win::GetKeyState(win::VK_CONTROL as i32) } < 0;
 
         match key {
             win::VK_ESCAPE => {
@@ -620,7 +621,7 @@ fn draw_item(lparam: LPARAM) {
             let mut star = line;
             star.right = left + 18;
             win::SetTextColor(dc, COLOR_PIN);
-            let mut text = win::wide("★");
+            let text = win::wide("★");
             win::DrawTextW(dc, text.as_ptr(), -1, &mut star, text_flags());
             left += 20;
         }
@@ -628,7 +629,7 @@ fn draw_item(lparam: LPARAM) {
         let mut preview = line;
         preview.left = left;
         win::SetTextColor(dc, COLOR_TEXT);
-        let mut text = win::wide(&summary.preview);
+        let text = win::wide(&summary.preview);
         win::DrawTextW(dc, text.as_ptr(), -1, &mut preview, text_flags());
         line = preview;
 
@@ -642,7 +643,7 @@ fn draw_item(lparam: LPARAM) {
 
         win::SelectObject(dc, font_meta);
         win::SetTextColor(dc, COLOR_META);
-        let mut text = win::wide(&summary.meta);
+        let text = win::wide(&summary.meta);
         win::DrawTextW(dc, text.as_ptr(), -1, &mut meta, text_flags());
 
         win::SelectObject(dc, previous);

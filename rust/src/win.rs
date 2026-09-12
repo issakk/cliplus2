@@ -88,6 +88,7 @@ pub const EN_CHANGE: u32 = 0x0300;
 pub const LBN_DBLCLK: u32 = 2;
 
 pub const SW_SHOW: i32 = 5;
+pub const SW_HIDE: i32 = 0;
 pub const SWP_NOACTIVATE: u32 = 0x0010;
 pub const SWP_SHOWWINDOW: u32 = 0x0040;
 pub const HWND_TOPMOST: HWND = -1;
@@ -293,7 +294,7 @@ extern "system" {
     fn PostQuitMessage(nExitCode: i32);
     fn PostMessageW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> i32;
     fn DestroyWindow(hWnd: HWND) -> i32;
-    fn ShowWindow(hWnd: HWND, nCmdShow: i32) -> i32;
+    pub fn ShowWindow(hWnd: HWND, nCmdShow: i32) -> i32;
 
     fn RegisterHotKey(hWnd: HWND, id: i32, fsModifiers: u32, vk: u32) -> i32;
     fn UnregisterHotKey(hWnd: HWND, id: i32) -> i32;
