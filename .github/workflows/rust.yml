@@ -101,9 +101,16 @@ jobs:
               )
 
           if not seen:
-              lines = [line for line in log.strip().splitlines() if line.strip()]
-              for line in lines[-25:]:
-                  print(f"::error::log| {escape(line[:400])}")
+              # This step runs on success too, so an empty parse is the normal
+              # outcome for a clean build. Only dump the tail when the log
+              # actually contains a failure, otherwise every green build would
+              # be decorated with a dozen fabricated "errors".
+              if re.search(r"^error", log, re.M) or "could not compile" in log:
+                  lines = [line for line in log.strip().splitlines() if line.strip()]
+                  for line in lines[-25:]:
+                      print(f"::error::log| {escape(line[:400])}")
+              else:
+                  print("::notice::rust build reported no diagnostics")
           PY
 
       - name: Upload artifact
