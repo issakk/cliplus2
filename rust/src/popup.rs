@@ -4,6 +4,10 @@
 //! input, selection and the caret are the system's problem rather than mine. The
 //! list is a real `LISTBOX` with owner-drawn rows, which keeps scrolling,
 //! keyboard navigation and hit testing out of this file too.
+//!
+//! Every pixel value below is a *logical* pixel at 96 DPI and is multiplied by
+//! the monitor's scale factor before use — including the row layout, which is
+//! what keeps the two text lines from colliding on a scaled display.
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -15,14 +19,22 @@ use crate::log;
 use crate::store::Store;
 use crate::win::{self, HBRUSH, HWND, LPARAM, LRESULT, WPARAM};
 
-// Layout in logical pixels at 96 DPI; everything is scaled by the monitor's
-// effective DPI at show time.
 const WIDTH: i32 = 620;
-const HEIGHT: i32 = 442;
 const PAD: i32 = 10;
 const SEARCH_HEIGHT: i32 = 30;
 const GAP: i32 = 8;
-const ROW_HEIGHT: i32 = 44;
+
+/// Chosen so the list holds exactly eight whole rows: 48 + 46*8 + 10 = 426.
+const HEIGHT: i32 = 426;
+const ROW_HEIGHT: i32 = 46;
+const LINE1_TOP: i32 = 4;
+const LINE1_HEIGHT: i32 = 22;
+const LINE2_TOP: i32 = 26;
+const LINE2_HEIGHT: i32 = 17;
+
+/// How far the popup is pushed away from the cursor.
+const CURSOR_OFFSET: i32 = 18;
+
 const MAX_RESULTS: usize = 300;
 const SUBCLASS_ID: usize = 1;
 
@@ -43,7 +55,8 @@ struct Popup {
     /// Window that had focus before the popup opened: the paste target.
     target: AtomicIsize,
     visible: AtomicBool,
-    font_scale: AtomicIsize,
+    /// Scale factor x100, so a plain integer atomic can carry it.
+    scale: AtomicIsize,
     font_main: AtomicIsize,
     font_meta: AtomicIsize,
     brush_bg: HBRUSH,
@@ -55,6 +68,21 @@ static POPUP: OnceLock<Popup> = OnceLock::new();
 
 fn popup() -> Option<&'static Popup> {
     POPUP.get()
+}
+
+fn scaled(value: i32, scale: f64) -> i32 {
+    (value as f64 * scale).round() as i32
+}
+
+/// Current scale factor, defaulting to 1.0 before the first show.
+fn current_scale() -> f64 {
+    match popup() {
+        Some(p) => match p.scale.load(Ordering::SeqCst) {
+            key if key > 0 => key as f64 / 100.0,
+            _ => 1.0,
+        },
+        None => 1.0,
+    }
 }
 
 /// Creates the popup hidden. Doing this at startup rather than on first use
@@ -125,7 +153,7 @@ pub fn create(store: Arc<Store>) -> bool {
         items: Mutex::new(Vec::new()),
         target: AtomicIsize::new(0),
         visible: AtomicBool::new(false),
-        font_scale: AtomicIsize::new(0),
+        scale: AtomicIsize::new(100),
         font_main: AtomicIsize::new(0),
         font_meta: AtomicIsize::new(0),
         brush_bg: unsafe { win::CreateSolidBrush(COLOR_BG) },
@@ -141,9 +169,7 @@ pub fn create(store: Arc<Store>) -> bool {
     // The EDIT eats the keys we care about, so intercept them in a subclass
     // proc and forward everything else to the control's own handling.
     let subclass: win::SUBCLASSPROC = search_proc;
-    let installed = unsafe {
-        win::SetWindowSubclass(search, subclass, SUBCLASS_ID, 0)
-    } != 0;
+    let installed = unsafe { win::SetWindowSubclass(search, subclass, SUBCLASS_ID, 0) } != 0;
 
     if !installed {
         log::warn(&format!(
@@ -190,22 +216,28 @@ pub fn show() {
     let area = win::work_area_at(cursor);
     let scale = win::dpi_at(cursor) as f64 / 96.0;
 
-    let width = (WIDTH as f64 * scale) as i32;
-    let height = (HEIGHT as f64 * scale) as i32;
-    let pad = (PAD as f64 * scale) as i32;
-    let search_height = (SEARCH_HEIGHT as f64 * scale) as i32;
-    let gap = (GAP as f64 * scale) as i32;
+    let width = scaled(WIDTH, scale);
+    let height = scaled(HEIGHT, scale);
+    let pad = scaled(PAD, scale);
+    let search_height = scaled(SEARCH_HEIGHT, scale);
+    let gap = scaled(GAP, scale);
+    let offset = scaled(CURSOR_OFFSET, scale);
 
-    let mut left = cursor.x + pad;
-    let mut top = cursor.y + pad;
+    // Prefer just below-right of the cursor; flip whichever axis would overflow,
+    // then clamp, so a cursor in a screen corner still gets a fully visible
+    // window rather than one hanging off the edge.
+    let mut left = cursor.x + offset;
     if left + width > area.right {
-        left = area.right - width;
+        left = cursor.x - offset - width;
     }
+
+    let mut top = cursor.y + offset;
     if top + height > area.bottom {
-        top = cursor.y - height - pad;
+        top = cursor.y - offset - height;
     }
-    left = left.max(area.left);
-    top = top.max(area.top);
+
+    left = left.clamp(area.left, (area.right - width).max(area.left));
+    top = top.clamp(area.top, (area.bottom - height).max(area.top));
 
     ensure_fonts(p, scale);
 
@@ -214,7 +246,12 @@ pub fn show() {
     let list_height = height - list_top - pad;
 
     unsafe {
-        win::SendMessageW(p.list, win::LB_SETITEMHEIGHT, 0, ROW_HEIGHT as LPARAM);
+        // Scaled: the row boxes have to grow with the font, or the two lines
+        // overlap. This is the bug that made the list look wrong at any DPI
+        // above 100%.
+        let row_height = scaled(ROW_HEIGHT, scale) as LPARAM;
+        win::SendMessageW(p.list, win::LB_SETITEMHEIGHT, 0, row_height);
+
         win::SetWindowPos(p.search, 0, pad, pad, inner, search_height, win::SWP_NOACTIVATE);
         win::SetWindowPos(p.list, 0, pad, list_top, inner, list_height, win::SWP_NOACTIVATE);
         win::SetWindowPos(
@@ -229,9 +266,10 @@ pub fn show() {
         win::SetFocus(p.search);
     }
 
-    log::info(&format!("popup shown at {left},{top} {width}x{height} ({} rows)", {
-        p.items.lock().unwrap_or_else(|e| e.into_inner()).len()
-    }));
+    let rows = p.items.lock().unwrap_or_else(|e| e.into_inner()).len();
+    log::info(&format!(
+        "popup shown at {left},{top} {width}x{height} scale {scale:.2} ({rows} rows)"
+    ));
     p.visible.store(true, Ordering::SeqCst);
 }
 
@@ -248,13 +286,13 @@ pub fn hide() {
 
 fn ensure_fonts(p: &'static Popup, scale: f64) {
     let key = (scale * 100.0) as isize;
-    if p.font_scale.load(Ordering::SeqCst) == key && key != 0 {
+    if p.scale.load(Ordering::SeqCst) == key && p.font_main.load(Ordering::SeqCst) != 0 {
         return;
     }
 
     let face = win::wide("Microsoft YaHei UI");
-    let main_height = -((16.0 * scale) as i32);
-    let meta_height = -((12.0 * scale) as i32);
+    let main_height = -scaled(16, scale);
+    let meta_height = -scaled(12, scale);
 
     unsafe {
         let main = win::CreateFontW(
@@ -300,7 +338,7 @@ fn ensure_fonts(p: &'static Popup, scale: f64) {
         }
     }
 
-    p.font_scale.store(key, Ordering::SeqCst);
+    p.scale.store(key, Ordering::SeqCst);
 }
 
 fn reload() {
@@ -485,9 +523,25 @@ fn window_text(hwnd: HWND) -> String {
 
 extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match message {
+        // The window class has no background brush and this window is composed
+        // by DWM, so without this the padding around the controls is whatever
+        // happened to be there.
+        win::WM_ERASEBKGND => {
+            if let Some(p) = popup() {
+                let dc = wparam as win::HDC;
+                let mut rect = win::RECT::default();
+                unsafe {
+                    win::GetClientRect(hwnd, &mut rect);
+                    win::FillRect(dc, &rect, p.brush_bg);
+                }
+                return 1; // erased
+            }
+            0
+        }
+
         win::WM_CTLCOLOREDIT => {
-            // The parent paints its children's non-client cruft, so the colour
-            // has to be set here and the brush handed back.
+            // The parent paints its children's backgrounds, so the colour is set
+            // here and the brush handed back.
             if let Some(p) = popup() {
                 let dc = wparam as win::HDC;
                 unsafe {
@@ -495,6 +549,21 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                     win::SetBkColor(dc, COLOR_INPUT_BG);
                 }
                 return p.brush_input as LRESULT;
+            }
+            0
+        }
+
+        // The list is owner-drawn, so the rows are ours, but the control still
+        // erases itself with this brush — including the empty space below the
+        // last row.
+        win::WM_CTLCOLORLISTBOX => {
+            if let Some(p) = popup() {
+                let dc = wparam as win::HDC;
+                unsafe {
+                    win::SetTextColor(dc, COLOR_TEXT);
+                    win::SetBkColor(dc, COLOR_BG);
+                }
+                return p.brush_bg as LRESULT;
             }
             0
         }
@@ -599,6 +668,17 @@ fn draw_item(lparam: LPARAM) {
     let selected = item.item_state & win::ODS_SELECTED != 0;
     let font_main = p.font_main.load(Ordering::SeqCst);
     let font_meta = p.font_meta.load(Ordering::SeqCst);
+    let scale = current_scale();
+
+    // Same scaling as the font sizes and LB_SETITEMHEIGHT: if these boxes do not
+    // grow with the font, the two lines collide.
+    let inset = scaled(10, scale);
+    let gap = scaled(20, scale);
+    let line1_top = scaled(LINE1_TOP, scale);
+    let line1_height = scaled(LINE1_HEIGHT, scale);
+    let line2_top = scaled(LINE2_TOP, scale);
+    let line2_height = scaled(LINE2_HEIGHT, scale);
+    let star_width = scaled(18, scale);
 
     unsafe {
         let dc = item.hdc;
@@ -608,40 +688,37 @@ fn draw_item(lparam: LPARAM) {
         win::FillRect(dc, &rect, background);
         win::SetBkMode(dc, win::TRANSPARENT_BK);
 
-        let mut left = rect.left + 10;
+        let mut left = rect.left + inset;
 
-        // First line: optional pin star, then the preview.
-        let mut line = win::RECT {
+        let mut line1 = win::RECT {
             left,
-            top: rect.top + 6,
-            right: rect.right - 10,
-            bottom: rect.top + 6 + 18,
+            top: rect.top + line1_top,
+            right: rect.right - inset,
+            bottom: rect.top + line1_top + line1_height,
         };
 
         let previous = win::SelectObject(dc, font_main);
 
         if summary.pinned {
-            let mut star = line;
-            star.right = left + 18;
+            let mut star = line1;
+            star.right = left + star_width;
             win::SetTextColor(dc, COLOR_PIN);
             let text = win::wide("★");
             win::DrawTextW(dc, text.as_ptr(), -1, &mut star, text_flags());
-            left += 20;
+            left += gap;
         }
 
-        let mut preview = line;
+        let mut preview = line1;
         preview.left = left;
         win::SetTextColor(dc, COLOR_TEXT);
         let text = win::wide(&summary.preview);
         win::DrawTextW(dc, text.as_ptr(), -1, &mut preview, text_flags());
-        line = preview;
 
-        // Second line: kind, time, origin.
         let mut meta = win::RECT {
-            left: line.left,
-            top: rect.top + 25,
-            right: rect.right - 10,
-            bottom: rect.top + 25 + 15,
+            left,
+            top: rect.top + line2_top,
+            right: rect.right - inset,
+            bottom: rect.top + line2_top + line2_height,
         };
 
         win::SelectObject(dc, font_meta);

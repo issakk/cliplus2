@@ -80,9 +80,11 @@ pub const LB_SETITEMHEIGHT: u32 = 0x01A0;
 pub const WM_ACTIVATE: u32 = 0x0006;
 pub const WM_SETFOCUS: u32 = 0x0007;
 pub const WM_DRAWITEM: u32 = 0x002B;
+pub const WM_ERASEBKGND: u32 = 0x0014;
 pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_COMMAND: u32 = 0x0111;
 pub const WM_CTLCOLOREDIT: u32 = 0x0133;
+pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
 
 pub const EN_CHANGE: u32 = 0x0300;
 pub const LBN_DBLCLK: u32 = 2;
