@@ -113,10 +113,6 @@ impl Index {
         self.items.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
     pub fn has_stem(&self, stem: &str) -> bool {
         self.stems.contains(stem)
     }

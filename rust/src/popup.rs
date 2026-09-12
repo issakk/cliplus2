@@ -229,6 +229,9 @@ pub fn show() {
         win::SetFocus(p.search);
     }
 
+    log::info(&format!("popup shown at {left},{top} {width}x{height} ({} rows)", {
+        p.items.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }));
     p.visible.store(true, Ordering::SeqCst);
 }
 

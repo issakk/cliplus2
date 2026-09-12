@@ -116,8 +116,9 @@ impl Store {
         {
             let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
             if index.has_hash(&hash) {
-                // Already stored: re-copied, pasted back out of history, or
+                // Already stored: re-copied from history, pasted back out, or
                 // written by the other build. The file is immutable.
+                log::info("clip already stored, nothing written");
                 return Ok(());
             }
         }
@@ -191,13 +192,6 @@ impl Store {
         } else {
             index.query(Some(&needle), limit)
         }
-    }
-
-    pub fn count(&self) -> usize {
-        self.index
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .len()
     }
 
     /// Hydrates a clip for paste-back. Touches disk only when it has a blob.
