@@ -953,7 +953,7 @@ pub fn create_child_id(
             width,
             height,
             parent,
-            id,
+            id as HMENU,
             instance,
             std::ptr::null(),
         )

@@ -39,7 +39,7 @@ const ID_CANCEL: usize = 11;
 static WINDOW: OnceLock<HWND> = OnceLock::new();
 
 fn field(id: usize) -> HWND {
-    WINDOW.get().map(|hwnd| unsafe { win::child_by_id(*hwnd, id) }).unwrap_or(0)
+    WINDOW.get().map(|hwnd| win::child_by_id(*hwnd, id)).unwrap_or(0)
 }
 
 pub fn create() -> bool {
@@ -113,7 +113,7 @@ pub fn create() -> bool {
             field_style | win::ES_AUTOHSCROLL
         };
 
-        win::create_child_id("EDIT", "", style, hwnd, *id, field_x, y, FIELD_WIDTH, ROW_HEIGHT);
+        win::create_child_id("EDIT", "", style, hwnd, id, field_x, y, FIELD_WIDTH, ROW_HEIGHT);
     }
 
     let check_y = MARGIN + 6 * ROW_STEP + 6;
@@ -125,7 +125,7 @@ pub fn create() -> bool {
 
     for (index, (id, label)) in checks.iter().copied().enumerate() {
         let x = MARGIN + index as i32 * 140;
-        win::create_child_id("BUTTON", label, check_style, hwnd, *id, x, check_y, 130, ROW_HEIGHT);
+        win::create_child_id("BUTTON", label, check_style, hwnd, id, x, check_y, 130, ROW_HEIGHT);
     }
 
     win::create_child_id(
