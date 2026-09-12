@@ -4,6 +4,7 @@ mod clip;
 mod clipboard;
 mod index;
 mod log;
+mod popup;
 mod settings;
 mod store;
 mod win;
@@ -78,16 +79,28 @@ fn main() {
     // every filesystem event, and `let _ =` would drop it right here.
     let _watcher = store.start_watcher();
 
+    // Built once at startup so the first hotkey press has no window-creation
+    // latency in front of it.
+    if !popup::create(Arc::clone(&store)) {
+        log::error("popup could not be created; the hotkey will do nothing");
+    }
+
     win::set_per_monitor_dpi_aware();
 
     // Coerce at a let-binding rather than inline, so the safe-fn to unsafe-fn
     // pointer conversion has an unambiguous coercion site.
     let window_proc: win::WNDPROC = wnd_proc;
 
-    let hwnd = win::create_message_window(
-        &win::wide("ClipPlus.MessageWindow"),
-        &win::wide("ClipPlus"),
+    let hwnd = win::create_window(
+        "ClipPlus.MessageWindow",
+        "ClipPlus",
         window_proc,
+        win::WS_POPUP,
+        win::WS_EX_TOOLWINDOW,
+        0,
+        0,
+        0,
+        0,
     );
 
     if hwnd == 0 {
@@ -177,7 +190,7 @@ extern "system" fn wnd_proc(
 
         win::WM_HOTKEY => {
             if wparam as i32 == HOTKEY_ID {
-                log::info("hotkey pressed");
+                popup::toggle();
             }
             0
         }

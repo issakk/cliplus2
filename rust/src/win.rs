@@ -22,6 +22,9 @@ pub type HMENU = isize;
 pub type HICON = isize;
 pub type HCURSOR = isize;
 pub type HBRUSH = isize;
+pub type HDC = isize;
+pub type HFONT = isize;
+pub type HGDIOBJ = isize;
 pub type HGLOBAL = isize;
 pub type HANDLE = isize;
 pub type WPARAM = usize;
@@ -30,6 +33,8 @@ pub type LRESULT = isize;
 pub type PCWSTR = *const u16;
 
 pub type WNDPROC = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
+pub type SUBCLASSPROC =
+    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT;
 
 // ------------------------------------------------------------------- constants
 
@@ -56,6 +61,60 @@ pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
 pub const ERROR_ALREADY_EXISTS: u32 = 183;
 /// GlobalAlloc flag: the block can move, which is what the clipboard requires.
 pub const GMEM_MOVEABLE: u32 = 0x0002;
+
+// --- popup window and its child controls ---
+pub const WS_CHILD: u32 = 0x4000_0000;
+pub const WS_VISIBLE: u32 = 0x1000_0000;
+pub const WS_VSCROLL: u32 = 0x0020_0000;
+pub const ES_AUTOHSCROLL: u32 = 0x0080;
+pub const LBS_NOTIFY: u32 = 0x0001;
+pub const LBS_OWNERDRAWFIXED: u32 = 0x0010;
+pub const LBS_HASSTRINGS: u32 = 0x0040;
+pub const LBS_NOINTEGRALHEIGHT: u32 = 0x0100;
+pub const LB_ADDSTRING: u32 = 0x0180;
+pub const LB_RESETCONTENT: u32 = 0x0184;
+pub const LB_SETCURSEL: u32 = 0x0186;
+pub const LB_GETCURSEL: u32 = 0x0188;
+pub const LB_SETITEMHEIGHT: u32 = 0x01A0;
+
+pub const WM_ACTIVATE: u32 = 0x0006;
+pub const WM_SETFOCUS: u32 = 0x0007;
+pub const WM_DRAWITEM: u32 = 0x002B;
+pub const WM_KEYDOWN: u32 = 0x0100;
+pub const WM_COMMAND: u32 = 0x0111;
+pub const WM_CTLCOLOREDIT: u32 = 0x0133;
+
+pub const EN_CHANGE: u32 = 0x0300;
+pub const LBN_DBLCLK: u32 = 2;
+
+pub const SW_SHOW: i32 = 5;
+pub const SWP_NOACTIVATE: u32 = 0x0010;
+pub const SWP_SHOWWINDOW: u32 = 0x0040;
+pub const HWND_TOPMOST: HWND = -1;
+
+pub const VK_RETURN: i32 = 0x0D;
+pub const VK_ESCAPE: i32 = 0x1B;
+pub const VK_PRIOR: i32 = 0x21;
+pub const VK_NEXT: i32 = 0x22;
+pub const VK_UP: i32 = 0x26;
+pub const VK_DOWN: i32 = 0x28;
+pub const VK_P: i32 = 0x50;
+
+pub const ODS_SELECTED: u32 = 0x0001;
+
+pub const DT_LEFT: u32 = 0x0000;
+pub const DT_VCENTER: u32 = 0x0004;
+pub const DT_SINGLELINE: u32 = 0x0020;
+pub const DT_NOPREFIX: u32 = 0x0800;
+pub const DT_END_ELLIPSIS: u32 = 0x8000;
+
+pub const TRANSPARENT_BK: i32 = 1;
+
+// CreateFontW arguments.
+pub const FW_NORMAL: i32 = 400;
+pub const FW_SEMIBOLD: i32 = 600;
+pub const CHARSET_DEFAULT: u32 = 1;
+pub const QUALITY_CLEARTYPE: u32 = 5;
 
 pub const MB_OK: u32 = 0x0000_0000;
 pub const MB_ICONERROR: u32 = 0x0000_0010;
@@ -251,7 +310,10 @@ extern "system" {
     pub fn EnumClipboardFormats(format: u32) -> u32;
     pub fn EmptyClipboard() -> i32;
 
-    fn GetForegroundWindow() -> HWND;
+    pub fn GetForegroundWindow() -> HWND;
+    pub fn GetWindowTextW(hWnd: HWND, lpString: *mut u16, nMaxCount: i32) -> i32;
+    pub fn GetWindowTextLengthW(hWnd: HWND) -> i32;
+    pub fn SetWindowTextW(hWnd: HWND, lpString: PCWSTR) -> i32;
     fn SetForegroundWindow(hWnd: HWND) -> i32;
     fn GetCursorPos(lpPoint: *mut POINT) -> i32;
     fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *mut u32) -> u32;
@@ -263,6 +325,24 @@ extern "system" {
     fn SendInput(cInputs: u32, pInputs: *const INPUT, cbSize: i32) -> u32;
     fn SetProcessDpiAwarenessContext(value: HANDLE) -> i32;
     fn MessageBoxW(hWnd: HWND, lpText: PCWSTR, lpCaption: PCWSTR, uType: u32) -> i32;
+
+    // --- popup support ---
+    pub fn SendMessageW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
+    pub fn SetFocus(hWnd: HWND) -> HWND;
+    pub fn GetKeyState(nVirtKey: i32) -> i16;
+    pub fn IsWindowVisible(hWnd: HWND) -> i32;
+    pub fn SetWindowPos(
+        hWnd: HWND,
+        hWndInsertAfter: HWND,
+        X: i32,
+        Y: i32,
+        cx: i32,
+        cy: i32,
+        uFlags: u32,
+    ) -> i32;
+    pub fn GetClientRect(hWnd: HWND, lpRect: *mut RECT) -> i32;
+    pub fn InvalidateRect(hWnd: HWND, lpRect: *const RECT, bErase: i32) -> i32;
+    pub fn GetDpiForWindow(hwnd: HWND) -> u32;
 }
 
 // ---------------------------------------------------------------- kernel32.dll
@@ -297,6 +377,66 @@ extern "system" {
 #[link(name = "shell32")]
 extern "system" {
     pub fn DragQueryFileW(hDrop: HANDLE, iFile: u32, lpszFile: *mut u16, cch: u32) -> u32;
+}
+
+// ------------------------------------------------------------------- gdi32.dll
+
+#[link(name = "gdi32")]
+extern "system" {
+    pub fn CreateFontW(
+        cHeight: i32,
+        cWidth: i32,
+        cEscapement: i32,
+        cOrientation: i32,
+        cWeight: i32,
+        bItalic: u32,
+        bUnderline: u32,
+        bStrikeOut: u32,
+        iCharSet: u32,
+        iOutPrecision: u32,
+        iClipPrecision: u32,
+        iQuality: u32,
+        iPitchAndFamily: u32,
+        pszFaceName: PCWSTR,
+    ) -> HFONT;
+    pub fn CreateSolidBrush(color: u32) -> HBRUSH;
+    pub fn DeleteObject(ho: HGDIOBJ) -> i32;
+    pub fn SelectObject(hdc: HDC, h: HGDIOBJ) -> HGDIOBJ;
+    pub fn SetTextColor(hdc: HDC, color: u32) -> u32;
+    pub fn SetBkColor(hdc: HDC, color: u32) -> u32;
+    pub fn SetBkMode(hdc: HDC, mode: i32) -> i32;
+    pub fn DrawTextW(hdc: HDC, lpchText: PCWSTR, cchText: i32, lprc: *mut RECT, format: u32) -> i32;
+    pub fn FillRect(hdc: HDC, lprc: *const RECT, hbr: HBRUSH) -> i32;
+    pub fn FrameRect(hdc: HDC, lprc: *const RECT, hbr: HBRUSH) -> i32;
+}
+
+// ---------------------------------------------------------------- comctl32.dll
+
+#[link(name = "comctl32")]
+extern "system" {
+    pub fn SetWindowSubclass(
+        hWnd: HWND,
+        pfnSubclass: SUBCLASSPROC,
+        uIdSubclass: usize,
+        dwRefData: usize,
+    ) -> i32;
+    pub fn DefSubclassProc(hWnd: HWND, uMsg: u32, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
+}
+
+/// What the listbox hands us on `WM_DRAWITEM`. x64 layout:
+/// 5 UINTs (20) + 4 pad + HWND(8) + HDC(8) + RECT(16) + ULONG_PTR(8) = 64.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DRAWITEMSTRUCT {
+    pub ctl_type: u32,
+    pub ctl_id: u32,
+    pub item_id: u32,
+    pub item_action: u32,
+    pub item_state: u32,
+    pub hwnd_item: HWND,
+    pub hdc: HDC,
+    pub rc_item: RECT,
+    pub item_data: usize,
 }
 
 // ------------------------------------------------------------------- helpers
@@ -364,6 +504,33 @@ pub fn local_year_month(ms: i64) -> (u16, u16) {
         (1970, 1)
     } else {
         (local.year, local.month)
+    }
+}
+
+pub const MDT_EFFECTIVE_DPI: i32 = 0;
+
+#[link(name = "shcore")]
+extern "system" {
+    fn GetDpiForMonitor(hmonitor: HANDLE, dpiType: i32, dpiX: *mut u32, dpiY: *mut u32) -> i32;
+}
+
+/// Effective DPI of the monitor nearest to a point. 96 when unknown.
+pub fn dpi_at(point: POINT) -> u32 {
+    unsafe {
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        if monitor == 0 {
+            return 96;
+        }
+
+        let mut dpi_x = 0u32;
+        let mut dpi_y = 0u32;
+        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) == 0
+            && dpi_x > 0
+        {
+            dpi_x
+        } else {
+            96
+        }
     }
 }
 
@@ -469,6 +636,109 @@ pub fn message_box(title: &str, text: &str, flags: u32) {
             title.as_ptr(),
             flags | MB_SETFOREGROUND | MB_TOPMOST,
         );
+    }
+}
+
+/// Registers `class_name` and creates the window. Returns 0 on failure.
+pub fn create_window(
+    class_name: &str,
+    title: &str,
+    proc: WNDPROC,
+    style: u32,
+    ex_style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> HWND {
+    let class_wide = wide(class_name);
+    let title_wide = wide(title);
+    create_window_wide(
+        &class_wide,
+        &title_wide,
+        proc,
+        style,
+        ex_style,
+        x,
+        y,
+        width,
+        height,
+    )
+}
+
+fn create_window_wide(
+    class_name: &[u16],
+    title: &[u16],
+    proc: WNDPROC,
+    style: u32,
+    ex_style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> HWND {
+    unsafe {
+        let instance = GetModuleHandleW(std::ptr::null());
+        let class = WNDCLASSEXW {
+            cb_size: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfn_wnd_proc: Some(proc),
+            h_instance: instance,
+            lpsz_class_name: class_name.as_ptr(),
+            ..Default::default()
+        };
+
+        if RegisterClassExW(&class) == 0 {
+            crate::log::warn(&format!("RegisterClassExW failed, err {}", GetLastError()));
+        }
+
+        CreateWindowExW(
+            ex_style,
+            class_name.as_ptr(),
+            title.as_ptr(),
+            style,
+            x,
+            y,
+            width,
+            height,
+            0,
+            0,
+            instance,
+            std::ptr::null(),
+        )
+    }
+}
+
+/// Creates a child control from one of the Win32 system classes ("EDIT",
+/// "LISTBOX", "STATIC", ...), which need no registration of ours.
+pub fn create_child(
+    class_name: &str,
+    title: &str,
+    style: u32,
+    parent: HWND,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> HWND {
+    let class_wide = wide(class_name);
+    let title_wide = wide(title);
+
+    unsafe {
+        let instance = GetModuleHandleW(std::ptr::null());
+        CreateWindowExW(
+            0,
+            class_wide.as_ptr(),
+            title_wide.as_ptr(),
+            style,
+            x,
+            y,
+            width,
+            height,
+            parent,
+            0,
+            instance,
+            std::ptr::null(),
+        )
     }
 }
 
