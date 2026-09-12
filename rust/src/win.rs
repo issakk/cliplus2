@@ -52,6 +52,33 @@ pub const MOD_NOREPEAT: u32 = 0x4000;
 pub const WS_POPUP: u32 = 0x8000_0000;
 pub const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 
+// --- settings window ---
+pub const WS_CAPTION: u32 = 0x00C0_0000;
+pub const WS_SYSMENU: u32 = 0x0008_0000;
+pub const WS_MINIMIZEBOX: u32 = 0x0002_0000;
+pub const WS_CLIPCHILDREN: u32 = 0x0200_0000;
+
+pub const BS_PUSHBUTTON: u32 = 0x0000_0000;
+pub const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
+pub const BS_AUTOCHECKBOX: u32 = 0x0000_0003;
+pub const ES_NUMBER: u32 = 0x2000;
+
+pub const WM_CLOSE: u32 = 0x0010;
+
+/// Passed as `hbrBackground`. When the value is in 1..=COLOR_ENDCOLORS the
+/// low byte names a system colour and the system supplies a stock brush, so
+/// the dialog face needs no CreateSolidBrush. COLOR_BTNFACE is 15.
+pub const COLOR_BTNFACE_BRUSH: HBRUSH = 16;
+pub const WS_BORDER: u32 = 0x0080_0000;
+pub const WS_TABSTOP: u32 = 0x0001_0000;
+
+pub const BM_SETCHECK: u32 = 0x00F1;
+pub const BM_GETCHECK: u32 = 0x00F0;
+
+/// The only button notification we care about, and it is zero, which is why
+/// the settings window also accepts a bare zero notification code.
+pub const BN_CLICKED: u32 = 0;
+
 pub const INPUT_KEYBOARD: u32 = 1;
 pub const KEYEVENTF_KEYUP: u32 = 0x0002;
 pub const VK_CONTROL: u16 = 0x11;
@@ -393,6 +420,17 @@ extern "system" {
     ) -> i32;
     pub fn LoadIconW(hInstance: HINSTANCE, lpIconName: PCWSTR) -> HICON;
     pub fn GetModuleFileNameW(hModule: HINSTANCE, lpFilename: *mut u16, nSize: u32) -> u32;
+    pub fn CreateIconFromResourceEx(
+        presbits: *const u8,
+        dwResSize: u32,
+        fIcon: i32,
+        dwVer: u32,
+        cxDesired: i32,
+        cyDesired: i32,
+        flags: u32,
+    ) -> HICON;
+    pub fn AdjustWindowRectEx(lpRect: *mut RECT, dwStyle: u32, bMenu: i32, dwExStyle: u32) -> i32;
+    pub fn GetDlgItem(hDlg: HWND, nIDDlgItem: i32) -> HWND;
 }
 
 // ---------------------------------------------------------------- kernel32.dll
@@ -755,6 +793,31 @@ pub fn post_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> boo
     unsafe { PostMessageW(hwnd, msg, wparam, lparam) != 0 }
 }
 
+/// Current text of a control. Shared so the popup and the settings window do
+/// not each carry their own copy of the two-call dance.
+pub fn window_text(hwnd: HWND) -> String {
+    unsafe {
+        let length = GetWindowTextLengthW(hwnd);
+        if length <= 0 {
+            return String::new();
+        }
+
+        let mut buffer = vec![0u16; length as usize + 1];
+        let copied = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+        if copied <= 0 {
+            return String::new();
+        }
+
+        buffer.truncate(copied as usize);
+        String::from_utf16_lossy(&buffer)
+    }
+}
+
+/// A child control by its id. Works for any window, not just dialogs.
+pub fn child_by_id(parent: HWND, id: usize) -> HWND {
+    unsafe { GetDlgItem(parent, id as i32) }
+}
+
 /// A daemon has no window to fail in front of, so a fatal startup problem would
 /// otherwise be completely invisible to whoever just double-clicked the exe.
 pub fn message_box(title: &str, text: &str, flags: u32) {
@@ -781,6 +844,7 @@ pub fn create_window(
     y: i32,
     width: i32,
     height: i32,
+    background: HBRUSH,
 ) -> HWND {
     let class_wide = wide(class_name);
     let title_wide = wide(title);
@@ -794,9 +858,13 @@ pub fn create_window(
         y,
         width,
         height,
+        background,
     )
 }
 
+/// `background` is either a real brush or the special `COLOR_* + 1` value
+/// that makes the system pick a stock one; 0 leaves it unpainted, which is
+/// what the popup wants because it fills itself in WM_ERASEBKGND.
 fn create_window_wide(
     class_name: &[u16],
     title: &[u16],
@@ -807,6 +875,7 @@ fn create_window_wide(
     y: i32,
     width: i32,
     height: i32,
+    background: HBRUSH,
 ) -> HWND {
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
@@ -814,6 +883,7 @@ fn create_window_wide(
             cb_size: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfn_wnd_proc: Some(proc),
             h_instance: instance,
+            hbr_background: background,
             lpsz_class_name: class_name.as_ptr(),
             ..Default::default()
         };
@@ -851,6 +921,23 @@ pub fn create_child(
     width: i32,
     height: i32,
 ) -> HWND {
+    create_child_id(class_name, title, style, parent, 0, x, y, width, height)
+}
+
+/// Same as `create_child`, but with a control id. The id travels in the
+/// `hMenu` slot, which is how Windows reports button presses back through
+/// `WM_COMMAND` — without one there is no way to tell the controls apart.
+pub fn create_child_id(
+    class_name: &str,
+    title: &str,
+    style: u32,
+    parent: HWND,
+    id: usize,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> HWND {
     let class_wide = wide(class_name);
     let title_wide = wide(title);
 
@@ -866,7 +953,7 @@ pub fn create_child(
             width,
             height,
             parent,
-            0,
+            id,
             instance,
             std::ptr::null(),
         )

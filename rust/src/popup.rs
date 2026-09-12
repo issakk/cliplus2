@@ -99,6 +99,7 @@ pub fn create(store: Arc<Store>) -> bool {
         0,
         WIDTH,
         HEIGHT,
+        0, // no class background: the popup fills itself in WM_ERASEBKGND
     );
 
     if hwnd == 0 {
@@ -346,7 +347,7 @@ fn reload() {
         return;
     };
 
-    let filter = window_text(p.search);
+    let filter = win::window_text(p.search);
     let summaries = p.store.query(&filter, MAX_RESULTS);
 
     unsafe {
@@ -498,24 +499,6 @@ fn move_selection(delta: i32) {
 
     unsafe {
         win::SendMessageW(p.list, win::LB_SETCURSEL, next as usize, 0);
-    }
-}
-
-fn window_text(hwnd: HWND) -> String {
-    unsafe {
-        let length = win::GetWindowTextLengthW(hwnd);
-        if length <= 0 {
-            return String::new();
-        }
-
-        let mut buffer = vec![0u16; length as usize + 1];
-        let copied = win::GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
-        if copied <= 0 {
-            return String::new();
-        }
-
-        buffer.truncate(copied as usize);
-        String::from_utf16_lossy(&buffer)
     }
 }
 

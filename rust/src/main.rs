@@ -8,13 +8,14 @@ mod log;
 mod popup;
 mod tray;
 mod settings;
+mod settings_window;
 mod store;
 mod win;
 
 use crate::clip::ClipPayload;
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Deliberately the same name the C# build uses. Both versions write into the
 /// same machine-sharded history folder, so letting them run together would
@@ -23,9 +24,16 @@ const INSTANCE_MUTEX: &str = "Local\\ClipPlus.SingleInstance";
 
 const HOTKEY_ID: i32 = 0xC1A0;
 
-static SETTINGS: OnceLock<settings::Settings> = OnceLock::new();
+// A lock rather than a OnceLock: the settings window can change the hotkey at
+// runtime, and the C# build's "edit the JSON and restart" is exactly what this
+// removes.
+static SETTINGS: RwLock<Option<settings::Settings>> = RwLock::new(None);
 static LAST_CLIPBOARD_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static STORE: OnceLock<Arc<store::Store>> = OnceLock::new();
+
+/// The hidden window the hotkey is registered against. Needed to re-register
+/// it when the setting changes at runtime.
+static MESSAGE_WINDOW: AtomicIsize = AtomicIsize::new(0);
 
 fn main() {
     log::init(&settings::app_dir());
@@ -41,7 +49,7 @@ fn main() {
         settings.sync_root.display(),
         settings.hotkey
     ));
-    let _ = SETTINGS.set(settings.clone());
+    set_settings(settings.clone());
 
     if !win::acquire_single_instance(&win::wide(INSTANCE_MUTEX)) {
         log::warn("another ClipPlus instance owns the single-instance mutex; exiting");
@@ -102,6 +110,7 @@ fn main() {
         0,
         0,
         0,
+        0, // never painted: a message-only window is never shown
     );
 
     if hwnd == 0 {
@@ -112,7 +121,13 @@ fn main() {
     }
     log::info(&format!("message window ready (hwnd {hwnd:#x})"));
 
-    register_hotkey(hwnd);
+    // Recorded before registering: apply_hotkey reads it.
+    MESSAGE_WINDOW.store(hwnd, Ordering::SeqCst);
+    apply_hotkey();
+
+    if !settings_window::create() {
+        log::error("settings window could not be created; the tray entry will do nothing");
+    }
 
     if win::add_clipboard_listener(hwnd) {
         log::info("clipboard listener registered");
@@ -123,8 +138,8 @@ fn main() {
         ));
     }
 
-    if let Some(settings) = SETTINGS.get() {
-        tray::add(hwnd, settings);
+    if let Some(settings) = current_settings() {
+        tray::add(hwnd, &settings);
     }
     log::info("entering message loop");
     win::run_message_loop();
@@ -137,8 +152,41 @@ fn main() {
     log::info("=== ClipPlus stopping ===");
 }
 
-fn register_hotkey(hwnd: win::HWND) {
-    let Some(settings) = SETTINGS.get() else {
+/// The three per-kind switches are consulted at capture time rather than at
+/// startup, which is what lets the settings window turn them off and have it
+/// take effect on the next copy instead of the next launch.
+fn capture_enabled(payload: &ClipPayload) -> bool {
+    let Some(settings) = current_settings() else {
+        return true;
+    };
+
+    match payload {
+        ClipPayload::Text(_) => settings.capture_text,
+        ClipPayload::Image(_) => settings.capture_images,
+        ClipPayload::Files(_) => settings.capture_files,
+    }
+}
+
+/// Snapshot of the live settings. Cloned, because callers outlive the lock.
+pub fn current_settings() -> Option<settings::Settings> {
+    SETTINGS.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+pub fn set_settings(updated: settings::Settings) {
+    *SETTINGS.write().unwrap_or_else(|p| p.into_inner()) = Some(updated);
+}
+
+/// (Re)registers the hotkey from the current settings.
+///
+/// Called at startup and again whenever the settings window saves, which is
+/// what makes a hotkey change take effect without a restart.
+pub fn apply_hotkey() {
+    let hwnd = MESSAGE_WINDOW.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+
+    let Some(settings) = current_settings() else {
         return;
     };
 
@@ -150,12 +198,11 @@ fn register_hotkey(hwnd: win::HWND) {
         return;
     };
 
-    if win::register_hotkey(
-        hwnd,
-        HOTKEY_ID,
-        hotkey.modifiers | win::MOD_NOREPEAT,
-        hotkey.vk,
-    ) {
+    // Drop the old registration first: re-registering the same combination
+    // while it is still held by this process fails against ourselves.
+    win::unregister_hotkey(hwnd, HOTKEY_ID);
+
+    if win::register_hotkey(hwnd, HOTKEY_ID, hotkey.modifiers | win::MOD_NOREPEAT, hotkey.vk) {
         log::info(&format!("hotkey registered: {}", settings.hotkey));
     } else {
         let detail = format!(
@@ -186,9 +233,13 @@ extern "system" fn wnd_proc(
                         ClipPayload::Files(paths) => format!("{} file(s)", paths.len()),
                         ClipPayload::Image(png) => format!("image, {} PNG bytes", png.len()),
                     };
-                    log::info(&format!("captured {description}"));
-                    if let Some(store) = STORE.get() {
-                        store.enqueue(payload);
+                    if capture_enabled(&payload) {
+                        log::info(&format!("captured {description}"));
+                        if let Some(store) = STORE.get() {
+                            store.enqueue(payload);
+                        }
+                    } else {
+                        log::info(&format!("ignored {description} (switched off)"));
                     }
                 }
             }
