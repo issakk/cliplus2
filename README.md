@@ -45,7 +45,7 @@ Windows 剪贴板增强工具。捕获 → 本地落盘 → 通过网盘目录�
 git add -A && git commit -m "..." && git push
 ```
 
-`rust.yml` 跑 `windows-latest` → `cargo test` → `cargo build --release`，产出 `rust/target/release/ClipPlus.exe` 上传为 artifact。单文件、静态 CRT、SQLite 静态链接进去，不需要任何运行时。
+`rust.yml` 跑 `windows-latest` → `cargo test` → `cargo build --release`，产出 `rust/target/release/ClipPlus.exe` 上传为 artifact。单文件、静态 CRT、SQLite 静态链接进去，不需要任何运行时。想在本机跑也一样：`cargo test` 就行。
 
 编译错误会直接以 check-run annotations 的形式挂在 commit 上，不用去下载 workflow 日志。
 
@@ -55,13 +55,13 @@ git add -A && git commit -m "..." && git push
 2. 按 `Win+Alt+V` 打开历史，输入即过滤，`↑↓` 选择，`Ctrl+P` 固定/取消固定，`Enter` 粘贴回原窗口，`Esc` 取消。
 3. 弹窗顶部是实例 tab：「全部」是所有机器混排，「本机」只列这台机器，其余每台机器一个 tab；鼠标点它，或按 `Ctrl+Tab` 切换（`Ctrl+Shift+Tab` 往回）。
 4. 托盘右键是「设置…」「打开同步目录」「打开设置文件」「退出」。设置里的热键框点一下、再按组合键就录进去了，不用手写 `Win+Alt+V`。
-5. 界面跟 Windows 的显示缩放走（进程是 per-monitor DPI aware，弹窗和设置窗口都按显示器 DPI 换算）：4K 屏上如果系统缩放还停在 100%，字就只有 100% 那么大。
+5. 界面统一用 Microsoft YaHei UI，字号跟着 Windows 的显示缩放走（进程是 per-monitor DPI aware，弹窗和设置窗口都按显示器 DPI 换算）：4K 屏上如果系统缩放还停在 100%，字就只有 100% 那么大。
 
 首次运行自动在 `%OneDrive%\ClipPlus` 建立历史目录。没检测到 OneDrive 时退化为本地模式，功能完整，只是不跨机器。
 
 ## 配置
 
-`%LOCALAPPDATA%\ClipPlus\settings.json`。托盘右键 →「设置…」直接改，保存即生效（热键当场重新注册，不用重启）：
+`%LOCALAPPDATA%\ClipPlus\settings.json`。托盘右键 →「设置…」直接改（热键和三个记录开关**立即生效**，其余项下次启动生效）：
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -102,21 +102,23 @@ git add -A && git commit -m "..." && git push
 - **远端库第一次会被整份取到本地**。搜索要覆盖对方的全文就得打开对方的库，OneDrive 的「按需下载」会在首次扫描时把每个月的库拉下来（几 MB 一个）；代价比只读元数据高，但依然不会把异地几 G 的图片历史拉下来。
 - **粘贴不到管理员权限的窗口**。程序以 `asInvoker` 运行，Windows 的 UIPI 会拦掉注入的按键。所有非提权剪贴板工具都一样。
 - **同内容只存一条**。第二次复制同样的东西不会新建记录，也不会把旧条目顶到最前（行不原地改写，`at` 永远是它被复制的那一刻）。
+- **实例 tab 超过 5 个会超出右边缘**。tab 条是按固定宽度画的（不测文字），两三台机器是常态；真到那天再改成测宽换行。
+- **设置窗口拖到另一台缩放不同的显示器上不会重排**（没处理 `WM_DPICHANGED`），关掉重开就正常。
 - **界面是深色占位风格**，没做主题适配。
 
 ## 结构
 
 ```
 rust/src/
-  main.rs              装配 + 单实例 + 消息窗口过程
-  win.rs               全部 Win32 声明（手写，不引 windows-sys）
+  main.rs              装配 + 单实例 + 全局热键 + 消息窗口过程
+  win.rs               全部 Win32 声明（手写，不引 windows-sys）+ 字体/DPI 换算
   clipboard.rs         剪贴板读取与写入（文本 / 文件 / PNG→DIB）
-  clip.rs              payload 与磁盘 schema
-  store.rs             库布局 + 索引 + 写入/摄取/重扫 + SQL 层
+  clip.rs              payload 与数据库行 schema
+  store.rs             库布局 + SQL 层 + 写入/重扫/固定/清理
   index.rs             内存索引：排序、过滤、固定态、清理候选
-  popup.rs             搜索弹窗
-  settings.rs          配置 + machineId + 路径解析
-  settings_window.rs   设置窗口
+  popup.rs             搜索弹窗 + 实例 tab
+  settings.rs          配置 + machineId + 热键解析/规范化
+  settings_window.rs   设置窗口（含热键录制、DPI 适配）
   tray.rs              托盘图标与菜单
   autostart.rs         开机自启
   log.rs               落盘日志
