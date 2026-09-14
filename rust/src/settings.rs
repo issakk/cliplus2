@@ -1,8 +1,8 @@
 //! Persisted configuration, the machine id, and path resolution.
 //!
-//! The JSON keys are the ones the C# build wrote, so an existing settings.json
-//! keeps working in both directions. Same for `machine.id`: sharing it is what
-//! lets the two builds read one history folder.
+//! The JSON keys and `machine.id` are never renamed: both are already on disk on
+//! any machine that ran an earlier build, and keeping the id means this build
+//! keeps writing into the machine shard its history already lives in.
 
 use std::env;
 use std::fs;
@@ -32,7 +32,7 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// `<local yyyy-MM>`, matching the C# build's directory bucketing exactly.
+/// `<local yyyy-MM>`: local time, because that is how the folders already on disk
 pub fn month_bucket(ms: i64) -> String {
     let (year, month) = win::local_year_month(ms);
     format!("{year:04}-{month:02}")
@@ -250,8 +250,8 @@ fn load_machine_id(dir: &Path) -> String {
     id
 }
 
-/// Eight lowercase hex characters, the same shape the C# build generated, so an
-/// existing machine.id keeps this machine's shard stable across both builds.
+/// Eight lowercase hex characters, the shape an existing `machine.id` already
+/// has, so this machine keeps writing into the shard it has always used.
 fn fresh_machine_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -399,8 +399,8 @@ fn commit() {
         win::set_foreground(target);
     }
 
-    // Poll instead of sleeping a flat amount. The C# build used a fixed 120 ms
-    // here, which was the single largest cost on the whole paste path.
+    // Poll instead of sleeping a flat amount: this wait is paid on every single
+    // paste, and a flat sleep here was the largest cost on the whole path.
     let deadline = started + Duration::from_millis(300);
     while Instant::now() < deadline {
         if unsafe { win::GetForegroundWindow() } == target {

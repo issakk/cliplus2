@@ -17,16 +17,16 @@ use crate::clip::ClipPayload;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
-/// Deliberately the same name the C# build uses. Both versions write into the
-/// same machine-sharded history folder, so letting them run together would
+/// Deliberately unchanged since the previous build, which used the same name: an
+/// older ClipPlus still installed would otherwise run alongside this one and
 /// capture every clip twice.
 const INSTANCE_MUTEX: &str = "Local\\ClipPlus.SingleInstance";
 
 const HOTKEY_ID: i32 = 0xC1A0;
 
 // A lock rather than a OnceLock: the settings window can change the hotkey at
-// runtime, and the C# build's "edit the JSON and restart" is exactly what this
-// removes.
+// runtime, so the settings are not a value that is written once and read
+// forever.
 static SETTINGS: RwLock<Option<settings::Settings>> = RwLock::new(None);
 static LAST_CLIPBOARD_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static STORE: OnceLock<Arc<store::Store>> = OnceLock::new();
@@ -53,12 +53,12 @@ fn main() {
 
     if !win::acquire_single_instance(&win::wide(INSTANCE_MUTEX)) {
         log::warn("another ClipPlus instance owns the single-instance mutex; exiting");
-        // Silent exit is the worst possible outcome here: the C# build and this
-        // one share the mutex on purpose, so "nothing happened" is almost always
-        // the tray instance still running.
+        // Silent exit is the worst possible outcome here: the mutex is shared
+        // with an older ClipPlus install on purpose, so "nothing happened" is
+        // almost always the tray instance still running.
         win::message_box(
             "ClipPlus",
-            "另一个 ClipPlus 正在运行，本次启动已退出。\n\nC# 版和 Rust 版共用同一个单实例锁，写的是同一个历史目录，\n同时运行会把每条剪贴捕获两遍。请先在托盘里退出那一个。",
+            "另一个 ClipPlus 正在运行，本次启动已退出。\n\n新旧两版共用同一个单实例锁，写的是同一个历史目录，\n同时运行会把每条剪贴捕获两遍。请先在托盘里退出那一个。",
             win::MB_OK | win::MB_ICONWARNING,
         );
         return;

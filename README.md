@@ -37,27 +37,27 @@ Windows 剪贴板增强工具。捕获 → 本地落盘 → 通过网盘目录�
 
 ## 构建
 
-本地不装 SDK，编译全在 GitHub Actions：
+本机不需要工具链，编译全在 GitHub Actions：
 
 ```bash
 git add -A && git commit -m "..." && git push
 ```
 
-Actions 跑 `windows-latest` → `dotnet build` → `dotnet publish` → 产物上传为 artifact。
+`rust.yml` 跑 `windows-latest` → `cargo test` → `cargo build --release`，产出 `rust/target/release/ClipPlus.exe` 上传为 artifact。单文件、静态 CRT、SQLite 静态链接进去，不需要任何运行时。
 
-改自包含（不需要用户装 .NET 运行时，体积约 160MB）：把 `.github/workflows/build.yml` 里的 `--self-contained false` 改成 `true`。
+编译错误会直接以 check-run annotations 的形式挂在 commit 上，不用去下载 workflow 日志。
 
 ## 运行
 
-1. 下载 artifact 里的 `ClipPlus.exe`（框架依赖版需要先装 [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0)）。
-2. 双击运行，托盘出现图标。
-3. 按 `Win+Alt+V` 打开历史，输入即过滤，`↑↓` 选择，`Ctrl+P` 固定/取消固定，`Enter` 粘贴回原窗口，`Esc` 取消。
+1. 下载 artifact 里的 `ClipPlus.exe`，双击运行，托盘出现图标。
+2. 按 `Win+Alt+V` 打开历史，输入即过滤，`↑↓` 选择，`Ctrl+P` 固定/取消固定，`Enter` 粘贴回原窗口，`Esc` 取消。
+3. 托盘右键是「设置…」「打开同步目录」「打开设置文件」「退出」。
 
 首次运行自动在 `%OneDrive%\ClipPlus` 建立历史目录。没检测到 OneDrive 时退化为本地模式，功能完整，只是不跨机器。
 
 ## 配置
 
-`%LOCALAPPDATA%\ClipPlus\settings.json`，改完重启生效（没有设置界面，故意的）：
+`%LOCALAPPDATA%\ClipPlus\settings.json`。托盘右键 →「设置…」直接改，保存即生效（热键当场重新注册，不用重启）：
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -90,7 +90,7 @@ Actions 跑 `windows-latest` → `dotnet build` → `dotnet publish` → 产物�
 
 清理在启动后一分钟跑一次（等首次扫描落定），之后每 6 小时一次。
 
-## 已知限制（v1）
+## 已知限制
 
 - **没有手动删除**。列表里按不了删除键；只有自动清理（默认关）会删东西，固定过的一律安全。
 - **别的机器删掉的条目，要等它的库同步过来才消失**。库一变文件监听就刷新索引，条目立刻移除；对方那台机器当时关着的话，就要等下一次同步或下次启动。
@@ -103,15 +103,17 @@ Actions 跑 `windows-latest` → `dotnet build` → `dotnet publish` → 产物�
 ## 结构
 
 ```
-src/ClipPlus/
-  App.xaml(.cs)        装配 + 单实例 + 粘贴回原窗口
-  MsgWindow.cs         隐藏消息窗口：剪贴板监听 + 全局热键
-  PasteHelper.cs       剪贴板读写、占用重试
-  ClipStore.cs         文件布局 + 内存索引 + 后台写入/摄取/重扫（Rust 版对应 store.rs，存储已换成 SQLite）
-  ClipModel.cs         磁盘 schema 与索引条目（Rust 版对应 clip.rs / index.rs）
-  PopupWindow.xaml     搜索弹窗
-  TrayIcon.cs          托盘图标与菜单（图标运行时绘制，仓库里没有二进制资源）
-  Settings.cs          配置 + machineId + 开机自启
-  Native.cs            全部 P/Invoke
-  Log.cs               落盘日志
+rust/src/
+  main.rs              装配 + 单实例 + 消息窗口过程
+  win.rs               全部 Win32 声明（手写，不引 windows-sys）
+  clipboard.rs         剪贴板读取与写入（文本 / 文件 / PNG→DIB）
+  clip.rs              payload 与磁盘 schema
+  store.rs             库布局 + 索引 + 写入/摄取/重扫 + SQL 层
+  index.rs             内存索引：排序、过滤、固定态、清理候选
+  popup.rs             搜索弹窗
+  settings.rs          配置 + machineId + 路径解析
+  settings_window.rs   设置窗口
+  tray.rs              托盘图标与菜单
+  autostart.rs         开机自启
+  log.rs               落盘日志
 ```

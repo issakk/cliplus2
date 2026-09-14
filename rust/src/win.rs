@@ -1,12 +1,12 @@
 //! Hand-declared Win32 bindings.
 //!
-//! This is a mechanical port of the C# `Native.cs` that already works on the
-//! user's machine: `LayoutKind.Sequential` becomes `#[repr(C)]`, `IntPtr`
-//! becomes `isize`, `[DllImport("user32.dll")]` becomes `#[link(name = "user32")]`.
+//! Every declaration here has been exercised by a build that works: `IntPtr`
+//! becomes `isize`, `[DllImport("user32.dll")]` becomes `#[link(name = "user32")]`,
+//! and `LayoutKind.Sequential` becomes `#[repr(C)]`.
 //!
 //! Deliberately dependency-free. A crate would supply the same declarations,
-//! but this way every signature has exactly one verified reference, and there is
-//! no version or feature-name surface left to guess at. A wrong `repr(C)` layout
+//! but these are already known to work and there is no version or feature-name
+//! surface left to guess at. A wrong `repr(C)` layout
 //! is the one class of mistake a compiler cannot catch, so it is worth having
 //! only one source of truth for it.
 
@@ -214,7 +214,7 @@ pub struct SYSTEMTIME {
     pub milliseconds: u16,
 }
 
-/// x64 layout, verified against the existing C# app:
+/// x64 layout, with the padding counted out:
 /// HWND(8) message(4) pad(4) WPARAM(8) LPARAM(8) time(4) POINT(8) = 48 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -636,14 +636,14 @@ pub fn unix_ms_to_file_time(ms: i64) -> FILETIME {
 
 /// Local-time year and month for a unix timestamp.
 ///
-/// Done through Win32 rather than a date crate on purpose: the history folder
-/// is bucketed by LOCAL year-month because the C# build wrote it that way, and
-/// getting a correct local offset is the one thing time crates are awkward at.
+/// Done through Win32 rather than a date crate on purpose: the folders already
+/// on disk are named in LOCAL year-month, and a correct local offset is the one
+/// thing time crates are awkward at.
 /// Local wall-clock time for a unix timestamp.
 ///
-/// Done through Win32 rather than a date crate on purpose: the history folder
-/// is bucketed by LOCAL year-month because the C# build wrote it that way, and
-/// getting a correct local offset is the one thing time crates are awkward at.
+/// Done through Win32 rather than a date crate on purpose: the folders already
+/// on disk are named in LOCAL year-month, and a correct local offset is the one
+/// thing time crates are awkward at.
 pub fn local_datetime(ms: i64) -> SYSTEMTIME {
     let file_time = unix_ms_to_file_time(ms);
     let mut utc = SYSTEMTIME::default();

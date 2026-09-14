@@ -20,8 +20,7 @@ pub struct ClipItem {
     pub machine: String,
     pub kind: ClipKind,
     pub hash: String,
-    /// The file this entry lives in: the `.clip.json` the C# build wrote, or
-    /// the `clips.db` this build writes.
+    /// The file this entry lives in: a legacy `.clip.json`, or `clips.db`.
     pub owner_path: PathBuf,
     /// True when the entry came out of a database, where retention deletes a
     /// row instead of a file.

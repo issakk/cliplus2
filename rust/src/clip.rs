@@ -1,8 +1,8 @@
 //! Clipboard payloads and the on-disk record schema.
 //!
-//! `ClipRecord`'s field names *are* the file format: `serde_json` writes them
-//! verbatim, exactly like the C# build's `System.Text.Json`, so both versions
-//! read and write the same `.clip.json`. Do not rename a field without a
+//! `ClipRecord`'s field names *are* the on-disk schema: a database row is built
+//! from it, and a legacy `.clip.json` deserializes into it, so one struct covers
+//! both. Do not rename a field without a
 //! migration that every other machine can follow.
 
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,7 @@ impl ClipKind {
 #[derive(Clone, Debug)]
 pub enum ClipPayload {
     Text(String),
-    /// Newline-joined absolute paths, the same shape the C# build stored.
+    /// Newline-joined absolute paths, the shape already in the history folder.
     Files(Vec<String>),
     /// PNG bytes.
     Image(Vec<u8>),
@@ -54,8 +54,9 @@ impl ClipPayload {
         }
     }
 
-    /// The exact bytes the content hash is computed over. Must stay identical to
-    /// the C# build's `Blob ?? UTF8(text)` for cross-version dedupe to work.
+    /// The exact bytes the content hash is computed over. The formula is frozen:
+    /// a hash that is already stored has to keep matching, or the same clip gets
+    /// written a second time.
     pub fn body(&self) -> Vec<u8> {
         match self {
             ClipPayload::Text(text) => text.as_bytes().to_vec(),
@@ -73,8 +74,8 @@ impl ClipPayload {
     }
 }
 
-/// On-disk schema, version 1. Field order matches the C# build only for
-/// readability; nothing depends on it.
+/// On-disk schema, version 1: still the shape of a legacy `.clip.json`, and now
+/// also the source of every database row. Field order is cosmetic.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClipRecord {

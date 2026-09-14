@@ -1,7 +1,7 @@
 //! Storage: capture queue, disk layout, index, pinning and retention.
 //!
-//! The layout is inherited from the C# build and both versions read the same
-//! folder, but only this one writes databases:
+//! The layout is unchanged from the file-per-clip era, so a folder an earlier
+//! build filled keeps working, but only databases are written now:
 //!
 //! * One database per machine per month: `<machine>/<yyyy-MM>/clips.db`, written
 //!   only by the machine it is named after. A sync client resolves the same file
@@ -16,8 +16,8 @@
 //! * Pins are still empty `<stem>.pin` markers in the folder that owns the clip.
 //!   An empty file has identical content on every machine, so two machines
 //!   creating the same marker cannot be seen as a conflict.
-//! * `<stem>.clip.json`, the C# build's format, is still read and never written,
-//!   so existing history keeps working without a migration pass.
+//! * The older `<stem>.clip.json` files are still read and never written, so
+//!   existing history keeps working without a migration pass.
 //! * The `INSERT` is the commit point: a reader sees the previous or the new
 //!   state, never half a clip. That is the property the `.tmp` + rename dance
 //!   existed to provide, and blobs are still written before the row that points
@@ -69,8 +69,8 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
 
 const SELECT_ROWS: &str = "SELECT stem, at, machine, kind, hash, text, length, blob FROM clips";
 
-/// How much of an over-long text is kept inline for searching. Matches the C#
-/// build's `RetainedChars`.
+/// How much of an over-long text is kept inline for searching. The tail exists
+/// only in the `.bin` sibling, which a search never opens.
 const RETAINED_CHARS: usize = 512;
 
 /// A read can end up behind this machine's own writer thread. A remote file the
@@ -283,7 +283,7 @@ impl Store {
 
     // ---------------------------------------------------------------- indexing
 
-    /// Full folder walk: the databases plus whatever the C# build left behind.
+    /// Full folder walk: every database, plus the legacy files an earlier build
     /// Databases are stamped, so one that has not changed costs a `stat`.
     pub fn rescan(&self) {
         let root = self.settings.sync_root.clone();
@@ -455,7 +455,7 @@ impl Store {
         }
     }
 
-    /// The C# build's format. Still read so an existing folder keeps working.
+    /// The legacy `.clip.json` format: read-only, so an existing folder still works.
     fn ingest_file(&self, path: &Path) {
         let file_stem = stem_of(path, JSON_SUFFIX);
         if file_stem.is_empty() {
@@ -812,7 +812,7 @@ fn stamp_of(path: &Path) -> Option<(u64, i64)> {
 }
 
 /// Decides what stays inline and whether a `.bin` sibling is needed.
-/// Mirrors `ClipStore.Persist` in the C# build exactly.
+/// Inline text is what a search can see, so the split trades coverage against size.
 fn plan_payload(
     payload: &ClipPayload,
     stem: &str,
@@ -842,7 +842,8 @@ fn plan_payload(
 /// SHA-256 over a 4-byte kind prefix plus the payload.
 ///
 /// The kind is mixed in so identical bytes stored as text and as an image are
-/// different clips. Uppercase hex, matching `Convert.ToHexString` in C#.
+/// different clips. Uppercase hex, and frozen: a hash already in the folder has
+/// to keep matching.
 fn hash_of(kind: ClipKind, body: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update((kind as i32).to_le_bytes());

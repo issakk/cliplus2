@@ -21,7 +21,7 @@ const RETRY_DELAY: Duration = Duration::from_millis(20);
 
 /// Reads whatever is currently on the clipboard.
 ///
-/// Priority matches the C# build: files, then text, then image. Explorer puts
+/// Priority: files, then text, then image. Explorer puts
 /// both a file drop and a text form on the clipboard, and the file drop is the
 /// more useful of the two; Excel puts both text and an image, and text is what
 /// people expect to paste back.

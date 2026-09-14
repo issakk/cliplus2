@@ -1,18 +1,8 @@
-## .NET / Visual Studio
-bin/
-obj/
-*.user
-*.suo
-*.userosscache
-*.sln.docstates
-.vs/
-artifacts/
+## Rust
 target/
-dist/
 
-## ReSharper / Rider
-.idea/
-*.DotSettings.user
+## Python scratch
+__pycache__/
 
 ## OS
 Thumbs.db

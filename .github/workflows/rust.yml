@@ -18,8 +18,6 @@ env:
   RUSTFLAGS: -C target-feature=+crt-static
 
 jobs:
-  # Distinct from the .NET workflow's job name so check runs stay tellable
-  # apart by name alone.
   rust-build:
     runs-on: windows-latest
 
@@ -47,8 +45,8 @@ jobs:
           cargo build --release 2>&1 | tee -a "$RUNNER_TEMP/build.log"
 
       # Workflow-run logs need repo admin to download, but check-run annotations
-      # are public. rustc does not emit GitHub-format diagnostics the way the
-      # .NET SDK does, so translate them here. The tail fallback exists so a
+      # are public. rustc's output is not in the annotation format GitHub wants,
+      # so translate it here. The tail fallback exists so a
       # failing build can never be invisible just because the parse missed.
       - name: Surface rustc diagnostics
         if: always()
@@ -121,7 +119,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v7
         with:
-          name: ClipPlus-rs-win-x64
+          name: ClipPlus-win-x64
           path: rust/target/release/ClipPlus.exe
           if-no-files-found: error
           retention-days: 30
