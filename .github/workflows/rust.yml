@@ -36,11 +36,15 @@ jobs:
         with:
           workspaces: rust -> target
 
-      - name: Build
+      # The tests cover the SQLite layer, which is the only part of the storage
+      # that a reviewer cannot check by reading a diff. They share the build log
+      # so a failure lands in the same round of annotations.
+      - name: Test and build
         shell: bash
         run: |
           set -o pipefail
-          cargo build --release 2>&1 | tee "$RUNNER_TEMP/build.log"
+          cargo test 2>&1 | tee "$RUNNER_TEMP/build.log"
+          cargo build --release 2>&1 | tee -a "$RUNNER_TEMP/build.log"
 
       # Workflow-run logs need repo admin to download, but check-run annotations
       # are public. rustc does not emit GitHub-format diagnostics the way the

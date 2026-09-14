@@ -1,27 +1,39 @@
 //! Storage: capture queue, disk layout, index, pinning and retention.
 //!
-//! Layout and ordering rules are inherited from the C# build and must not drift,
-//! because both versions read the same folder:
+//! The layout is inherited from the C# build and both versions read the same
+//! folder, but only this one writes databases:
 //!
-//! * One clip is one immutable `.clip.json`, plus an optional `.bin` sibling for
-//!   heavy payloads and an optional empty `.pin` marker.
-//! * Writes are sharded by machine id, so only the originating machine ever
-//!   writes a given file and no sync client can ever see a conflict.
-//! * The blob is written first. A reader that sees a blob with no JSON simply
-//!   ignores it, whereas a JSON pointing at a missing blob is a broken entry.
-//! * The JSON is written to `.tmp` and renamed into place, so the file appearing
-//!   IS the commit point.
+//! * One database per machine per month: `<machine>/<yyyy-MM>/clips.db`, written
+//!   only by the machine it is named after. A sync client resolves the same file
+//!   changed twice as last-writer-wins, so one writer per file makes a conflict
+//!   physically impossible — no lock, no protocol, no server.
+//! * Only the month in progress is ever written. Once a month rolls over its
+//!   database is frozen and already uploaded, so the price of a capture is
+//!   bounded by one month of history rather than by all of it.
+//! * Heavy payloads stay out of the database, as `<stem>.bin` siblings. A sync
+//!   client moves whole files: an image stored in a row would re-upload every
+//!   image of the month on every capture.
+//! * Pins are still empty `<stem>.pin` markers in the folder that owns the clip.
+//!   An empty file has identical content on every machine, so two machines
+//!   creating the same marker cannot be seen as a conflict.
+//! * `<stem>.clip.json`, the C# build's format, is still read and never written,
+//!   so existing history keeps working without a migration pass.
+//! * The `INSERT` is the commit point: a reader sees the previous or the new
+//!   state, never half a clip. That is the property the `.tmp` + rename dance
+//!   existed to provide, and blobs are still written before the row that points
+//!   at them, so a crash leaves an unreferenced blob rather than a broken entry.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 // `watch` lives on the Watcher trait, not on the concrete watcher type.
 use notify::Watcher as _;
+use rusqlite::{params, Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 
 use crate::clip::{ClipKind, ClipPayload, ClipRecord};
@@ -33,28 +45,70 @@ pub const JSON_SUFFIX: &str = ".clip.json";
 pub const PIN_SUFFIX: &str = ".pin";
 const BIN_SUFFIX: &str = ".bin";
 
+/// Matched exactly rather than by extension, so an unrelated `.db` that happens
+/// to sit in the synced folder is never opened as a clip store.
+const DB_NAME: &str = "clips.db";
+
+const DB_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS clips (
+    stem    TEXT PRIMARY KEY,
+    at      INTEGER NOT NULL,
+    machine TEXT NOT NULL,
+    kind    TEXT NOT NULL,
+    hash    TEXT NOT NULL,
+    text    TEXT,
+    length  INTEGER NOT NULL,
+    blob    TEXT
+)";
+
+/// `OR IGNORE`: the stem is the primary key, so a capture that is already stored
+/// is a no-op instead of an error.
+const INSERT_ROW: &str = "
+INSERT OR IGNORE INTO clips (stem, at, machine, kind, hash, text, length, blob)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+
+const SELECT_ROWS: &str = "SELECT stem, at, machine, kind, hash, text, length, blob FROM clips";
+
 /// How much of an over-long text is kept inline for searching. Matches the C#
 /// build's `RetainedChars`.
 const RETAINED_CHARS: usize = 512;
+
+/// A read can end up behind this machine's own writer thread. A remote file the
+/// sync client is halfway through uploading fails differently — it does not open
+/// at all — and is handled by keeping the previous snapshot.
+const BUSY_TIMEOUT_MS: u64 = 3_000;
 
 pub struct Store {
     settings: Settings,
     index: Mutex<Index>,
     queue: Mutex<Vec<ClipPayload>>,
     signal: Condvar,
+    /// `(len, mtime)` of every database already read, so the periodic rescan
+    /// re-reads what changed instead of every row of every month every minute.
+    loaded: Mutex<HashMap<PathBuf, (u64, i64)>>,
+    /// This machine's own folder, lowercased and with a trailing separator.
+    own_root: String,
 }
 
 impl Store {
     pub fn new(settings: Settings) -> Store {
+        let own_root = format!(
+            "{}{}",
+            settings.history_root().to_string_lossy().to_lowercase(),
+            std::path::MAIN_SEPARATOR
+        );
+
         let store = Store {
             settings,
             index: Mutex::new(Index::default()),
             queue: Mutex::new(Vec::new()),
             signal: Condvar::new(),
+            loaded: Mutex::new(HashMap::new()),
+            own_root,
         };
 
-        // Synchronous, deliberately: the hash set it builds is what stops a
-        // restart from re-writing clips that are already on disk.
+        // Synchronous, deliberately: the index it builds is what stops a
+        // restart from re-writing clips that are already stored.
         store.rescan();
         store
     }
@@ -117,7 +171,7 @@ impl Store {
             let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
             if index.has_hash(&hash) {
                 // Already stored: re-copied from history, pasted back out, or
-                // written by the other build. The file is immutable.
+                // written by another machine. Rows are never rewritten.
                 log::info("clip already stored, nothing written");
                 return Ok(());
             }
@@ -134,6 +188,8 @@ impl Store {
 
         let (inline, blob_name) = plan_payload(&payload, &stem, &self.settings);
 
+        // The blob goes first: a reader that sees a blob without a row ignores
+        // it, whereas a row pointing at a missing blob is a broken entry.
         if let Some(name) = &blob_name {
             let path = directory.join(name);
             fs::write(&path, &body).map_err(|err| format!("write {}: {err}", path.display()))?;
@@ -152,20 +208,13 @@ impl Store {
             blob: blob_name,
         };
 
-        let json_path = directory.join(format!("{stem}{JSON_SUFFIX}"));
-        let temp_path = directory.join(format!("{stem}{JSON_SUFFIX}.tmp"));
-        let json = serde_json::to_string(&record).map_err(|err| err.to_string())?;
-
-        fs::write(&temp_path, json)
-            .map_err(|err| format!("write {}: {err}", temp_path.display()))?;
-
-        // The rename is the publish step: after it, the clip exists.
-        fs::rename(&temp_path, &json_path)
-            .map_err(|err| format!("publish {}: {err}", json_path.display()))?;
+        let db_path = directory.join(DB_NAME);
+        insert_row(&db_path, &record)?;
+        self.remember_db(&db_path);
 
         let item = ClipItem::from_record(
             &record,
-            json_path,
+            db_path,
             stem,
             false,
             &self.settings.machine_id,
@@ -234,8 +283,8 @@ impl Store {
 
     // ---------------------------------------------------------------- indexing
 
-    /// Full folder walk. Add-only: entries whose files disappeared are pruned by
-    /// the watcher, or implicitly by the next restart rebuilding the index.
+    /// Full folder walk: the databases plus whatever the C# build left behind.
+    /// Databases are stamped, so one that has not changed costs a `stat`.
     pub fn rescan(&self) {
         let root = self.settings.sync_root.clone();
         let mut pinned = HashSet::new();
@@ -273,7 +322,9 @@ impl Store {
                 None => continue,
             };
 
-            if name.ends_with(PIN_SUFFIX) {
+            if name == DB_NAME {
+                self.refresh_db(&path, false);
+            } else if name.ends_with(PIN_SUFFIX) {
                 let stem = stem_of(&path, PIN_SUFFIX);
                 if !stem.is_empty() {
                     pinned.insert(stem);
@@ -284,6 +335,127 @@ impl Store {
         }
     }
 
+    /// Reads one database, then swaps its rows into the index.
+    ///
+    /// Read first, forget second: a database that cannot be read — halfway
+    /// uploaded by a sync client, or replaced while we read it — leaves the
+    /// previous snapshot in place instead of emptying part of the history.
+    fn load_db(&self, path: &Path) -> Result<usize, String> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|err| err.to_string())?;
+        let _ = conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS));
+
+        let mut statement = conn.prepare(SELECT_ROWS).map_err(|err| err.to_string())?;
+        let rows = statement
+            .query_map([], Row::read)
+            .map_err(|err| err.to_string())?;
+
+        let folder = path.parent().unwrap_or(Path::new(""));
+        let mut items = Vec::new();
+
+        for row in rows {
+            let row = row.map_err(|err| err.to_string())?;
+            let pinned = folder
+                .join(format!("{}{PIN_SUFFIX}", row.stem))
+                .exists();
+
+            let record = ClipRecord {
+                v: 1,
+                id: row.stem.clone(),
+                at: row.at,
+                machine: row.machine,
+                kind: row.kind,
+                hash: row.hash,
+                text: row.text,
+                truncated: false,
+                length: row.length,
+                blob: row.blob,
+            };
+
+            items.push(ClipItem::from_row(
+                &record,
+                path.to_path_buf(),
+                row.stem,
+                pinned,
+                &self.settings.machine_id,
+            ));
+        }
+
+        drop(statement);
+
+        let count = items.len();
+        let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+        index.forget_owner(path);
+
+        for item in items {
+            index.insert(item);
+        }
+
+        Ok(count)
+    }
+
+    /// Re-reads a database whose file changed.
+    ///
+    /// `skip_own` is for the watcher: this machine's own database changes on
+    /// every capture and its rows are already in the index, so a reload there
+    /// would be a full read of the month for nothing.
+    fn refresh_db(&self, path: &Path, skip_own: bool) {
+        if skip_own && self.is_own_db(path) {
+            return;
+        }
+
+        let Some(stamp) = stamp_of(path) else {
+            return;
+        };
+
+        {
+            let loaded = self.loaded.lock().unwrap_or_else(|p| p.into_inner());
+            if loaded.get(path) == Some(&stamp) {
+                return;
+            }
+        }
+
+        match self.load_db(path) {
+            Ok(count) => {
+                self.loaded
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(path.to_path_buf(), stamp);
+
+                log::info(&format!("{}: {count} clip(s)", path.display()));
+            }
+            Err(err) => log::warn(&format!(
+                "{} unreadable, keeping the previous snapshot: {err}",
+                path.display()
+            )),
+        }
+    }
+
+    /// A string compare rather than `Path::starts_with`, which is case-sensitive
+    /// and would miss the folder as OneDrive spells it. Getting this wrong only
+    /// costs a redundant reload, never correctness.
+    fn is_own_db(&self, path: &Path) -> bool {
+        path.to_string_lossy()
+            .to_lowercase()
+            .starts_with(&self.own_root)
+    }
+
+    /// Records a database as seen, so the rescan does not read this machine's
+    /// own month again: it changes on every capture and its rows are already in
+    /// the index.
+    fn remember_db(&self, path: &Path) {
+        if let Some(stamp) = stamp_of(path) {
+            self.loaded
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(path.to_path_buf(), stamp);
+        }
+    }
+
+    /// The C# build's format. Still read so an existing folder keeps working.
     fn ingest_file(&self, path: &Path) {
         let file_stem = stem_of(path, JSON_SUFFIX);
         if file_stem.is_empty() {
@@ -311,7 +483,7 @@ impl Store {
         } else {
             record.id.clone()
         };
-        let pinned = index::pin_path_for(path).exists();
+        let pinned = index::pin_path_for(path, &stem).exists();
 
         let item = ClipItem::from_record(
             &record,
@@ -392,11 +564,7 @@ impl Store {
         }
 
         for item in &doomed {
-            remove_file(&item.json_path);
-            if item.has_blob && !item.blob_path.as_os_str().is_empty() {
-                remove_file(&item.blob_path);
-            }
-            remove_file(&item.pin_path());
+            delete_clip(item);
         }
 
         {
@@ -417,7 +585,9 @@ impl Store {
     pub fn on_path_changed(&self, path: &Path) {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        if name.ends_with(JSON_SUFFIX) {
+        if name == DB_NAME {
+            self.refresh_db(path, true);
+        } else if name.ends_with(JSON_SUFFIX) {
             self.ingest_file(path);
         } else if name.ends_with(PIN_SUFFIX) {
             let stem = stem_of(path, PIN_SUFFIX);
@@ -432,7 +602,18 @@ impl Store {
     pub fn on_path_removed(&self, path: &Path) {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        if name.ends_with(JSON_SUFFIX) {
+        if name == DB_NAME {
+            self.index
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .forget_owner(path);
+            self.loaded
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(path);
+
+            log::info(&format!("clip database removed: {}", path.display()));
+        } else if name.ends_with(JSON_SUFFIX) {
             let stem = stem_of(path, JSON_SUFFIX);
             let removed = {
                 let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
@@ -517,6 +698,119 @@ impl Store {
     }
 }
 
+/// One clip, as stored. Mirrors `ClipRecord`, which is also what the legacy
+/// reader produces, so both paths build index entries the same way.
+struct Row {
+    stem: String,
+    at: i64,
+    machine: String,
+    kind: String,
+    hash: String,
+    text: Option<String>,
+    length: i64,
+    blob: Option<String>,
+}
+
+impl Row {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
+        Ok(Row {
+            stem: row.get(0)?,
+            at: row.get(1)?,
+            machine: row.get(2)?,
+            kind: row.get(3)?,
+            hash: row.get(4)?,
+            text: row.get(5)?,
+            length: row.get(6)?,
+            blob: row.get(7)?,
+        })
+    }
+}
+
+/// Writes one clip into the database for its month, creating both on first use
+/// so the layout stays a pure function of the timestamp.
+///
+/// The journal mode is left at SQLite's default (DELETE) rather than WAL: write
+/// ahead logging puts the new data in `-wal`/`-shm` siblings, which a sync client
+/// would have to move as a set, and `-shm` is specific to the machine that wrote
+/// it — a copy of just the `.db` would not be readable anywhere else.
+fn insert_row(db_path: &Path, record: &ClipRecord) -> Result<(), String> {
+    let conn = open_rw(db_path)?;
+
+    conn.execute_batch(DB_SCHEMA)
+        .map_err(|err| format!("schema {}: {err}", db_path.display()))?;
+
+    conn.execute(
+        INSERT_ROW,
+        params![
+            &record.id,
+            record.at,
+            &record.machine,
+            &record.kind,
+            &record.hash,
+            &record.text,
+            record.length,
+            &record.blob,
+        ],
+    )
+    .map_err(|err| format!("insert into {}: {err}", db_path.display()))?;
+
+    Ok(())
+}
+
+/// Removes one clip from the database that holds it. A delete is the one write
+/// an older, otherwise frozen month can still see, so retention re-uploads
+/// exactly the databases it actually changed.
+fn delete_row(db_path: &Path, stem: &str) {
+    let result = open_rw(db_path).and_then(|conn| {
+        conn.execute("DELETE FROM clips WHERE stem = ?1", params![stem])
+            .map_err(|err| err.to_string())
+            .map(|_| ())
+    });
+
+    if let Err(err) = result {
+        log::error(&format!("delete {stem} from {}: {err}", db_path.display()));
+    }
+}
+
+/// Deletes one clip: its row (or the legacy file), its blob, and its pin marker.
+///
+/// Split out of `prune_old` so the one destructive rule in this file — a row
+/// read from a database must never take the database with it — is testable
+/// without a live store.
+fn delete_clip(item: &ClipItem) {
+    if item.in_db {
+        delete_row(&item.owner_path, &item.stem);
+    } else {
+        remove_file(&item.owner_path);
+    }
+
+    if item.has_blob && !item.blob_path.as_os_str().is_empty() {
+        remove_file(&item.blob_path);
+    }
+
+    remove_file(&item.pin_path());
+}
+
+fn open_rw(path: &Path) -> Result<Connection, String> {
+    let conn = Connection::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
+    let _ = conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS));
+    Ok(conn)
+}
+
+/// `(len, mtime in ms)`. A sync client that rewrites a file without changing its
+/// length still moves the mtime, so the pair is enough to skip an unchanged one.
+fn stamp_of(path: &Path) -> Option<(u64, i64)> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|since| since.as_millis() as i64)
+        .unwrap_or(0);
+
+    Some((meta.len(), mtime))
+}
+
 /// Decides what stays inline and whether a `.bin` sibling is needed.
 /// Mirrors `ClipStore.Persist` in the C# build exactly.
 fn plan_payload(
@@ -582,3 +876,104 @@ fn remove_file(path: &Path) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("clipplus-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn record(stem: &str, text: Option<&str>, blob: Option<&str>) -> ClipRecord {
+        ClipRecord {
+            v: 1,
+            id: stem.to_string(),
+            at: 1_769_000_000_000,
+            machine: "3f9a2c81".to_string(),
+            kind: if blob.is_some() { "image" } else { "text" }.to_string(),
+            hash: "AB".repeat(32),
+            text: text.map(str::to_string),
+            truncated: false,
+            length: 5,
+            blob: blob.map(str::to_string),
+        }
+    }
+
+    /// A clip now lives only in the database, so the two things that would
+    /// silently lose history get a test: the round trip, and the insert of a
+    /// stem that is already there (a retried capture must not kill the writer
+    /// thread), plus the delete retention leans on.
+    #[test]
+    fn rows_round_trip_and_delete() {
+        let dir = scratch("db");
+        let path = dir.join(DB_NAME);
+
+        insert_row(&path, &record("stem-1", Some("hello"), None)).unwrap();
+        insert_row(&path, &record("stem-2", None, Some("stem-2.bin"))).unwrap();
+        insert_row(&path, &record("stem-1", Some("hello"), None)).unwrap();
+
+        let rows = read_all(&path);
+        assert_eq!(rows.len(), 2);
+
+        let first = rows.iter().find(|row| row.stem == "stem-1").unwrap();
+        assert_eq!(first.text.as_deref(), Some("hello"));
+        assert_eq!(first.blob, None);
+        assert_eq!(first.at, 1_769_000_000_000);
+        assert_eq!(first.machine, "3f9a2c81");
+
+        let second = rows.iter().find(|row| row.stem == "stem-2").unwrap();
+        assert_eq!(second.text, None);
+        assert_eq!(second.blob.as_deref(), Some("stem-2.bin"));
+
+        delete_row(&path, "stem-1");
+        let left = read_all(&path);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].stem, "stem-2");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn read_all(path: &Path) -> Vec<Row> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let mut statement = conn.prepare(SELECT_ROWS).unwrap();
+        let rows = statement
+            .query_map([], Row::read)
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        rows
+    }
+
+    /// The one destructive rule in this file: a row that came out of a
+    /// database must delete the row, never the database that holds it.
+    /// Retention is off by default, so a mistake here would stay hidden until
+    /// the day someone turns it on.
+    #[test]
+    fn retention_deletes_the_row_not_the_database() {
+        let dir = scratch("retention");
+        let path = dir.join(DB_NAME);
+
+        insert_row(&path, &record("stem-1", None, Some("stem-1.bin"))).unwrap();
+        insert_row(&path, &record("stem-2", Some("bye"), None)).unwrap();
+        fs::write(dir.join("stem-1.bin"), b"blob").unwrap();
+        fs::write(dir.join("stem-1.pin"), []).unwrap();
+
+        let row = record("stem-1", None, Some("stem-1.bin"));
+        let item = ClipItem::from_row(&row, path.clone(), "stem-1".to_string(), true, "3f9a2c81");
+        delete_clip(&item);
+
+        assert!(path.exists(), "the database must outlive its own row");
+        assert_eq!(read_all(&path).len(), 1);
+        assert!(!dir.join("stem-1.bin").exists());
+        assert!(!dir.join("stem-1.pin").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
