@@ -13,6 +13,7 @@
 #![allow(dead_code, non_snake_case)]
 
 use std::ffi::c_void;
+use std::sync::OnceLock;
 
 // --------------------------------------------------------------------- aliases
 
@@ -145,8 +146,14 @@ pub const WM_CTLCOLOREDIT: u32 = 0x0133;
 pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
 pub const WM_PAINT: u32 = 0x000F;
 pub const WM_LBUTTONDOWN: u32 = 0x0201;
+pub const WM_SETFONT: u32 = 0x0030;
+pub const WM_CHAR: u32 = 0x0102;
+pub const WM_SYSKEYDOWN: u32 = 0x0104;
+pub const WM_SYSCHAR: u32 = 0x0106;
 
 pub const EN_CHANGE: u32 = 0x0300;
+pub const EN_SETFOCUS: u32 = 0x0100;
+pub const EN_KILLFOCUS: u32 = 0x0200;
 pub const LBN_DBLCLK: u32 = 2;
 
 pub const SW_SHOW: i32 = 5;
@@ -164,6 +171,9 @@ pub const VK_DOWN: i32 = 0x28;
 pub const VK_P: i32 = 0x50;
 pub const VK_TAB: i32 = 0x09;
 pub const VK_SHIFT: i32 = 0x10;
+pub const VK_MENU: i32 = 0x12;
+pub const VK_LWIN: i32 = 0x5B;
+pub const VK_RWIN: i32 = 0x5C;
 
 pub const ODS_SELECTED: u32 = 0x0001;
 
@@ -960,7 +970,7 @@ pub fn create_child_id(
     let class_wide = wide(class_name);
     let title_wide = wide(title);
 
-    unsafe {
+    let child = unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
         CreateWindowExW(
             0,
@@ -976,13 +986,63 @@ pub fn create_child_id(
             instance,
             std::ptr::null(),
         )
+    };
+
+    // Windows hands a new control the stock system font, and this app draws in
+    // one face, so it is applied here rather than at each of the dozen call
+    // sites. `win::ui_font` covers windows that need another size.
+    unsafe {
+        SendMessageW(child, WM_SETFONT, default_ui_font() as usize, 1);
     }
+
+    child
 }
 
 pub fn destroy_window(hwnd: HWND) {
     unsafe {
         DestroyWindow(hwnd);
     }
+}
+
+/// The one face the whole app draws in. Microsoft YaHei UI ships with every
+/// supported Windows and covers the CJK the interface is written in.
+pub const UI_FACE: &str = "Microsoft YaHei UI";
+
+/// One step up from the stock 9 pt (12 px), which still fits the row grid the
+/// settings window was laid out with.
+const UI_FONT_HEIGHT: i32 = 14;
+
+/// A font in the app's face. The height is in pixels and negative, the
+/// character-height convention `CreateFontW` wants; callers that need another
+/// size (the popup's rows are 16 px) make their own.
+pub fn ui_font(pixel_height: i32) -> HFONT {
+    let face = wide(UI_FACE);
+
+    unsafe {
+        CreateFontW(
+            pixel_height,
+            0,
+            0,
+            0,
+            FW_NORMAL,
+            0,
+            0,
+            0,
+            CHARSET_DEFAULT,
+            0,
+            0,
+            QUALITY_CLEARTYPE,
+            0,
+            face.as_ptr(),
+        )
+    }
+}
+
+/// The font every control created through this module gets. Made once and never
+/// deleted: it outlives every window, like the popup's brushes.
+fn default_ui_font() -> HFONT {
+    static FONT: OnceLock<HFONT> = OnceLock::new();
+    *FONT.get_or_init(|| ui_font(UI_FONT_HEIGHT))
 }
 
 pub fn register_hotkey(hwnd: HWND, id: i32, modifiers: u32, vk: u32) -> bool {

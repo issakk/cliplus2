@@ -161,6 +161,65 @@ pub struct Hotkey {
     pub vk: u32,
 }
 
+impl Hotkey {
+    /// Rejects a combination that must not be registered, so neither a
+    /// hand-edited settings.json nor the settings window's capture field can
+    /// produce one.
+    pub fn new(modifiers: u32, vk: u32) -> Option<Hotkey> {
+        key_name(vk)?;
+
+        // A bare key would swallow every press of it system-wide, so anything
+        // without a modifier has to be a function key.
+        if modifiers == 0 && !is_function_key(vk) {
+            return None;
+        }
+
+        Some(Hotkey { modifiers, vk })
+    }
+
+    /// The canonical spelling: the inverse of `parse_hotkey`, in the modifier
+    /// order the README documents.
+    pub fn text(self) -> String {
+        let mut out = String::new();
+
+        // Win first: that is how the shipped default (`Win+Alt+V`) reads, and
+        // how the README spells it.
+        for (flag, name) in [
+            (win::MOD_WIN, "Win"),
+            (win::MOD_CONTROL, "Ctrl"),
+            (win::MOD_ALT, "Alt"),
+            (win::MOD_SHIFT, "Shift"),
+        ] {
+            if self.modifiers & flag != 0 {
+                out.push_str(name);
+                out.push('+');
+            }
+        }
+
+        out.push_str(&key_name(self.vk).unwrap_or_default());
+        out
+    }
+}
+
+/// The spelling `virtual_key` accepts for this code, or `None` for a key with
+/// no name — the settings window ignores those rather than letting the field
+/// hold something that would not survive a round trip.
+pub fn key_name(vk: u32) -> Option<String> {
+    if (0x41..=0x5A).contains(&vk) || (0x30..=0x39).contains(&vk) {
+        return Some(((vk as u8) as char).to_string());
+    }
+
+    if (0x70..=0x87).contains(&vk) {
+        return Some(format!("F{}", vk - 0x6F));
+    }
+
+    None
+}
+
+fn is_function_key(vk: u32) -> bool {
+    (0x70..=0x87).contains(&vk)
+}
+
 /// Returns `None` when the string is unusable, so the caller can report it
 /// rather than silently running without a hotkey.
 pub fn parse_hotkey(text: &str) -> Option<Hotkey> {
@@ -182,11 +241,7 @@ pub fn parse_hotkey(text: &str) -> Option<Hotkey> {
         }
     }
 
-    if vk == 0 {
-        None
-    } else {
-        Some(Hotkey { modifiers, vk })
-    }
+    Hotkey::new(modifiers, vk)
 }
 
 fn virtual_key(name: &str) -> Option<u32> {
@@ -259,4 +314,34 @@ fn fresh_machine_id() -> String {
         .unwrap_or(0);
     let mixed = nanos ^ ((std::process::id() as u64) << 48);
     format!("{:08x}", (mixed ^ (mixed >> 32)) as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The settings window writes what `text` produces and the save path reads
+    /// it back through `parse_hotkey`, so the two have to agree — and the
+    /// bare-key rule is what stops a hotkey from eating a whole key.
+    #[test]
+    fn hotkey_text_round_trips() {
+        for spelling in ["Win+Alt+V", "Ctrl+Shift+F9", "F5", "Ctrl+0"] {
+            let parsed = parse_hotkey(spelling).unwrap_or_else(|| panic!("{spelling}"));
+            assert_eq!(parsed.text(), spelling);
+            assert_eq!(parse_hotkey(&parsed.text()).map(Hotkey::text), Some(parsed.text()));
+        }
+
+        assert_eq!(
+            parse_hotkey("ctrl+alt+v").map(Hotkey::text),
+            Some("Ctrl+Alt+V".to_string())
+        );
+
+        // A bare letter, digit or punctuation key would be registered against
+        // the whole system, so those are rejected rather than accepted.
+        assert!(parse_hotkey("V").is_none());
+        assert!(parse_hotkey("7").is_none());
+        assert!(parse_hotkey("Ctrl+Shift").is_none());
+        assert!(parse_hotkey("Ctrl+Shift+Q+W").is_none());
+        assert!(parse_hotkey("Ctrl+F25").is_none());
+    }
 }

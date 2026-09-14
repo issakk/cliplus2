@@ -308,46 +308,19 @@ fn ensure_fonts(p: &'static Popup, scale: f64) {
         return;
     }
 
-    let face = win::wide("Microsoft YaHei UI");
     let main_height = -scaled(16, scale);
     let meta_height = -scaled(12, scale);
 
     unsafe {
-        let main = win::CreateFontW(
-            main_height,
-            0,
-            0,
-            0,
-            win::FW_NORMAL,
-            0,
-            0,
-            0,
-            win::CHARSET_DEFAULT,
-            0,
-            0,
-            win::QUALITY_CLEARTYPE,
-            0,
-            face.as_ptr(),
-        );
-        let meta = win::CreateFontW(
-            meta_height,
-            0,
-            0,
-            0,
-            win::FW_NORMAL,
-            0,
-            0,
-            0,
-            win::CHARSET_DEFAULT,
-            0,
-            0,
-            win::QUALITY_CLEARTYPE,
-            0,
-            face.as_ptr(),
-        );
+        let main = win::ui_font(main_height);
+        let meta = win::ui_font(meta_height);
 
         let old_main = p.font_main.swap(main, Ordering::SeqCst);
         let old_meta = p.font_meta.swap(meta, Ordering::SeqCst);
+
+        // The search box is a real EDIT, so it has to be told; the rows beside
+        // it are drawn by this file and would otherwise not match it.
+        win::SendMessageW(p.search, win::WM_SETFONT, main as usize, 1);
         if old_main != 0 {
             win::DeleteObject(old_main);
         }

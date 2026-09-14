@@ -54,7 +54,7 @@ git add -A && git commit -m "..." && git push
 1. 下载 artifact 里的 `ClipPlus.exe`，双击运行，托盘出现图标。
 2. 按 `Win+Alt+V` 打开历史，输入即过滤，`↑↓` 选择，`Ctrl+P` 固定/取消固定，`Enter` 粘贴回原窗口，`Esc` 取消。
 3. 弹窗顶部是实例 tab：「全部」是所有机器混排，「本机」只列这台机器，其余每台机器一个 tab；鼠标点它，或按 `Ctrl+Tab` 切换（`Ctrl+Shift+Tab` 往回）。
-4. 托盘右键是「设置…」「打开同步目录」「打开设置文件」「退出」。
+4. 托盘右键是「设置…」「打开同步目录」「打开设置文件」「退出」。设置里的热键框点一下、再按组合键就录进去了，不用手写 `Win+Alt+V`。
 
 首次运行自动在 `%OneDrive%\ClipPlus` 建立历史目录。没检测到 OneDrive 时退化为本地模式，功能完整，只是不跨机器。
 
@@ -64,7 +64,7 @@ git add -A && git commit -m "..." && git push
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `Hotkey` | `Win+Alt+V` | `Ctrl`/`Alt`/`Shift`/`Win` + 一个键（A-Z、0-9、F1-F24） |
+| `Hotkey` | `Win+Alt+V` | `Win`/`Ctrl`/`Alt`/`Shift` + 一个键（A-Z、0-9、F1-F24）。设置窗口里点进输入框**直接按下组合键**即可；至少需要一个修饰键，只有 F1-F24 能单独用（裸的字母键会吃掉全系统那个键） |
 | `SyncRootOverride` | `null` | 手动指定历史目录，覆盖 OneDrive 自动探测 |
 | `InlineTextLimit` | `8192` | 超过这个长度的文本拆到 `.bin` |
 | `MaxBlobBytes` | `10485760` | 超过这个大小的图片直接丢弃，不进同步目录 |

@@ -176,6 +176,16 @@ pub fn set_settings(updated: settings::Settings) {
     *SETTINGS.write().unwrap_or_else(|p| p.into_inner()) = Some(updated);
 }
 
+/// Drops the global hotkey for as long as the settings window is recording a new
+/// one. Without this, pressing the combination that is already registered would
+/// fire the popup instead of reaching the field.
+pub fn suspend_hotkey() {
+    let hwnd = MESSAGE_WINDOW.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        win::unregister_hotkey(hwnd, HOTKEY_ID);
+    }
+}
+
 /// (Re)registers the hotkey from the current settings.
 ///
 /// Called at startup and again whenever the settings window saves, which is

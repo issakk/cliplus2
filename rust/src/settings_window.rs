@@ -11,7 +11,7 @@
 use std::sync::OnceLock;
 
 use crate::log;
-use crate::settings::{self, Settings};
+use crate::settings::{self, Hotkey, Settings};
 use crate::win::{self, HWND, LPARAM, LRESULT, WPARAM};
 
 /// Client area in logical pixels; the frame is added around it at creation.
@@ -19,8 +19,8 @@ const CLIENT_WIDTH: i32 = 560;
 const CLIENT_HEIGHT: i32 = 344;
 
 const MARGIN: i32 = 16;
-const LABEL_WIDTH: i32 = 168;
-const FIELD_WIDTH: i32 = 340;
+const LABEL_WIDTH: i32 = 180;
+const FIELD_WIDTH: i32 = 320;
 const ROW_HEIGHT: i32 = 24;
 const ROW_STEP: i32 = 34;
 
@@ -36,6 +36,10 @@ const ID_CAPTURE_FILES: usize = 9;
 const ID_SAVE: usize = 10;
 const ID_CANCEL: usize = 11;
 
+
+/// Subclass id for the hotkey field, which is the only control here that has to
+/// intercept its own keystrokes.
+const HOTKEY_SUBCLASS_ID: usize = 1;
 static WINDOW: OnceLock<HWND> = OnceLock::new();
 
 fn field(id: usize) -> HWND {
@@ -91,7 +95,7 @@ pub fn create() -> bool {
     let field_x = MARGIN + LABEL_WIDTH + 8;
 
     let rows: [(usize, &str); 6] = [
-        (ID_HOTKEY, "热键（例 Win+Alt+V）"),
+        (ID_HOTKEY, "热键（点这里按组合键）"),
         (ID_SYNC_ROOT, "同步目录（留空 = 自动）"),
         (ID_RETENTION, "保留天数（0 = 不清理）"),
         (ID_MAX_BLOB_MB, "单条上限（MB）"),
@@ -163,6 +167,22 @@ pub fn create() -> bool {
         110,
         26,
     );
+
+    // The hotkey field records combinations instead of accepting text, which
+    // means it has to see the keystrokes before the EDIT turns them into
+    // characters. `field()` cannot be used here: the window is not in the
+    // static yet.
+    let subclass: win::SUBCLASSPROC = hotkey_proc;
+    let hotkey_field = win::child_by_id(hwnd, ID_HOTKEY);
+    let installed =
+        unsafe { win::SetWindowSubclass(hotkey_field, subclass, HOTKEY_SUBCLASS_ID, 0) } != 0;
+
+    if !installed {
+        log::warn(&format!(
+            "SetWindowSubclass failed for the hotkey field, err {}; it will not record combinations",
+            win::last_error()
+        ));
+    }
 
     if WINDOW.set(hwnd).is_err() {
         log::error("settings window already created");
@@ -290,10 +310,23 @@ fn save() {
         return;
     };
 
-    let hotkey = win::window_text(field(ID_HOTKEY)).trim().to_string();
-    if settings::parse_hotkey(&hotkey).is_none() {
+    // Kept for the "is this combination even free" probe below: re-registering
+    // the combination that is already ours is not a conflict.
+    let previous = updated.clone();
+
+    let typed = win::window_text(field(ID_HOTKEY)).trim().to_string();
+    let Some(hotkey) = settings::parse_hotkey(&typed) else {
         complain(&format!(
-            "热键 “{hotkey}” 无法识别。\n\n写法示例：Win+Alt+V、Ctrl+Shift+F9"
+            "热键 “{typed}” 不能用。\n\n点进热键框直接按下组合键即可。需要至少一个修饰键（Ctrl/Alt/Shift/Win），\n只有 F1-F24 能单独使用——单独的字母或数字会吃掉全系统的那个键。"
+        ));
+        return;
+    };
+
+    let unchanged = settings::parse_hotkey(&previous.hotkey).map(Hotkey::text) == Some(hotkey.text());
+    if !unchanged && !combination_is_free(hotkey) {
+        complain(&format!(
+            "“{}” 已经被别的程序占用了，换一个组合。",
+            hotkey.text()
         ));
         return;
     }
@@ -342,7 +375,9 @@ fn save() {
 
     let sync_root = win::window_text(field(ID_SYNC_ROOT)).trim().to_string();
 
-    updated.hotkey = hotkey;
+    // Canonical spelling, so a hand-edited variant in settings.json is cleaned
+    // up on the next save.
+    updated.hotkey = hotkey.text();
     updated.sync_root_override = if sync_root.is_empty() {
         None
     } else {
@@ -374,10 +409,118 @@ fn complain(message: &str) {
 
 pub fn hide() {
     if let Some(hwnd) = WINDOW.get().copied() {
+        // Hiding takes the focus off the hotkey field, which is what puts the
+        // global hotkey back; doing it here as well means the hotkey cannot be
+        // left suspended if that notification never arrives.
+        crate::apply_hotkey();
+
         unsafe {
             win::ShowWindow(hwnd, win::SW_HIDE);
         }
     }
+}
+
+/// The hotkey field records instead of accepting text: pressing a combination is
+/// easier than spelling it, and it cannot be misspelled.
+extern "system" fn hotkey_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    _ref_data: usize,
+) -> LRESULT {
+    match message {
+        win::WM_KEYDOWN | win::WM_SYSKEYDOWN => {
+            record(wparam as u32);
+            return 0;
+        }
+
+        // TranslateMessage turns the key into a character after this point, so
+        // the keystroke has to be eaten here as well or it lands in the box.
+        win::WM_CHAR | win::WM_SYSCHAR => return 0,
+
+        _ => {}
+    }
+
+    unsafe { win::DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+/// Puts the pressed combination into the field. Modifiers are read from the
+/// keyboard rather than collected from earlier messages, which is what makes
+/// this work for combinations this process has not registered.
+fn record(vk: u32) {
+    // A lone modifier is not a combination yet, and a key with no name would
+    // leave the field holding something that cannot be saved.
+    if is_modifier(vk) {
+        return;
+    }
+
+    if vk == win::VK_ESCAPE as u32 {
+        // Escape puts back what is saved, so a mis-press is undoable.
+        if let Some(current) = crate::current_settings() {
+            set_text(ID_HOTKEY, &current.hotkey);
+        }
+        return;
+    }
+
+    let Some(hotkey) = Hotkey::new(held_modifiers(), vk) else {
+        return;
+    };
+
+    log::info(&format!("hotkey field recorded {}", hotkey.text()));
+    set_text(ID_HOTKEY, &hotkey.text());
+}
+
+fn held_modifiers() -> u32 {
+    fn down(vk: u32) -> bool {
+        // Bound first: a block directly followed by `<` reads as a type
+        // argument list to the parser.
+        let state = unsafe { win::GetKeyState(vk as i32) };
+        state < 0
+    }
+
+    let mut modifiers = 0;
+
+    if down(win::VK_CONTROL as u32) {
+        modifiers |= win::MOD_CONTROL;
+    }
+    if down(win::VK_MENU as u32) {
+        modifiers |= win::MOD_ALT;
+    }
+    if down(win::VK_SHIFT as u32) {
+        modifiers |= win::MOD_SHIFT;
+    }
+    if down(win::VK_LWIN as u32) || down(win::VK_RWIN as u32) {
+        modifiers |= win::MOD_WIN;
+    }
+
+    modifiers
+}
+
+fn is_modifier(vk: u32) -> bool {
+    [
+        win::VK_SHIFT as u32,
+        win::VK_CONTROL as u32,
+        win::VK_MENU as u32,
+        win::VK_LWIN as u32,
+        win::VK_RWIN as u32,
+    ]
+    .contains(&vk)
+}
+
+/// Registers the combination for a moment to find out whether anything else
+/// already owns it. Done here so the failure is reported before the settings
+/// are written, rather than afterwards by `apply_hotkey`.
+fn combination_is_free(hotkey: Hotkey) -> bool {
+    // A null window registers against this thread. Our own registration is
+    // dropped while the field has focus, so this cannot collide with itself.
+    if !win::register_hotkey(0, 0, hotkey.modifiers | win::MOD_NOREPEAT, hotkey.vk) {
+        return false;
+    }
+
+    win::unregister_hotkey(0, 0);
+    true
 }
 
 extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -386,6 +529,15 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             // LOWORD is the control id, HIWORD the notification code.
             let id = wparam & 0xFFFF;
             let notification = ((wparam >> 16) & 0xFFFF) as u32;
+
+            // The hotkey field stands the global hotkey down while it records,
+            // otherwise pressing the registered combination would fire the popup
+            // instead of reaching the field.
+            if id as usize == ID_HOTKEY && notification == win::EN_SETFOCUS {
+                crate::suspend_hotkey();
+            } else if id as usize == ID_HOTKEY && notification == win::EN_KILLFOCUS {
+                crate::apply_hotkey();
+            }
 
             // Keep the default push-button behaviour for Enter.
             if notification == win::BN_CLICKED || notification == 0 {
