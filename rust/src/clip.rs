@@ -91,3 +91,61 @@ pub struct ClipRecord {
     /// Sibling file name holding the heavy payload (image bytes, long text).
     pub blob: Option<String>,
 }
+
+/// Several clips as one clipboard payload: one per line, in the order they are
+/// listed.
+///
+/// A single clip is handed back untouched, so an image still copies as an image.
+/// With several, text is the only representation that can hold all of them: file
+/// lists contribute their paths, and images are dropped (the caller logs that).
+pub fn join_payloads(payloads: Vec<ClipPayload>) -> Option<ClipPayload> {
+    if payloads.len() == 1 {
+        return payloads.into_iter().next();
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for payload in payloads {
+        match payload {
+            ClipPayload::Text(text) => lines.push(text),
+            ClipPayload::Files(paths) => lines.extend(paths),
+            ClipPayload::Image(_) => {}
+        }
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    Some(ClipPayload::Text(lines.join("\n")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Multi-select copies become one text block, one clip per line; a single
+    /// clip keeps its own type so images still paste as images.
+    #[test]
+    fn several_clips_join_with_newlines() {
+        let payloads = vec![
+            ClipPayload::Text("一".to_string()),
+            ClipPayload::Files(vec!["C:\\a.txt".to_string(), "C:\\b.txt".to_string()]),
+            ClipPayload::Text("二".to_string()),
+            ClipPayload::Image(vec![1, 2, 3]),
+        ];
+
+        match join_payloads(payloads) {
+            Some(ClipPayload::Text(text)) => {
+                assert_eq!(text, "一\nC:\\a.txt\nC:\\b.txt\n二")
+            }
+            other => panic!("expected a text payload, got {other:?}"),
+        }
+
+        assert!(matches!(
+            join_payloads(vec![ClipPayload::Image(vec![1, 2, 3])]),
+            Some(ClipPayload::Image(_))
+        ));
+        assert!(join_payloads(vec![ClipPayload::Image(vec![1]), ClipPayload::Image(vec![2])]).is_none());
+        assert!(join_payloads(Vec::new()).is_none());
+    }
+}

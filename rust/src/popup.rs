@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::clip::{self, ClipPayload};
 use crate::clipboard;
 use crate::index::ClipSummary;
 use crate::log;
@@ -68,6 +69,9 @@ struct Popup {
     /// The strip as last drawn: hit tested by `tab_click`, and compared so that
     /// a repaint only happens when the set of instances actually changed.
     tabs: Mutex<Vec<MachineTab>>,
+    /// Where a Shift+arrow extension started. Reset by any single move, so the
+    /// range grows from the same place instead of from the moving caret.
+    anchor: AtomicIsize,
     /// Window that had focus before the popup opened: the paste target.
     target: AtomicIsize,
     visible: AtomicBool,
@@ -140,6 +144,7 @@ pub fn create(store: Arc<Store>) -> bool {
         | win::LBS_NOTIFY
         | win::LBS_OWNERDRAWFIXED
         | win::LBS_HASSTRINGS
+        | win::LBS_EXTENDEDSEL
         | win::LBS_NOINTEGRALHEIGHT;
 
     let list_top = LIST_TOP;
@@ -167,6 +172,7 @@ pub fn create(store: Arc<Store>) -> bool {
         items: Mutex::new(Vec::new()),
         tab: Mutex::new(None),
         tabs: Mutex::new(Vec::new()),
+        anchor: AtomicIsize::new(0),
         target: AtomicIsize::new(0),
         visible: AtomicBool::new(false),
         scale: AtomicIsize::new(100),
@@ -192,6 +198,14 @@ pub fn create(store: Arc<Store>) -> bool {
             "SetWindowSubclass failed, err {}; keyboard shortcuts will not work",
             win::last_error()
         ));
+    }
+
+    // The list gets the same treatment, because clicking a row moves the focus
+    // into it and Enter would otherwise stop working until the search box was
+    // clicked again.
+    let list_subclass: win::SUBCLASSPROC = list_proc;
+    if unsafe { win::SetWindowSubclass(list, list_subclass, SUBCLASS_ID, 0) } == 0 {
+        log::warn("SetWindowSubclass failed for the list; Enter and Ctrl+C will need the search box");
     }
 
     log::info(&format!("popup window ready (hwnd {hwnd:#x})"));
@@ -362,7 +376,11 @@ fn reload() {
         }
 
         if !summaries.is_empty() {
+            // Oldest first row selected, and the caret on it: a multiple-selection
+            // list box keeps the two separate.
+            win::SendMessageW(p.list, win::LB_SETSEL, 1, 0);
             win::SendMessageW(p.list, win::LB_SETCURSEL, 0, 0);
+            p.anchor.store(0, Ordering::SeqCst);
         }
 
         win::InvalidateRect(p.list, std::ptr::null(), 1);
@@ -502,9 +520,114 @@ fn move_selection(delta: i32) {
         Some(current) => (current as i32 + delta).clamp(0, count - 1),
     };
 
+    let shift_down = unsafe { win::GetKeyState(win::VK_SHIFT) } < 0;
+
     unsafe {
+        if shift_down {
+            // Extend from where the run started, not from wherever the caret has
+            // wandered to since.
+            let anchor = p.anchor.load(Ordering::SeqCst).max(0);
+            let first = anchor.min(next as isize) as usize;
+            let last = anchor.max(next as isize) as usize;
+
+            win::SendMessageW(p.list, win::LB_SETSEL, 0, -1);
+            let range = first | (last << 16);
+            win::SendMessageW(p.list, win::LB_SELITEMRANGE, 1, range as isize);
+        } else {
+            p.anchor.store(next as isize, Ordering::SeqCst);
+            win::SendMessageW(p.list, win::LB_SETSEL, 0, -1);
+            win::SendMessageW(p.list, win::LB_SETSEL, 1, next as isize);
+        }
+
         win::SendMessageW(p.list, win::LB_SETCURSEL, next as usize, 0);
     }
+}
+
+/// Copies the selection and closes. Enter means "put this where I am"; this
+/// means "keep this for whatever I do next", so nothing is pasted.
+fn copy_selected() {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    let items: Vec<ClipSummary> = {
+        let summaries = p.items.lock().unwrap_or_else(|e| e.into_inner());
+        selected_indices()
+            .into_iter()
+            .filter_map(|index| summaries.get(index).cloned())
+            .collect()
+    };
+
+    if items.is_empty() {
+        return;
+    }
+
+    let mut payloads = Vec::with_capacity(items.len());
+    for item in &items {
+        match p.store.read_payload(&item.stem) {
+            Some(payload) => payloads.push(payload),
+            None => log::warn(&format!("nothing copyable for {}", item.stem)),
+        }
+    }
+
+    let images = payloads
+        .iter()
+        .filter(|payload| matches!(payload, ClipPayload::Image(_)))
+        .count();
+
+    if images > 0 && payloads.len() > 1 {
+        log::warn(&format!("{images} image(s) left out of a multi-clip copy"));
+    }
+
+    let Some(payload) = clip::join_payloads(payloads) else {
+        log::warn("nothing copyable in that selection");
+        return;
+    };
+
+    if !clipboard::write(&payload) {
+        log::warn("clipboard write failed; keeping the popup open");
+        return;
+    }
+
+    log::info(&format!("copied {} clip(s) from the history list", items.len()));
+    hide();
+}
+
+/// The rows the user has selected, in list order. A multiple-selection list box
+/// reports them directly; the caret is the fallback for the one-row case.
+fn selected_indices() -> Vec<usize> {
+    let Some(p) = popup() else {
+        return Vec::new();
+    };
+
+    let count = unsafe { win::SendMessageW(p.list, win::LB_GETSELCOUNT, 0, 0) } as usize;
+    if count == 0 {
+        return selected_index().into_iter().collect();
+    }
+
+    let mut buffer = vec![0i32; count];
+    let filled = unsafe {
+        win::SendMessageW(
+            p.list,
+            win::LB_GETSELITEMS,
+            count,
+            buffer.as_mut_ptr() as LPARAM,
+        )
+    } as usize;
+
+    buffer.truncate(filled.min(count));
+    buffer.iter().map(|index| *index as usize).collect()
+}
+
+fn select_all() {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    unsafe {
+        win::SendMessageW(p.list, win::LB_SETSEL, 1, -1);
+    }
+    p.anchor.store(0, Ordering::SeqCst);
 }
 
 // ------------------------------------------------------------------ window procs
@@ -578,6 +701,12 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                 reload();
             } else if notification == win::LBN_DBLCLK {
                 commit();
+            } else if notification == win::LBN_SELCHANGE {
+                // Keep the extension anchor in step with the mouse, so a later
+                // Shift+arrow extends from where the user just clicked.
+                if let (Some(index), Some(p)) = (selected_index(), popup()) {
+                    p.anchor.store(index as isize, Ordering::SeqCst);
+                }
             }
             0
         }
@@ -596,6 +725,37 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
 
 /// The search box swallows the keys we care about, so they are intercepted here
 /// and everything else is handed back to the control.
+/// Keys that mean the same thing whichever half of the widget has focus: the
+/// search box and the list are two halves of one thing, and the user should not
+/// have to know which one the focus is in.
+///
+/// Returns true when the key was consumed.
+fn handle_key(key: i32) -> bool {
+    // VK_CONTROL is declared as u16 for SendInput; GetKeyState wants i32.
+    let control_down = unsafe { win::GetKeyState(win::VK_CONTROL as i32) } < 0;
+
+    match key {
+        win::VK_ESCAPE => hide(),
+        win::VK_RETURN => commit(),
+        win::VK_UP => move_selection(-1),
+        win::VK_DOWN => move_selection(1),
+        win::VK_PRIOR => move_selection(-8),
+        win::VK_NEXT => move_selection(8),
+        win::VK_P if control_down => toggle_pin(),
+        win::VK_C if control_down => copy_selected(),
+        win::VK_TAB if control_down => {
+            // Shift walks the strip backwards.
+            let shift_down = unsafe { win::GetKeyState(win::VK_SHIFT) } < 0;
+            cycle_tab(if shift_down { -1 } else { 1 });
+        }
+        _ => return false,
+    }
+
+    true
+}
+
+/// The search box swallows the keys we care about, so they are intercepted here
+/// and everything else is handed back to the control.
 extern "system" fn search_proc(
     hwnd: HWND,
     message: u32,
@@ -604,47 +764,55 @@ extern "system" fn search_proc(
     _subclass_id: usize,
     _ref_data: usize,
 ) -> LRESULT {
+    if message == win::WM_KEYDOWN && handle_key(wparam as i32) {
+        return 0;
+    }
+
+    unsafe { win::DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+/// The list gets the same keys: clicking a row moves the focus into it, and
+/// without this Enter would stop working until the search box was clicked again.
+///
+/// Ctrl+A is the list's alone — in a text box it means "select the text", which
+/// the EDIT already does for itself.
+extern "system" fn list_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    _ref_data: usize,
+) -> LRESULT {
+    // Typing belongs in the search box. Without this, a click on a row leaves
+    // the list focused and the next keystroke does list-box type-ahead instead
+    // of filtering. The WM_CHAR is forwarded rather than the key, because
+    // TranslateMessage has already been and gone for this one.
+    if message == win::WM_CHAR {
+        let code = wparam as u32;
+
+        if code >= 0x20 || code == 0x08 {
+            if let Some(p) = popup() {
+                unsafe {
+                    win::SetFocus(p.search);
+                    win::SendMessageW(p.search, win::WM_CHAR, wparam, lparam);
+                }
+            }
+            return 0;
+        }
+    }
+
     if message == win::WM_KEYDOWN {
         let key = wparam as i32;
-        // VK_CONTROL is declared as u16 for SendInput; GetKeyState wants i32.
         let control_down = unsafe { win::GetKeyState(win::VK_CONTROL as i32) } < 0;
 
-        match key {
-            win::VK_ESCAPE => {
-                hide();
-                return 0;
-            }
-            win::VK_RETURN => {
-                commit();
-                return 0;
-            }
-            win::VK_UP => {
-                move_selection(-1);
-                return 0;
-            }
-            win::VK_DOWN => {
-                move_selection(1);
-                return 0;
-            }
-            win::VK_PRIOR => {
-                move_selection(-8);
-                return 0;
-            }
-            win::VK_NEXT => {
-                move_selection(8);
-                return 0;
-            }
-            win::VK_P if control_down => {
-                toggle_pin();
-                return 0;
-            }
-            win::VK_TAB if control_down => {
-                // Shift walks the strip backwards.
-                let shift_down = unsafe { win::GetKeyState(win::VK_SHIFT) } < 0;
-                cycle_tab(if shift_down { -1 } else { 1 });
-                return 0;
-            }
-            _ => {}
+        if key == win::VK_A && control_down {
+            select_all();
+            return 0;
+        }
+
+        if handle_key(key) {
+            return 0;
         }
     }
 
