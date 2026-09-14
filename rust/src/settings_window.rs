@@ -40,6 +40,12 @@ const ID_CANCEL: usize = 11;
 /// Subclass id for the hotkey field, which is the only control here that has to
 /// intercept its own keystrokes.
 const HOTKEY_SUBCLASS_ID: usize = 1;
+
+/// The row labels and the note are moved by `layout`, which needs a handle for
+/// each, so they get ids of their own — a control created without one cannot be
+/// found again.
+const LABEL_ID_BASE: usize = 100;
+const NOTE_ID: usize = 200;
 static WINDOW: OnceLock<HWND> = OnceLock::new();
 
 fn field(id: usize) -> HWND {
@@ -106,7 +112,17 @@ pub fn create() -> bool {
     for (index, (id, label)) in rows.iter().copied().enumerate() {
         let y = MARGIN + index as i32 * ROW_STEP;
 
-        win::create_child_id("STATIC", label, label_style, hwnd, 0, MARGIN, y + 4, LABEL_WIDTH, ROW_HEIGHT);
+        win::create_child_id(
+            "STATIC",
+            label,
+            label_style,
+            hwnd,
+            LABEL_ID_BASE + index,
+            MARGIN,
+            y + 4,
+            LABEL_WIDTH,
+            ROW_HEIGHT,
+        );
 
         // Numeric fields reject non-digits at the control level, so the only
         // validation left is range.
@@ -137,7 +153,7 @@ pub fn create() -> bool {
         "热键与三个记录开关立即生效；其余项需要重启 ClipPlus。",
         label_style,
         hwnd,
-        0,
+        NOTE_ID,
         MARGIN,
         check_y + ROW_STEP,
         CLIENT_WIDTH - MARGIN * 2,
@@ -193,6 +209,93 @@ pub fn create() -> bool {
     true
 }
 
+/// Places every control for the monitor's scale and hands it the matching font.
+///
+/// Done on each show rather than once at creation: the window opens on whichever
+/// monitor the tray click came from, and those do not have to share a scale.
+// ponytail: dragging the window to a differently scaled monitor does not
+// re-layout (that needs WM_DPICHANGED); close and reopen it.
+fn layout(hwnd: HWND, scale: f64) {
+    let margin = win::scaled(MARGIN, scale);
+    let label_width = win::scaled(LABEL_WIDTH, scale);
+    let field_width = win::scaled(FIELD_WIDTH, scale);
+    let row_height = win::scaled(ROW_HEIGHT, scale);
+    let row_step = win::scaled(ROW_STEP, scale);
+    let field_x = margin + label_width + win::scaled(8, scale);
+    let font = win::ui_font_for_scale(scale);
+
+    let place = |id: usize, x: i32, y: i32, width: i32, height: i32| {
+        let control = win::child_by_id(hwnd, id);
+        if control == 0 {
+            return;
+        }
+
+        unsafe {
+            win::SendMessageW(control, win::WM_SETFONT, font as usize, 1);
+            win::SetWindowPos(
+                control,
+                0,
+                x,
+                y,
+                width,
+                height,
+                win::SWP_NOACTIVATE,
+            );
+        }
+    };
+
+    let fields = [
+        ID_HOTKEY,
+        ID_SYNC_ROOT,
+        ID_RETENTION,
+        ID_MAX_BLOB_MB,
+        ID_INLINE_LIMIT,
+        ID_RESCAN,
+    ];
+
+    for index in 0..fields.len() as i32 {
+        let y = margin + index * row_step;
+
+        place(
+            LABEL_ID_BASE + index as usize,
+            margin,
+            y + win::scaled(4, scale),
+            label_width,
+            row_height,
+        );
+        place(fields[index as usize], field_x, y, field_width, row_height);
+    }
+
+    let check_y = margin + 6 * row_step + win::scaled(6, scale);
+    let checks = [ID_CAPTURE_TEXT, ID_CAPTURE_IMAGES, ID_CAPTURE_FILES];
+
+    for (index, id) in checks.into_iter().enumerate() {
+        let x = margin + index as i32 * win::scaled(140, scale);
+        place(id, x, check_y, win::scaled(130, scale), row_height);
+    }
+
+    place(
+        NOTE_ID,
+        margin,
+        check_y + row_step,
+        win::scaled(CLIENT_WIDTH, scale) - margin * 2,
+        row_height,
+    );
+
+    let button_y = check_y + row_step * 2 + win::scaled(6, scale);
+    let button_width = win::scaled(110, scale);
+    let button_height = win::scaled(26, scale);
+
+    place(ID_SAVE, margin, button_y, button_width, button_height);
+    place(
+        ID_CANCEL,
+        margin + win::scaled(120, scale),
+        button_y,
+        button_width,
+        button_height,
+    );
+}
+
 pub fn show() {
     let Some(current) = crate::current_settings() else {
         return;
@@ -207,11 +310,16 @@ pub fn show() {
     let cursor = win::cursor_position();
     let area = win::work_area_at(cursor);
 
+
+    // Every size in this file is written at 96 DPI, so the monitor's scale has
+    // to be applied by hand: Windows does not do it for a per-monitor-DPI
+    // process, and a 4K display would get 14-pixel text if it did not.
+    let scale = win::dpi_at(cursor) as f64 / 96.0;
     let mut frame = win::RECT {
         left: 0,
         top: 0,
-        right: CLIENT_WIDTH,
-        bottom: CLIENT_HEIGHT,
+        right: win::scaled(CLIENT_WIDTH, scale),
+        bottom: win::scaled(CLIENT_HEIGHT, scale),
     };
     unsafe {
         win::AdjustWindowRectEx(
@@ -226,6 +334,8 @@ pub fn show() {
 
     let left = area.left + (area.right - area.left - width) / 2;
     let top = area.top + (area.bottom - area.top - height) / 3;
+
+    layout(hwnd, scale);
 
     unsafe {
         win::SetWindowPos(hwnd, 0, left, top, width, height, win::SWP_SHOWWINDOW);

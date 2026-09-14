@@ -17,7 +17,7 @@ use crate::clipboard;
 use crate::index::ClipSummary;
 use crate::log;
 use crate::store::{MachineTab, Store};
-use crate::win::{self, HBRUSH, HWND, LPARAM, LRESULT, WPARAM};
+use crate::win::{self, scaled, HBRUSH, HWND, LPARAM, LRESULT, WPARAM};
 
 const WIDTH: i32 = 620;
 const PAD: i32 = 10;
@@ -86,9 +86,6 @@ fn popup() -> Option<&'static Popup> {
     POPUP.get()
 }
 
-fn scaled(value: i32, scale: f64) -> i32 {
-    (value as f64 * scale).round() as i32
-}
 
 /// Current scale factor, defaulting to 1.0 before the first show.
 fn current_scale() -> f64 {
@@ -315,18 +312,14 @@ fn ensure_fonts(p: &'static Popup, scale: f64) {
         let main = win::ui_font(main_height);
         let meta = win::ui_font(meta_height);
 
-        let old_main = p.font_main.swap(main, Ordering::SeqCst);
-        let old_meta = p.font_meta.swap(meta, Ordering::SeqCst);
-
         // The search box is a real EDIT, so it has to be told; the rows beside
         // it are drawn by this file and would otherwise not match it.
         win::SendMessageW(p.search, win::WM_SETFONT, main as usize, 1);
-        if old_main != 0 {
-            win::DeleteObject(old_main);
-        }
-        if old_meta != 0 {
-            win::DeleteObject(old_meta);
-        }
+
+        // Stored rather than deleted on replacement: `win::ui_font` owns the
+        // handle and hands the same one back for the same height.
+        p.font_main.store(main, Ordering::SeqCst);
+        p.font_meta.store(meta, Ordering::SeqCst);
     }
 
     p.scale.store(key, Ordering::SeqCst);

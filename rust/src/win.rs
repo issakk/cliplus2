@@ -12,8 +12,9 @@
 
 #![allow(dead_code, non_snake_case)]
 
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 // --------------------------------------------------------------------- aliases
 
@@ -989,10 +990,11 @@ pub fn create_child_id(
     };
 
     // Windows hands a new control the stock system font, and this app draws in
-    // one face, so it is applied here rather than at each of the dozen call
-    // sites. `win::ui_font` covers windows that need another size.
+    // one face at a size that follows the monitor, so it is set here rather than
+    // at each of the dozen call sites.
     unsafe {
-        SendMessageW(child, WM_SETFONT, default_ui_font() as usize, 1);
+        let font = ui_font_for_scale(dpi_scale_of(parent));
+        SendMessageW(child, WM_SETFONT, font as usize, 1);
     }
 
     child
@@ -1010,15 +1012,29 @@ pub const UI_FACE: &str = "Microsoft YaHei UI";
 
 /// One step up from the stock 9 pt (12 px), which still fits the row grid the
 /// settings window was laid out with.
-const UI_FONT_HEIGHT: i32 = 14;
+pub const UI_FONT_HEIGHT: i32 = 14;
 
 /// A font in the app's face. The height is in pixels and negative, the
 /// character-height convention `CreateFontW` wants; callers that need another
 /// size (the popup's rows are 16 px) make their own.
 pub fn ui_font(pixel_height: i32) -> HFONT {
+    // One font per height, kept for the life of the process: every control asks
+    // for its font when it is created, and the same height comes back after a
+    // DPI change.
+    static FONTS: OnceLock<Mutex<HashMap<i32, HFONT>>> = OnceLock::new();
+    let fonts = FONTS.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(font) = fonts
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&pixel_height)
+    {
+        return *font;
+    }
+
     let face = wide(UI_FACE);
 
-    unsafe {
+    let font = unsafe {
         CreateFontW(
             pixel_height,
             0,
@@ -1035,14 +1051,41 @@ pub fn ui_font(pixel_height: i32) -> HFONT {
             0,
             face.as_ptr(),
         )
+    };
+
+    fonts
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(pixel_height, font);
+
+    font
+}
+
+/// The default control font for a monitor scale. Windows would hand a control the
+/// stock system font at one fixed pixel height; following the display instead is
+/// what keeps text readable on a 4K screen.
+pub fn ui_font_for_scale(scale: f64) -> HFONT {
+    ui_font(scaled(UI_FONT_HEIGHT, scale))
+}
+
+/// The scale factor of the monitor a window is on (1.0 = 96 DPI).
+pub fn dpi_scale_of(hwnd: HWND) -> f64 {
+    if hwnd == 0 {
+        return 1.0;
+    }
+
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    if dpi == 0 {
+        1.0
+    } else {
+        dpi as f64 / 96.0
     }
 }
 
-/// The font every control created through this module gets. Made once and never
-/// deleted: it outlives every window, like the popup's brushes.
-fn default_ui_font() -> HFONT {
-    static FONT: OnceLock<HFONT> = OnceLock::new();
-    *FONT.get_or_init(|| ui_font(UI_FONT_HEIGHT))
+/// Logical pixels to physical. Sizes in this crate are written at 96 DPI and
+/// multiplied by the monitor's scale before they are used.
+pub fn scaled(value: i32, scale: f64) -> i32 {
+    (value as f64 * scale).round() as i32
 }
 
 pub fn register_hotkey(hwnd: HWND, id: i32, modifiers: u32, vk: u32) -> bool {
