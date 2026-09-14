@@ -1,9 +1,8 @@
-//! In-memory index of everything found in the synced folder.
+//! In-memory index of everything found in the synced databases.
 //!
-//! The folder is the source of truth; this is a projection that a restart
-//! rebuilds from scratch, from the databases and legacy files in the folder.
-//! Nothing here is ever persisted, which is exactly why there is no cache to
-//! go stale.
+//! The databases are the source of truth; this is a projection that a restart
+//! rebuilds from scratch. Nothing here is ever persisted, which is exactly why
+//! there is no cache to go stale.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -20,11 +19,9 @@ pub struct ClipItem {
     pub machine: String,
     pub kind: ClipKind,
     pub hash: String,
-    /// The file this entry lives in: a legacy `.clip.json`, or `clips.db`.
-    pub owner_path: PathBuf,
-    /// True when the entry came out of a database, where retention deletes a
-    /// row instead of a file.
-    pub in_db: bool,
+    /// The database this entry lives in. Its folder is where the `.bin` and
+    /// `.pin` siblings go.
+    pub db_path: PathBuf,
     /// Full text, or the retained prefix when `has_blob` is set.
     pub text: String,
     pub has_blob: bool,
@@ -46,24 +43,9 @@ pub struct ClipSummary {
 }
 
 impl ClipItem {
-    /// A row read out of a synced database. Separate from `from_record` so the
-    /// distinction is made at the call site instead of defaulting to the
-    /// dangerous side: retention deletes a row, never the file it lives in.
-    pub fn from_row(
-        record: &ClipRecord,
-        db_path: PathBuf,
-        stem: String,
-        pinned: bool,
-        local_machine: &str,
-    ) -> ClipItem {
-        let mut item = ClipItem::from_record(record, db_path, stem, pinned, local_machine);
-        item.in_db = true;
-        item
-    }
-
     pub fn from_record(
         record: &ClipRecord,
-        owner_path: PathBuf,
+        db_path: PathBuf,
         stem: String,
         pinned: bool,
         local_machine: &str,
@@ -73,7 +55,7 @@ impl ClipItem {
         let has_blob = record.blob.is_some();
 
         let blob_path = match &record.blob {
-            Some(name) => owner_path.with_file_name(name),
+            Some(name) => db_path.with_file_name(name),
             None => PathBuf::new(),
         };
 
@@ -86,8 +68,7 @@ impl ClipItem {
             machine: record.machine.clone(),
             kind,
             hash: record.hash.clone(),
-            owner_path,
-            in_db: false,
+            db_path,
             text,
             has_blob,
             blob_path,
@@ -98,7 +79,7 @@ impl ClipItem {
     }
 
     pub fn pin_path(&self) -> PathBuf {
-        pin_path_for(&self.owner_path, &self.stem)
+        pin_path_for(&self.db_path, &self.stem)
     }
 
     pub fn summary(&self) -> ClipSummary {
@@ -111,11 +92,10 @@ impl ClipItem {
     }
 }
 
-/// `<stem>.pin`, in the folder that owns the entry: next to the `.clip.json`
-/// for legacy rows, next to `clips.db` for database rows. Pinning an immutable
-/// clip means adding a sibling, never rewriting the clip.
-pub fn pin_path_for(owner_path: &std::path::Path, stem: &str) -> PathBuf {
-    let folder = owner_path.parent().unwrap_or(std::path::Path::new(""));
+/// `<stem>.pin`, in the database's own folder. Pinning adds a sibling marker
+/// rather than rewriting the row, so it costs nothing and cannot conflict.
+pub fn pin_path_for(db_path: &std::path::Path, stem: &str) -> PathBuf {
+    let folder = db_path.parent().unwrap_or(std::path::Path::new(""));
     folder.join(format!("{stem}{}", crate::store::PIN_SUFFIX))
 }
 
@@ -132,9 +112,6 @@ impl Index {
         self.items.len()
     }
 
-    pub fn has_stem(&self, stem: &str) -> bool {
-        self.stems.contains(stem)
-    }
 
     pub fn has_hash(&self, hash: &str) -> bool {
         self.hashes.contains(hash)
@@ -177,11 +154,11 @@ impl Index {
 
     /// Drops every entry that came out of one container. Used when a database
     /// changed (its rows are re-read from scratch) or disappeared.
-    pub fn forget_owner(&mut self, owner: &std::path::Path) {
+    pub fn forget_db(&mut self, db_path: &std::path::Path) {
         let doomed: Vec<String> = self
             .items
             .iter()
-            .filter(|item| item.owner_path == owner)
+            .filter(|item| item.db_path == db_path)
             .map(|item| item.stem.clone())
             .collect();
 

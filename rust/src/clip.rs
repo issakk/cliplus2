@@ -1,11 +1,8 @@
-//! Clipboard payloads and the on-disk record schema.
+//! Clipboard payloads and the row schema.
 //!
-//! `ClipRecord`'s field names *are* the on-disk schema: a database row is built
-//! from it, and a legacy `.clip.json` deserializes into it, so one struct covers
-//! both. Do not rename a field without a
-//! migration that every other machine can follow.
-
-use serde::{Deserialize, Serialize};
+//! `ClipRecord` *is* one row of a synced database: it is built when a clip is
+//! captured and rebuilt when a database is read back. Its field names are the
+//! column names in the SQL, so renaming one means changing both.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(i32)]
@@ -16,6 +13,8 @@ pub enum ClipKind {
 }
 
 impl ClipKind {
+    /// The `kind` column. The discriminants above are mixed into the content
+    /// hash as well, so both halves of this type are already in the databases.
     pub fn name(self) -> &'static str {
         match self {
             ClipKind::Text => "text",
@@ -24,8 +23,8 @@ impl ClipKind {
         }
     }
 
-    /// Used when reading existing records back off disk.
-    #[allow(dead_code)]
+    /// Turns the `kind` column back into an enum. An unknown value reads as
+    /// text, which is the harmless choice for a hand-edited database.
     pub fn from_name(name: &str) -> ClipKind {
         match name {
             "image" => ClipKind::Image,
@@ -39,7 +38,7 @@ impl ClipKind {
 #[derive(Clone, Debug)]
 pub enum ClipPayload {
     Text(String),
-    /// Newline-joined absolute paths, the shape already in the history folder.
+    /// Newline-joined absolute paths.
     Files(Vec<String>),
     /// PNG bytes.
     Image(Vec<u8>),
@@ -54,9 +53,8 @@ impl ClipPayload {
         }
     }
 
-    /// The exact bytes the content hash is computed over. The formula is frozen:
-    /// a hash that is already stored has to keep matching, or the same clip gets
-    /// written a second time.
+    /// The exact bytes the content hash is computed over. Every machine has to
+    /// feed in the same bytes, or the same clip gets stored once per machine.
     pub fn body(&self) -> Vec<u8> {
         match self {
             ClipPayload::Text(text) => text.as_bytes().to_vec(),
@@ -74,28 +72,22 @@ impl ClipPayload {
     }
 }
 
-/// On-disk schema, version 1: still the shape of a legacy `.clip.json`, and now
-/// also the source of every database row. Field order is cosmetic.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+/// One clip: what was copied, when, and by which machine.
+#[derive(Clone, Debug)]
 pub struct ClipRecord {
-    pub v: u32,
+    /// Row key, and the stem of the `.bin` and `.pin` siblings.
     pub id: String,
     pub at: i64,
     pub machine: String,
     pub kind: String,
     pub hash: String,
 
-    /// Full text, or a truncated prefix when `blob` is set.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Full text, or the retained prefix when `blob` is set.
     pub text: Option<String>,
-
-    pub truncated: bool,
 
     /// Payload size in bytes, for display only.
     pub length: i64,
 
     /// Sibling file name holding the heavy payload (image bytes, long text).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub blob: Option<String>,
 }

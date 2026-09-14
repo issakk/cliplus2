@@ -1,8 +1,5 @@
 //! Storage: capture queue, disk layout, index, pinning and retention.
 //!
-//! The layout is unchanged from the file-per-clip era, so a folder an earlier
-//! build filled keeps working, but only databases are written now:
-//!
 //! * One database per machine per month: `<machine>/<yyyy-MM>/clips.db`, written
 //!   only by the machine it is named after. A sync client resolves the same file
 //!   changed twice as last-writer-wins, so one writer per file makes a conflict
@@ -13,14 +10,11 @@
 //! * Heavy payloads stay out of the database, as `<stem>.bin` siblings. A sync
 //!   client moves whole files: an image stored in a row would re-upload every
 //!   image of the month on every capture.
-//! * Pins are still empty `<stem>.pin` markers in the folder that owns the clip.
+//! * Pins are empty `<stem>.pin` markers in the folder that owns the clip.
 //!   An empty file has identical content on every machine, so two machines
 //!   creating the same marker cannot be seen as a conflict.
-//! * The older `<stem>.clip.json` files are still read and never written, so
-//!   existing history keeps working without a migration pass.
 //! * The `INSERT` is the commit point: a reader sees the previous or the new
-//!   state, never half a clip. That is the property the `.tmp` + rename dance
-//!   existed to provide, and blobs are still written before the row that points
+//!   state, never half a clip. Blobs are written before the row that points
 //!   at them, so a crash leaves an unreferenced blob rather than a broken entry.
 
 use std::collections::{HashMap, HashSet};
@@ -37,11 +31,10 @@ use rusqlite::{params, Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 
 use crate::clip::{ClipKind, ClipPayload, ClipRecord};
-use crate::index::{self, ClipItem, ClipSummary, Index};
+use crate::index::{ClipItem, ClipSummary, Index};
 use crate::log;
 use crate::settings::{self, Settings};
 
-pub const JSON_SUFFIX: &str = ".clip.json";
 pub const PIN_SUFFIX: &str = ".pin";
 const BIN_SUFFIX: &str = ".bin";
 
@@ -196,14 +189,12 @@ impl Store {
         }
 
         let record = ClipRecord {
-            v: 1,
             id: stem.clone(),
             at: now,
             machine: self.settings.machine_id.clone(),
             kind: payload.kind().name().to_string(),
             hash,
             text: inline,
-            truncated: blob_name.is_some() && payload.kind() == ClipKind::Text,
             length: body.len() as i64,
             blob: blob_name,
         };
@@ -283,7 +274,7 @@ impl Store {
 
     // ---------------------------------------------------------------- indexing
 
-    /// Full folder walk: every database, plus the legacy files an earlier build
+    /// Full folder walk: every database under the sync root, plus pin markers.
     /// Databases are stamped, so one that has not changed costs a `stat`.
     pub fn rescan(&self) {
         let root = self.settings.sync_root.clone();
@@ -329,8 +320,6 @@ impl Store {
                 if !stem.is_empty() {
                     pinned.insert(stem);
                 }
-            } else if name.ends_with(JSON_SUFFIX) {
-                self.ingest_file(&path);
             }
         }
     }
@@ -363,19 +352,17 @@ impl Store {
                 .exists();
 
             let record = ClipRecord {
-                v: 1,
                 id: row.stem.clone(),
                 at: row.at,
                 machine: row.machine,
                 kind: row.kind,
                 hash: row.hash,
                 text: row.text,
-                truncated: false,
                 length: row.length,
                 blob: row.blob,
             };
 
-            items.push(ClipItem::from_row(
+            items.push(ClipItem::from_record(
                 &record,
                 path.to_path_buf(),
                 row.stem,
@@ -388,7 +375,7 @@ impl Store {
 
         let count = items.len();
         let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
-        index.forget_owner(path);
+        index.forget_db(path);
 
         for item in items {
             index.insert(item);
@@ -453,50 +440,6 @@ impl Store {
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(path.to_path_buf(), stamp);
         }
-    }
-
-    /// The legacy `.clip.json` format: read-only, so an existing folder still works.
-    fn ingest_file(&self, path: &Path) {
-        let file_stem = stem_of(path, JSON_SUFFIX);
-        if file_stem.is_empty() {
-            return;
-        }
-
-        {
-            let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
-            if index.has_stem(&file_stem) {
-                return;
-            }
-        }
-
-        // A half-written file from a sync client just gets skipped; the periodic
-        // rescan picks it up once it is complete.
-        let Ok(text) = fs::read_to_string(path) else {
-            return;
-        };
-        let Ok(record) = serde_json::from_str::<ClipRecord>(&text) else {
-            return;
-        };
-
-        let stem = if record.id.is_empty() {
-            file_stem
-        } else {
-            record.id.clone()
-        };
-        let pinned = index::pin_path_for(path, &stem).exists();
-
-        let item = ClipItem::from_record(
-            &record,
-            path.to_path_buf(),
-            stem,
-            pinned,
-            &self.settings.machine_id,
-        );
-
-        self.index
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(item);
     }
 
     // --------------------------------------------------------------------- pins
@@ -587,8 +530,6 @@ impl Store {
 
         if name == DB_NAME {
             self.refresh_db(path, true);
-        } else if name.ends_with(JSON_SUFFIX) {
-            self.ingest_file(path);
         } else if name.ends_with(PIN_SUFFIX) {
             let stem = stem_of(path, PIN_SUFFIX);
             let exists = path.exists();
@@ -606,23 +547,13 @@ impl Store {
             self.index
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .forget_owner(path);
+                .forget_db(path);
             self.loaded
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(path);
 
             log::info(&format!("clip database removed: {}", path.display()));
-        } else if name.ends_with(JSON_SUFFIX) {
-            let stem = stem_of(path, JSON_SUFFIX);
-            let removed = {
-                let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
-                index.forget(&stem)
-            };
-
-            if let Some(item) = removed {
-                log::info(&format!("clip removed: {}", item.stem));
-            }
         } else if name.ends_with(PIN_SUFFIX) {
             let stem = stem_of(path, PIN_SUFFIX);
             self.index
@@ -698,8 +629,7 @@ impl Store {
     }
 }
 
-/// One clip, as stored. Mirrors `ClipRecord`, which is also what the legacy
-/// reader produces, so both paths build index entries the same way.
+/// One row, straight out of the database.
 struct Row {
     stem: String,
     at: i64,
@@ -772,17 +702,9 @@ fn delete_row(db_path: &Path, stem: &str) {
     }
 }
 
-/// Deletes one clip: its row (or the legacy file), its blob, and its pin marker.
-///
-/// Split out of `prune_old` so the one destructive rule in this file — a row
-/// read from a database must never take the database with it — is testable
-/// without a live store.
+/// Deletes one clip: its row, its blob, and its pin marker.
 fn delete_clip(item: &ClipItem) {
-    if item.in_db {
-        delete_row(&item.owner_path, &item.stem);
-    } else {
-        remove_file(&item.owner_path);
-    }
+    delete_row(&item.db_path, &item.stem);
 
     if item.has_blob && !item.blob_path.as_os_str().is_empty() {
         remove_file(&item.blob_path);
@@ -842,7 +764,7 @@ fn plan_payload(
 /// SHA-256 over a 4-byte kind prefix plus the payload.
 ///
 /// The kind is mixed in so identical bytes stored as text and as an image are
-/// different clips. Uppercase hex, and frozen: a hash already in the folder has
+/// different clips. Uppercase hex, and frozen: a hash already in a database has
 /// to keep matching.
 fn hash_of(kind: ClipKind, body: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -890,14 +812,12 @@ mod tests {
 
     fn record(stem: &str, text: Option<&str>, blob: Option<&str>) -> ClipRecord {
         ClipRecord {
-            v: 1,
             id: stem.to_string(),
             at: 1_769_000_000_000,
             machine: "3f9a2c81".to_string(),
             kind: if blob.is_some() { "image" } else { "text" }.to_string(),
             hash: "AB".repeat(32),
             text: text.map(str::to_string),
-            truncated: false,
             length: 5,
             blob: blob.map(str::to_string),
         }
@@ -952,10 +872,9 @@ mod tests {
         rows
     }
 
-    /// The one destructive rule in this file: a row that came out of a
-    /// database must delete the row, never the database that holds it.
-    /// Retention is off by default, so a mistake here would stay hidden until
-    /// the day someone turns it on.
+    /// Retention is the only thing in the app that destroys data, and it is
+    /// off by default, so its two halves get a test: the row goes, and what it
+    /// left beside the database goes with it.
     #[test]
     fn retention_deletes_the_row_not_the_database() {
         let dir = scratch("retention");
@@ -967,7 +886,7 @@ mod tests {
         fs::write(dir.join("stem-1.pin"), []).unwrap();
 
         let row = record("stem-1", None, Some("stem-1.bin"));
-        let item = ClipItem::from_row(&row, path.clone(), "stem-1".to_string(), true, "3f9a2c81");
+        let item = ClipItem::from_record(&row, path.clone(), "stem-1".to_string(), true, "3f9a2c81");
         delete_clip(&item);
 
         assert!(path.exists(), "the database must outlive its own row");
