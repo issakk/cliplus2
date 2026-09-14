@@ -143,6 +143,8 @@ pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_COMMAND: u32 = 0x0111;
 pub const WM_CTLCOLOREDIT: u32 = 0x0133;
 pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
+pub const WM_PAINT: u32 = 0x000F;
+pub const WM_LBUTTONDOWN: u32 = 0x0201;
 
 pub const EN_CHANGE: u32 = 0x0300;
 pub const LBN_DBLCLK: u32 = 2;
@@ -160,6 +162,8 @@ pub const VK_NEXT: i32 = 0x22;
 pub const VK_UP: i32 = 0x26;
 pub const VK_DOWN: i32 = 0x28;
 pub const VK_P: i32 = 0x50;
+pub const VK_TAB: i32 = 0x09;
+pub const VK_SHIFT: i32 = 0x10;
 
 pub const ODS_SELECTED: u32 = 0x0001;
 
@@ -168,6 +172,7 @@ pub const DT_VCENTER: u32 = 0x0004;
 pub const DT_SINGLELINE: u32 = 0x0020;
 pub const DT_NOPREFIX: u32 = 0x0800;
 pub const DT_END_ELLIPSIS: u32 = 0x8000;
+pub const DT_CENTER: u32 = 0x0001;
 
 pub const TRANSPARENT_BK: i32 = 1;
 
@@ -199,6 +204,18 @@ pub struct RECT {
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
+}
+
+/// Only ever filled in by `BeginPaint`, never read field by field here.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PAINTSTRUCT {
+    pub hdc: HDC,
+    pub erase: i32,
+    pub paint_rect: RECT,
+    pub restore: i32,
+    pub inc_update: i32,
+    pub reserved: [u8; 32],
 }
 
 #[repr(C)]
@@ -403,6 +420,8 @@ extern "system" {
     ) -> i32;
     pub fn GetClientRect(hWnd: HWND, lpRect: *mut RECT) -> i32;
     pub fn InvalidateRect(hWnd: HWND, lpRect: *const RECT, bErase: i32) -> i32;
+    pub fn BeginPaint(hWnd: HWND, lpPaint: *mut PAINTSTRUCT) -> HDC;
+    pub fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) -> i32;
     pub fn GetDpiForWindow(hwnd: HWND) -> u32;
 
     // --- tray icon and its menu ---

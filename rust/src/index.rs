@@ -184,6 +184,21 @@ impl Index {
         }
     }
 
+    /// Every instance that has a clip here, newest activity first. One pass: the
+    /// items are already sorted by time, so the first clip seen for an instance
+    /// is its newest.
+    pub fn machines(&self) -> Vec<(String, i64)> {
+        let mut out: Vec<(String, i64)> = Vec::new();
+
+        for item in &self.items {
+            if !out.iter().any(|(id, _)| id == &item.machine) {
+                out.push((item.machine.clone(), item.at));
+            }
+        }
+
+        out
+    }
+
     /// Clips eligible for retention: this machine's own, old enough, not pinned.
     pub fn stale_clips(&self, cutoff_ms: i64, local_machine: &str) -> Vec<ClipItem> {
         self.items
@@ -195,15 +210,25 @@ impl Index {
             .collect()
     }
 
-    /// Pinned rows first, then newest first. Two passes rather than a sort, so
-    /// the stored order can stay purely time-based.
-    pub fn query(&self, needle: Option<&str>, limit: usize) -> Vec<ClipSummary> {
+    /// Pinned rows first, then newest first. Two passes rather than a sort.
+    pub fn query(
+        &self,
+        machine: Option<&str>,
+        needle: Option<&str>,
+        limit: usize,
+    ) -> Vec<ClipSummary> {
         let mut out = Vec::with_capacity(limit.min(self.items.len()));
 
         for want_pinned in [true, false] {
             for item in &self.items {
                 if item.pinned != want_pinned {
                     continue;
+                }
+
+                if let Some(machine) = machine {
+                    if item.machine != machine {
+                        continue;
+                    }
                 }
 
                 if let Some(needle) = needle {
@@ -326,5 +351,55 @@ fn build_meta(
         format!("{label} · {time} · {who} · 完整内容在 .bin")
     } else {
         format!("{label} · {time} · {who}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(stem: &str, machine: &str, at: i64) -> ClipItem {
+        let record = ClipRecord {
+            id: stem.to_string(),
+            at,
+            machine: machine.to_string(),
+            kind: "text".to_string(),
+            hash: format!("hash-{stem}"),
+            text: Some(format!("clip {stem}")),
+            length: 8,
+            blob: None,
+        };
+
+        ClipItem::from_record(
+            &record,
+            PathBuf::from("C:/sync/clips.db"),
+            stem.to_string(),
+            false,
+            "local",
+        )
+    }
+
+    /// The instance strip and the per-instance filter are what the popup tabs
+    /// are built on: one entry per machine, newest activity first, and a tab
+    /// that lists only its own clips.
+    #[test]
+    fn machines_are_listed_once_newest_first() {
+        let mut index = Index::default();
+        index.insert(item("a1", "aaa", 100));
+        index.insert(item("b1", "bbb", 300));
+        index.insert(item("a2", "aaa", 200));
+
+        let machines: Vec<String> = index.machines().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(machines, vec!["bbb".to_string(), "aaa".to_string()]);
+
+        let mine: Vec<String> = index
+            .query(Some("aaa"), None, 10)
+            .into_iter()
+            .map(|summary| summary.stem)
+            .collect();
+        assert_eq!(mine, vec!["a2".to_string(), "a1".to_string()]);
+
+        assert_eq!(index.query(None, None, 10).len(), 3);
+        assert!(index.query(Some("bbb"), Some("clip a"), 10).is_empty());
     }
 }

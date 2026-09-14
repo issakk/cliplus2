@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crate::clipboard;
 use crate::index::ClipSummary;
 use crate::log;
-use crate::store::Store;
+use crate::store::{MachineTab, Store};
 use crate::win::{self, HBRUSH, HWND, LPARAM, LRESULT, WPARAM};
 
 const WIDTH: i32 = 620;
@@ -24,8 +24,19 @@ const PAD: i32 = 10;
 const SEARCH_HEIGHT: i32 = 30;
 const GAP: i32 = 8;
 
-/// Chosen so the list holds exactly eight whole rows: 48 + 46*8 + 10 = 426.
-const HEIGHT: i32 = 426;
+/// The instance strip sits between the search box and the list. One fixed
+/// width per tab, because measuring labels would mean a DC and a font round
+/// trip for a strip that is two or three tabs wide in practice.
+// ponytail: a sixth instance runs off the right edge; measure and wrap then.
+const TAB_TOP: i32 = PAD + SEARCH_HEIGHT + 6;
+const TAB_HEIGHT: i32 = 26;
+const TAB_WIDTH: i32 = 96;
+const TAB_GAP: i32 = 6;
+
+const LIST_TOP: i32 = TAB_TOP + TAB_HEIGHT + GAP;
+
+/// Chosen so the list still holds exactly eight whole rows: 80 + 46*8 + 10.
+const HEIGHT: i32 = LIST_TOP + ROW_HEIGHT * 8 + PAD;
 const ROW_HEIGHT: i32 = 46;
 const LINE1_TOP: i32 = 4;
 const LINE1_HEIGHT: i32 = 22;
@@ -52,6 +63,11 @@ struct Popup {
     list: HWND,
     store: Arc<Store>,
     items: Mutex<Vec<ClipSummary>>,
+    /// Which instance the list is showing. `None` is the "everything" tab.
+    tab: Mutex<Option<String>>,
+    /// The strip as last drawn: hit tested by `tab_click`, and compared so that
+    /// a repaint only happens when the set of instances actually changed.
+    tabs: Mutex<Vec<MachineTab>>,
     /// Window that had focus before the popup opened: the paste target.
     target: AtomicIsize,
     visible: AtomicBool,
@@ -129,7 +145,7 @@ pub fn create(store: Arc<Store>) -> bool {
         | win::LBS_HASSTRINGS
         | win::LBS_NOINTEGRALHEIGHT;
 
-    let list_top = PAD + SEARCH_HEIGHT + GAP;
+    let list_top = LIST_TOP;
     let list = win::create_child(
         "LISTBOX",
         "",
@@ -152,6 +168,8 @@ pub fn create(store: Arc<Store>) -> bool {
         list,
         store: Arc::clone(&store),
         items: Mutex::new(Vec::new()),
+        tab: Mutex::new(None),
+        tabs: Mutex::new(Vec::new()),
         target: AtomicIsize::new(0),
         visible: AtomicBool::new(false),
         scale: AtomicIsize::new(100),
@@ -221,7 +239,6 @@ pub fn show() {
     let height = scaled(HEIGHT, scale);
     let pad = scaled(PAD, scale);
     let search_height = scaled(SEARCH_HEIGHT, scale);
-    let gap = scaled(GAP, scale);
     let offset = scaled(CURSOR_OFFSET, scale);
 
     // Prefer just below-right of the cursor; flip whichever axis would overflow,
@@ -243,7 +260,7 @@ pub fn show() {
     ensure_fonts(p, scale);
 
     let inner = width - pad * 2;
-    let list_top = pad + search_height + gap;
+    let list_top = scaled(LIST_TOP, scale);
     let list_height = height - list_top - pad;
 
     unsafe {
@@ -348,8 +365,26 @@ fn reload() {
     };
 
     let filter = win::window_text(p.search);
-    let summaries = p.store.query(&filter, MAX_RESULTS);
 
+    // Derived from what is on disk, so a database that syncs in, or one that is
+    // cleaned up, adds or removes a tab while the popup is open.
+    let tabs = p.store.machines();
+    let selected = {
+        let mut current = p.tab.lock().unwrap_or_else(|e| e.into_inner());
+        if !tabs.iter().any(|tab| tab.id == *current) {
+            *current = None;
+        }
+        current.clone()
+    };
+
+    let summaries = p.store.query(selected.as_deref(), &filter, MAX_RESULTS);
+
+    let strip_changed = {
+        let mut drawn = p.tabs.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = *drawn != tabs;
+        *drawn = tabs;
+        changed
+    };
     unsafe {
         win::SendMessageW(p.list, win::LB_RESETCONTENT, 0, 0);
 
@@ -365,6 +400,10 @@ fn reload() {
         }
 
         win::InvalidateRect(p.list, std::ptr::null(), 1);
+
+        if strip_changed {
+            win::InvalidateRect(p.hwnd, std::ptr::null(), 1);
+        }
     }
 
     *p.items.lock().unwrap_or_else(|e| e.into_inner()) = summaries;
@@ -556,6 +595,16 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             1
         }
 
+        win::WM_PAINT => {
+            paint(hwnd);
+            0
+        }
+
+        win::WM_LBUTTONDOWN => {
+            tab_click(lparam);
+            0
+        }
+
         win::WM_COMMAND => {
             let notification = ((wparam >> 16) & 0xFFFF) as u32;
 
@@ -621,6 +670,12 @@ extern "system" fn search_proc(
             }
             win::VK_P if control_down => {
                 toggle_pin();
+                return 0;
+            }
+            win::VK_TAB if control_down => {
+                // Shift walks the strip backwards.
+                let shift_down = unsafe { win::GetKeyState(win::VK_SHIFT) } < 0;
+                cycle_tab(if shift_down { -1 } else { 1 });
                 return 0;
             }
             _ => {}
@@ -711,6 +766,134 @@ fn draw_item(lparam: LPARAM) {
 
         win::SelectObject(dc, previous);
     }
+}
+
+/// Paints the instance strip. Drawn here rather than from a real tab control or
+/// from buttons: a tab control cannot be themed dark, and buttons would take
+/// focus away from the search box on every click.
+fn paint(hwnd: HWND) {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    let mut ps = unsafe { std::mem::zeroed::<win::PAINTSTRUCT>() };
+    let dc = unsafe { win::BeginPaint(hwnd, &mut ps) };
+
+    if dc == 0 {
+        unsafe {
+            win::EndPaint(hwnd, &ps);
+        }
+        return;
+    }
+
+    let scale = current_scale();
+    let mut left = scaled(PAD, scale);
+    let top = scaled(TAB_TOP, scale);
+    let width = scaled(TAB_WIDTH, scale);
+    let height = scaled(TAB_HEIGHT, scale);
+    let step = width + scaled(TAB_GAP, scale);
+
+    let selected = p.tab.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let tabs = p.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let font = p.font_main.load(Ordering::SeqCst);
+
+    unsafe {
+        win::SetBkMode(dc, win::TRANSPARENT_BK);
+        let previous = win::SelectObject(dc, font);
+
+        for tab in &tabs {
+            let active = tab.id == selected;
+            let rect = win::RECT {
+                left,
+                top,
+                right: left + width,
+                bottom: top + height,
+            };
+
+            let background = if active { p.brush_selected } else { p.brush_input };
+            win::FillRect(dc, &rect, background);
+            win::SetTextColor(dc, if active { COLOR_TEXT } else { COLOR_META });
+
+            let mut text_rect = rect;
+            let text = win::wide(&tab.label);
+            win::DrawTextW(dc, text.as_ptr(), -1, &mut text_rect, tab_text_flags());
+
+            left += step;
+        }
+
+        win::SelectObject(dc, previous);
+        win::EndPaint(hwnd, &ps);
+    }
+}
+
+fn tab_text_flags() -> u32 {
+    win::DT_CENTER | win::DT_SINGLELINE | win::DT_VCENTER | win::DT_END_ELLIPSIS | win::DT_NOPREFIX
+}
+
+/// The strip is not a control, so clicks are hit tested by hand against the same
+/// rectangles `paint` draws.
+fn tab_click(lparam: LPARAM) {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    let x = (lparam & 0xFFFF) as u16 as i16 as i32;
+    let y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+
+    let scale = current_scale();
+    let left = scaled(PAD, scale);
+    let top = scaled(TAB_TOP, scale);
+    let width = scaled(TAB_WIDTH, scale);
+    let height = scaled(TAB_HEIGHT, scale);
+    let step = width + scaled(TAB_GAP, scale);
+
+    if x < left || y < top || y >= top + height {
+        return;
+    }
+
+    let index = (x - left).div_euclid(step);
+    // A click in the gap between two tabs belongs to neither of them.
+    if (x - left) - index * step > width {
+        return;
+    }
+
+    let tabs = p.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(tab) = tabs.get(index as usize) {
+        set_tab(tab.id.clone());
+    }
+}
+
+/// Switches the list to one instance. `None` is the tab that shows everything.
+fn set_tab(id: Option<String>) {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    *p.tab.lock().unwrap_or_else(|e| e.into_inner()) = id;
+    reload();
+
+    // The strip itself has to be repainted too: the set of tabs did not
+    // change, only which one is lit.
+    unsafe {
+        win::InvalidateRect(p.hwnd, std::ptr::null(), 1);
+    }
+}
+
+fn cycle_tab(delta: i32) {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    let tabs = p.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if tabs.len() < 2 {
+        return;
+    }
+
+    let current = p.tab.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let position = tabs.iter().position(|tab| tab.id == current).unwrap_or(0) as i32;
+    let next = (position + delta).rem_euclid(tabs.len() as i32) as usize;
+
+    set_tab(tabs[next].id.clone());
 }
 
 fn text_flags() -> u32 {

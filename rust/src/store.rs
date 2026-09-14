@@ -71,6 +71,14 @@ const RETAINED_CHARS: usize = 512;
 /// at all — and is handled by keeping the previous snapshot.
 const BUSY_TIMEOUT_MS: u64 = 3_000;
 
+/// One tab of the instance strip: which machine's clips the list shows, and
+/// what to call it. `id` is `None` for the tab that shows everything.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MachineTab {
+    pub id: Option<String>,
+    pub label: String,
+}
+
 pub struct Store {
     settings: Settings,
     index: Mutex<Index>,
@@ -221,17 +229,45 @@ impl Store {
 
     // ------------------------------------------------------------------- reading
 
-    /// Pinned rows first, then newest first. `filter` is matched with an
-    /// allocation-free case-insensitive substring search.
-    pub fn query(&self, filter: &str, limit: usize) -> Vec<ClipSummary> {
+    /// One instance's clips, or every instance's when `machine` is `None`.
+    /// `filter` is matched with an allocation-free case-insensitive substring
+    /// search.
+    pub fn query(&self, machine: Option<&str>, filter: &str, limit: usize) -> Vec<ClipSummary> {
         let needle = filter.trim().to_ascii_lowercase();
         let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
 
         if needle.is_empty() {
-            index.query(None, limit)
+            index.query(machine, None, limit)
         } else {
-            index.query(Some(&needle), limit)
+            index.query(machine, Some(&needle), limit)
         }
+    }
+
+    /// The instance strip: everything, then this machine, then the others in the
+    /// order they last captured something.
+    pub fn machines(&self) -> Vec<MachineTab> {
+        let ids = {
+            let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            index.machines()
+        };
+
+        let mut tabs = Vec::with_capacity(ids.len() + 1);
+        tabs.push(MachineTab {
+            id: None,
+            label: "全部".to_string(),
+        });
+
+        for (id, _) in ids {
+            let label = if id == self.settings.machine_id {
+                "本机".to_string()
+            } else {
+                id.clone()
+            };
+
+            tabs.push(MachineTab { id: Some(id), label });
+        }
+
+        tabs
     }
 
     /// Hydrates a clip for paste-back. Touches disk only when it has a blob.
