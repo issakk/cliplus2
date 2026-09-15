@@ -19,3 +19,11 @@ If you're using Codex or another agent-capable tool, additional project-scoped h
 Managed by Trellis. Edits outside this block are preserved; edits inside may be overwritten by a future `trellis update`.
 
 <!-- TRELLIS:END -->
+
+## 构建与验证
+
+**不要本地编译。** 不在本机跑 `cargo build` / `cargo check` / `cargo test`，也不要本地启动 exe 去看界面。
+
+- 编译和测试交给 CI（`.github/workflows/rust.yml`，push 就触发）：它跑 `cargo test` + `cargo build --release`，把 rustc 诊断挂成 check annotation，并上传 `ClipPlus-win-x64` artifact。要 exe 就从 artifact 下。
+- 本地只做不编译的检查：`rustfmt --check`（只验证语法解析）、读代码、`git diff` 复核。
+
