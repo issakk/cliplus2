@@ -52,24 +52,34 @@ fn field(id: usize) -> HWND {
     WINDOW.get().map(|hwnd| win::child_by_id(*hwnd, id)).unwrap_or(0)
 }
 
-pub fn create() -> bool {
-    let style = win::WS_CAPTION | win::WS_SYSMENU | win::WS_CLIPCHILDREN;
-    let ex_style = 0;
+/// The frame style this window is created with; the size of the window is
+/// computed from it in more than one place.
+const WINDOW_STYLE: u32 = win::WS_CAPTION | win::WS_SYSMENU | win::WS_CLIPCHILDREN;
 
-    // The frame has to be added around the client size, not included in it,
-    // otherwise the layout below would be clipped by the title bar.
+/// The window's outside size for a monitor scale: the client area the layout was
+/// designed at plus the frame Windows draws around it. The frame has to be added
+/// around the client size rather than included in it, or the layout would be
+/// clipped by the title bar.
+fn frame_size(scale: f64) -> (i32, i32) {
     let mut frame = win::RECT {
         left: 0,
         top: 0,
-        right: CLIENT_WIDTH,
-        bottom: CLIENT_HEIGHT,
+        right: win::scaled(CLIENT_WIDTH, scale),
+        bottom: win::scaled(CLIENT_HEIGHT, scale),
     };
+
     unsafe {
-        win::AdjustWindowRectEx(&mut frame, style, 0, ex_style);
+        win::AdjustWindowRectEx(&mut frame, WINDOW_STYLE, 0, 0);
     }
 
-    let width = frame.right - frame.left;
-    let height = frame.bottom - frame.top;
+    (frame.right - frame.left, frame.bottom - frame.top)
+}
+
+pub fn create() -> bool {
+    let style = WINDOW_STYLE;
+    let ex_style = 0;
+
+    let (width, height) = frame_size(1.0);
 
     let window_proc: win::WNDPROC = window_proc;
     let hwnd = win::create_window(
@@ -119,7 +129,7 @@ pub fn create() -> bool {
             hwnd,
             LABEL_ID_BASE + index,
             MARGIN,
-            y + 4,
+            y,
             LABEL_WIDTH,
             ROW_HEIGHT,
         );
@@ -213,8 +223,7 @@ pub fn create() -> bool {
 ///
 /// Done on each show rather than once at creation: the window opens on whichever
 /// monitor the tray click came from, and those do not have to share a scale.
-// ponytail: dragging the window to a differently scaled monitor does not
-// re-layout (that needs WM_DPICHANGED); close and reopen it.
+/// `WM_DPICHANGED` re-runs it when the window is dragged to another display.
 fn layout(hwnd: HWND, scale: f64) {
     let margin = win::scaled(MARGIN, scale);
     let label_width = win::scaled(LABEL_WIDTH, scale);
@@ -256,10 +265,13 @@ fn layout(hwnd: HWND, scale: f64) {
     for index in 0..fields.len() as i32 {
         let y = margin + index * row_step;
 
+        // The caption shares the field's top edge: both draw their text from the
+        // top of their box, so an extra offset only pushes the label below the
+        // text of the field it belongs to.
         place(
             LABEL_ID_BASE + index as usize,
             margin,
-            y + win::scaled(4, scale),
+            y,
             label_width,
             row_height,
         );
@@ -313,24 +325,9 @@ pub fn show() {
 
     // Every size in this file is written at 96 DPI, so the monitor's scale has
     // to be applied by hand: Windows does not do it for a per-monitor-DPI
-    // process, and a 4K display would get 14-pixel text if it did not.
+    // process, and a 4K display would otherwise get 96-DPI text.
     let scale = win::dpi_at(cursor) as f64 / 96.0;
-    let mut frame = win::RECT {
-        left: 0,
-        top: 0,
-        right: win::scaled(CLIENT_WIDTH, scale),
-        bottom: win::scaled(CLIENT_HEIGHT, scale),
-    };
-    unsafe {
-        win::AdjustWindowRectEx(
-            &mut frame,
-            win::WS_CAPTION | win::WS_SYSMENU | win::WS_CLIPCHILDREN,
-            0,
-            0,
-        );
-    }
-    let width = frame.right - frame.left;
-    let height = frame.bottom - frame.top;
+    let (width, height) = frame_size(scale);
 
     let left = area.left + (area.right - area.left - width) / 2;
     let top = area.top + (area.bottom - area.top - height) / 3;
@@ -664,6 +661,39 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
         // without rebuilding every control.
         win::WM_CLOSE => {
             hide();
+            0
+        }
+
+        // Dragged onto a display with a different scale: the window takes the
+        // size and the font that display needs instead of keeping the old ones
+        // until it is closed and reopened.
+        win::WM_DPICHANGED => {
+            // LOWORD is the new DPI, and lparam points at the rectangle Windows
+            // suggests for the new monitor. Only the position comes from it:
+            // this layout is a fixed grid, so its size is computed from the
+            // scale instead.
+            let dpi = (wparam & 0xFFFF) as u32;
+            let scale = if dpi == 0 {
+                win::dpi_scale_of(hwnd)
+            } else {
+                dpi as f64 / 96.0
+            };
+            let suggested = unsafe { &*(lparam as *const win::RECT) };
+            let (width, height) = frame_size(scale);
+
+            unsafe {
+                win::SetWindowPos(
+                    hwnd,
+                    0,
+                    suggested.left,
+                    suggested.top,
+                    width,
+                    height,
+                    win::SWP_NOZORDER | win::SWP_NOACTIVATE,
+                );
+            }
+
+            layout(hwnd, scale);
             0
         }
 

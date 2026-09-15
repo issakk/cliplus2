@@ -44,6 +44,7 @@ pub type SUBCLASSPROC =
 pub const WM_DESTROY: u32 = 0x0002;
 pub const WM_CLIPBOARDUPDATE: u32 = 0x031D;
 pub const WM_HOTKEY: u32 = 0x0312;
+pub const WM_DPICHANGED: u32 = 0x02E0;
 
 pub const MOD_ALT: u32 = 0x0001;
 pub const MOD_CONTROL: u32 = 0x0002;
@@ -166,6 +167,7 @@ pub const LBN_SELCHANGE: u32 = 1;
 pub const SW_SHOW: i32 = 5;
 pub const SW_HIDE: i32 = 0;
 pub const SWP_NOACTIVATE: u32 = 0x0010;
+pub const SWP_NOZORDER: u32 = 0x0004;
 pub const SWP_SHOWWINDOW: u32 = 0x0040;
 pub const HWND_TOPMOST: HWND = -1;
 
@@ -1018,9 +1020,12 @@ pub fn destroy_window(hwnd: HWND) {
 /// supported Windows and covers the CJK the interface is written in.
 pub const UI_FACE: &str = "Microsoft YaHei UI";
 
-/// One step up from the stock 9 pt (12 px), which still fits the row grid the
-/// settings window was laid out with.
-pub const UI_FONT_HEIGHT: i32 = 14;
+/// The stock Windows UI text height at 96 DPI: 9 pt, the size every other
+/// window on the desktop draws at, scaled by the monitor's DPI exactly as
+/// Windows scales it. A size of our own is what made this window's text look
+/// off beside the rest of the screen — at 150% this gives the same 18 px
+/// every other window there uses.
+pub const UI_FONT_HEIGHT: i32 = 12;
 
 /// A font in the app's face. The height is in pixels and negative, the
 /// character-height convention `CreateFontW` wants; callers that need another
