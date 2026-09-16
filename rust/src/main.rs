@@ -88,6 +88,11 @@ fn main() {
     // every filesystem event, and `let _ =` would drop it right here.
     let _watcher = store.start_watcher();
 
+    // Before the first control is created: a window keeps the theme it was made
+    // with, so this has to come first to matter. Undocumented and best-effort,
+    // see `win::allow_dark_mode` — the popup's scrollbar is the visible part.
+    win::allow_dark_mode();
+
     // Built once at startup so the first hotkey press has no window-creation
     // latency in front of it.
     if !popup::create(Arc::clone(&store)) {

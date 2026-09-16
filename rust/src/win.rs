@@ -31,6 +31,7 @@ pub type HGDIOBJ = isize;
 pub type HGLOBAL = isize;
 pub type HANDLE = isize;
 pub type HKEY = isize;
+pub type HMODULE = isize;
 pub type WPARAM = usize;
 pub type LPARAM = isize;
 pub type LRESULT = isize;
@@ -528,6 +529,10 @@ extern "system" {
 
 #[link(name = "kernel32")]
 extern "system" {
+    fn LoadLibraryExW(lpLibFileName: PCWSTR, hFile: HANDLE, dwFlags: u32) -> HMODULE;
+    /// The ordinal form as well as the name form: the dark-mode entry points in
+    /// uxtheme are exported by number only.
+    fn GetProcAddress(hModule: HMODULE, lpProcName: *const u8) -> *mut c_void;
     fn GetModuleHandleW(lpModuleName: PCWSTR) -> HINSTANCE;
     fn GetCurrentThreadId() -> u32;
     fn GetLocalTime(lpSystemTime: *mut SYSTEMTIME);
@@ -560,8 +565,16 @@ extern "system" {
     ) -> i32;
 }
 
-// ---------------------------------------------------------------- shell32.dll
+// ------------------------------------------------------------------ uxtheme.dll
 
+#[link(name = "uxtheme")]
+extern "system" {
+    /// The one dark-mode entry point Microsoft exports by name: point a control at
+    /// the theme class it should be drawn with.
+    fn SetWindowTheme(hWnd: HWND, pszSubAppName: PCWSTR, pszSubIdList: PCWSTR) -> i32;
+}
+
+// ---------------------------------------------------------------- shell32.dll
 #[link(name = "shell32")]
 extern "system" {
     pub fn Shell_NotifyIconW(dwMessage: u32, lpData: *mut NOTIFYICONDATAW) -> i32;
@@ -1476,5 +1489,86 @@ fn key_stroke(vk: u16, up: bool) -> INPUT {
                 dw_extra_info: 0,
             },
         },
+    }
+}
+
+// ------------------------------------------------------------------- dark mode
+
+// Windows has no dark mode a plain Win32 app can simply ask for. What it has is a
+// handful of switches the shell uses on itself, and a dark theme class in
+// aero.msstyles that only Explorer was meant to wear. This is the smallest useful
+// part of that: enough to colour the list's scrollbar, which is the one thing in
+// the popup drawn by Windows rather than by this crate.
+//
+// All of it is best-effort. A build without these entry points, or without the
+// theme class, leaves the control with the system's light theming — a white stripe
+// down a dark popup, which is what it had before.
+
+/// The dark theme class the scrollbar lives in, on Windows 10 1809 and later.
+const DARK_THEME: &str = "DarkMode_Explorer";
+
+/// uxtheme exports these two by number only, and the numbers have been stable since
+/// 1809. `AllowDarkModeForWindow` is the per-window half — a control keeps the
+/// light theme until it is told otherwise — and `SetPreferredAppMode` is the
+/// process-wide one, which is also what colours the context menus.
+const ORD_ALLOW_DARK_MODE_FOR_WINDOW: usize = 133;
+const ORD_SET_PREFERRED_APP_MODE: usize = 135;
+
+/// `LoadLibraryExW` flag: resolve against the system directory only, so a stray
+/// `uxtheme.dll` sitting next to the exe is never the one that gets loaded.
+const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+
+/// The process-wide half. Called once at startup, before any control exists,
+/// because a window created first keeps whatever theme it was made with.
+pub fn allow_dark_mode() {
+    let Some(entry) = uxtheme_export(ORD_SET_PREFERRED_APP_MODE) else {
+        return;
+    };
+
+    // `AllowDark` is 1, and it is one integer argument either way: 1903 and later
+    // call this `SetPreferredAppMode`, 1809 called it `AllowDarkModeForApp`, and
+    // both mean "this process may draw dark".
+    let set_app_mode: unsafe extern "system" fn(i32) -> i32 =
+        unsafe { std::mem::transmute(entry) };
+    unsafe {
+        set_app_mode(1);
+    }
+}
+
+/// The per-window half, and the one that actually colours a scrollbar.
+pub fn dark_theme(hwnd: HWND) {
+    if let Some(entry) = uxtheme_export(ORD_ALLOW_DARK_MODE_FOR_WINDOW) {
+        // Declared as taking a bool; passing the integer is the same call on x64.
+        let allow: unsafe extern "system" fn(HWND, i32) -> i32 =
+            unsafe { std::mem::transmute(entry) };
+        unsafe {
+            allow(hwnd, 1);
+        }
+    }
+
+    let theme = wide(DARK_THEME);
+    unsafe {
+        SetWindowTheme(hwnd, theme.as_ptr(), std::ptr::null());
+    }
+}
+
+/// uxtheme's own copy, asked for one of the exports it keeps to ordinals. `None`
+/// means this Windows has nothing to offer, which is an answer rather than an error.
+fn uxtheme_export(ordinal: usize) -> Option<*mut c_void> {
+    unsafe {
+        let name = wide("uxtheme.dll");
+        let module = LoadLibraryExW(name.as_ptr(), 0, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if module == 0 {
+            return None;
+        }
+
+        // The low word of the pointer is the ordinal: that is how `GetProcAddress`
+        // is told to look one up instead of a name.
+        let found = GetProcAddress(module, ordinal as *const u8);
+        if found.is_null() {
+            None
+        } else {
+            Some(found)
+        }
     }
 }

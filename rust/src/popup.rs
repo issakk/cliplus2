@@ -183,6 +183,11 @@ pub fn create(store: Arc<Store>) -> bool {
         return false;
     }
 
+    // The list's scrollbar is the one thing in this window Windows draws itself,
+    // and left alone it is a white stripe down a dark popup. Best-effort: on a
+    // build without the dark theme class this does nothing at all.
+    win::dark_theme(list);
+
     let state = Popup {
         hwnd,
         search,
