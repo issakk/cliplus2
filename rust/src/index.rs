@@ -59,7 +59,7 @@ impl ClipItem {
             None => PathBuf::new(),
         };
 
-        let preview = build_preview(kind, &text);
+        let preview = build_preview(kind, &text, has_blob);
         let meta = build_meta(record, kind, has_blob, local_machine);
 
         ClipItem {
@@ -379,27 +379,47 @@ fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
     false
 }
 
-fn build_preview(kind: ClipKind, text: &str) -> String {
+/// What one row shows above the meta line.
+///
+/// A row is one line tall, so a multi-line clip cannot show any of its other
+/// lines — the marker in front is the only way it can say that there are some.
+/// It goes in front rather than at the end because a long first line is exactly
+/// when it matters, and an ellipsis would eat a suffix.
+fn build_preview(kind: ClipKind, text: &str, has_blob: bool) -> String {
     if kind == ClipKind::Image {
         return "[图片]".to_string();
     }
 
-    let first_line = text.lines().next().unwrap_or("").trim();
+    // The first line with anything in it: a clip that opens with a blank line
+    // still has to show what it says.
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
 
     if kind == ClipKind::Files {
         let count = text.lines().filter(|line| !line.trim().is_empty()).count();
-        return format!("[文件 x{count}] {first_line}");
+        return format!("[文件 x{count}] {first}");
     }
 
-    if first_line.is_empty() {
-        return if text.contains('\n') {
-            "(多行文本)".to_string()
+    if first.is_empty() {
+        return if text.lines().count() > 1 {
+            "(多行空文本)".to_string()
         } else {
             "(空文本)".to_string()
         };
     }
 
-    truncate_chars(first_line, PREVIEW_CHARS)
+    let marker = match text.lines().count() {
+        0 | 1 => String::new(),
+        // Only the head of an over-long clip is kept inline, so a count of what
+        // is here would be a count of the head, not of what was copied.
+        _ if has_blob => "[多行] ".to_string(),
+        lines => format!("[{lines} 行] "),
+    };
+
+    format!("{marker}{}", truncate_chars(first, PREVIEW_CHARS))
 }
 
 fn truncate_chars(text: &str, limit: usize) -> String {
@@ -553,5 +573,26 @@ mod tests {
             .collect();
         merged.forget_many(&stems);
         assert_eq!(order(&merged), vec!["e", "b", "d"]);
+    }
+
+    /// A row is one line tall, so the preview is the only place that can say a clip
+    /// has more lines than the one it shows. Each case gets a look: one line,
+    /// several, only blanks, and the over-long clip that keeps just its head inline.
+    #[test]
+    fn preview_marks_what_does_not_fit() {
+        assert_eq!(build_preview(ClipKind::Text, "one line", false), "one line");
+        assert_eq!(build_preview(ClipKind::Text, "a\nb", false), "[2 行] a");
+        assert_eq!(
+            build_preview(ClipKind::Text, "\n\nfirst\nsecond", false),
+            "[4 行] first"
+        );
+        assert_eq!(build_preview(ClipKind::Text, "a\nb", true), "[多行] a");
+        assert_eq!(build_preview(ClipKind::Text, "\n\n\n", false), "(多行空文本)");
+        assert_eq!(build_preview(ClipKind::Text, "", false), "(空文本)");
+        assert_eq!(build_preview(ClipKind::Image, "", false), "[图片]");
+        assert_eq!(
+            build_preview(ClipKind::Files, "C:\\a.txt\nC:\\b.txt", false),
+            "[文件 x2] C:\\a.txt"
+        );
     }
 }
