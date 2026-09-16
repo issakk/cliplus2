@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // --------------------------------------------------------------------- aliases
@@ -90,6 +91,10 @@ pub const VK_V: u16 = 0x56;
 pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
 pub const ERROR_ALREADY_EXISTS: u32 = 183;
+
+/// Enough access to ask a process for its image name, and to do it to processes
+/// this one could not open any other way (an elevated editor, say).
+pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
 // --- tray icon ---
 pub const NIM_ADD: u32 = 0;
@@ -493,6 +498,15 @@ extern "system" {
     pub fn GlobalLock(hMem: HGLOBAL) -> *mut c_void;
     pub fn GlobalUnlock(hMem: HGLOBAL) -> i32;
     pub fn GlobalSize(hMem: HGLOBAL) -> usize;
+    pub fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> HANDLE;
+    pub fn QueryFullProcessImageNameW(
+        hProcess: HANDLE,
+        dwFlags: u32,
+        lpExeName: *mut u16,
+        lpdwSize: *mut u32,
+    ) -> i32;
+    pub fn CloseHandle(hObject: HANDLE) -> i32;
+
     fn CreateMutexW(
         lpMutexAttributes: *const c_void,
         bInitialOwner: i32,
@@ -854,6 +868,68 @@ pub fn begin_drag_move(hwnd: HWND) {
     }
 }
 
+/// Titles are a title bar, not a document, and this one ends up in a row and in a
+/// search: cut to something both can hold.
+const TITLE_CHARS: usize = 120;
+
+/// The window in front, as `(executable, title)` — what a clipboard capture
+/// stores beside the clip.
+///
+/// Best-effort on both halves, empty on failure: the caller is in the middle of
+/// storing a clip, and losing a window title must not cost the clip itself. Read
+/// it while the copy is still that window's — the only moment it means anything.
+pub fn foreground_context() -> (String, String) {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd == 0 {
+        return (String::new(), String::new());
+    }
+
+    // GetWindowTextW rather than WM_GETTEXT is what makes this work at all: the
+    // system keeps every window's caption, other processes' included, and hands
+    // it over without asking anyone.
+    let title: String = window_text(hwnd)
+        .trim()
+        .chars()
+        .take(TITLE_CHARS)
+        .collect();
+
+    (process_name_of(hwnd), title)
+}
+
+/// The executable that owns `hwnd`, by name only.
+fn process_name_of(hwnd: HWND) -> String {
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    if pid == 0 {
+        return String::new();
+    }
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process == 0 {
+        return String::new();
+    }
+
+    let mut buffer = vec![0u16; 512];
+    let mut length = buffer.len() as u32;
+    let written =
+        unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) };
+    unsafe { CloseHandle(process) };
+
+    if written == 0 {
+        return String::new();
+    }
+
+    buffer.truncate(length as usize);
+    let full = String::from_utf16_lossy(&buffer);
+
+    // Paths are `\`-separated on Windows; `/` costs nothing and covers one that
+    // arrived some other way.
+    match full.rsplit(|c| c == '\\' || c == '/').next() {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => String::new(),
+    }
+}
+
 /// Current text of a control. Shared so the popup and the settings window do
 /// not each carry their own copy of the two-call dance.
 pub fn window_text(hwnd: HWND) -> String {
@@ -1117,9 +1193,34 @@ pub fn dpi_scale_of(hwnd: HWND) -> f64 {
 }
 
 /// Logical pixels to physical. Sizes in this crate are written at 96 DPI and
-/// multiplied by the monitor's scale before they are used.
+/// multiplied by the monitor's scale — and by the user's own `UiScale` — before
+/// they are used.
 pub fn scaled(value: i32, scale: f64) -> i32 {
-    (value as f64 * scale).round() as i32
+    (value as f64 * scale * user_scale()).round() as i32
+}
+
+/// The user's own multiplier on top of the display's scale, read by `scaled` and
+/// therefore applied to the whole interface — fonts, boxes and hit tests alike —
+/// rather than to any one window. The default is a size up from what Windows
+/// itself draws at, which is what 100% means here.
+static UI_SCALE: AtomicIsize = AtomicIsize::new(DEFAULT_UI_SCALE as isize);
+
+/// The range the settings window offers. Below it the interface stops being
+/// readable; above it the popup no longer fits on a 1080p screen.
+pub const MIN_UI_SCALE: u32 = 50;
+pub const MAX_UI_SCALE: u32 = 300;
+pub const DEFAULT_UI_SCALE: u32 = 125;
+
+/// Sets the user scale, clamped. Changes take effect at the next layout: the
+/// settings window recomputes its own when it is saved and reopened, and the
+/// popup reads the scale on every show.
+pub fn set_ui_scale(percent: u32) {
+    let clamped = percent.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
+    UI_SCALE.store(clamped as isize, Ordering::SeqCst);
+}
+
+fn user_scale() -> f64 {
+    UI_SCALE.load(Ordering::SeqCst) as f64 / 100.0
 }
 
 pub fn register_hotkey(hwnd: HWND, id: i32, modifiers: u32, vk: u32) -> bool {

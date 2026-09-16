@@ -4,7 +4,7 @@
 //! a `.rc` file would mean a resource compiler step in the build, and the layout
 //! here is fixed enough that a scripted dialog template buys nothing.
 //!
-//! Only two of these values can change without a restart. That is stated in the
+//! Some of these values can change without a restart. That is stated in the
 //! window itself instead of being hidden, because silently ignoring a saved
 //! field is worse than saying so.
 
@@ -40,7 +40,7 @@ const ID_CAPTURE_IMAGES: usize = 8;
 const ID_CAPTURE_FILES: usize = 9;
 const ID_SAVE: usize = 10;
 const ID_CANCEL: usize = 11;
-
+const ID_UI_SCALE: usize = 12;
 
 /// Subclass id for the hotkey field, which is the only control here that has to
 /// intercept its own keystrokes.
@@ -115,13 +115,14 @@ pub fn create() -> bool {
 
     let field_x = MARGIN + LABEL_WIDTH + 8;
 
-    let rows: [(usize, &str); 6] = [
+    let rows: [(usize, &str); 7] = [
         (ID_HOTKEY, "热键（点这里按组合键）"),
         (ID_SYNC_ROOT, "同步目录（留空 = 自动）"),
         (ID_RETENTION, "保留天数（0 = 不清理）"),
         (ID_MAX_BLOB_MB, "单条上限（MB）"),
         (ID_INLINE_LIMIT, "内联文本上限（字符）"),
         (ID_RESCAN, "重扫间隔（秒）"),
+        (ID_UI_SCALE, "界面缩放（%，100=系统）"),
     ];
 
     for (index, (id, label)) in rows.iter().copied().enumerate() {
@@ -151,7 +152,9 @@ pub fn create() -> bool {
         win::create_child_id("EDIT", "", style, hwnd, id, field_x, y, FIELD_WIDTH, ROW_HEIGHT);
     }
 
-    let check_y = MARGIN + 6 * ROW_STEP + 6;
+    // Counted from the array rather than written as a number, so adding a row
+    // cannot leave the checkboxes sitting on top of it.
+    let check_y = MARGIN + rows.len() as i32 * ROW_STEP + 6;
     let checks: [(usize, &str); 3] = [
         (ID_CAPTURE_TEXT, "记录文本"),
         (ID_CAPTURE_IMAGES, "记录图片"),
@@ -165,7 +168,7 @@ pub fn create() -> bool {
 
     win::create_child_id(
         "STATIC",
-        "热键与三个记录开关立即生效；其余项需要重启 ClipPlus。",
+        "热键、三个记录开关和界面缩放立即生效；其余项需要重启 ClipPlus。",
         label_style,
         hwnd,
         NOTE_ID,
@@ -265,6 +268,7 @@ fn layout(hwnd: HWND, scale: f64) {
         ID_MAX_BLOB_MB,
         ID_INLINE_LIMIT,
         ID_RESCAN,
+        ID_UI_SCALE,
     ];
 
     for index in 0..fields.len() as i32 {
@@ -283,7 +287,7 @@ fn layout(hwnd: HWND, scale: f64) {
         place(fields[index as usize], field_x, y, field_width, row_height);
     }
 
-    let check_y = margin + 6 * row_step + win::scaled(6, scale);
+    let check_y = margin + fields.len() as i32 * row_step + win::scaled(6, scale);
     let checks = [ID_CAPTURE_TEXT, ID_CAPTURE_IMAGES, ID_CAPTURE_FILES];
 
     for (index, id) in checks.into_iter().enumerate() {
@@ -372,6 +376,7 @@ fn populate(current: &Settings) {
     );
     set_text(ID_INLINE_LIMIT, &current.inline_text_limit.to_string());
     set_text(ID_RESCAN, &current.rescan_seconds.to_string());
+    set_text(ID_UI_SCALE, &current.ui_scale.to_string());
 
     set_checked(ID_CAPTURE_TEXT, current.capture_text);
     set_checked(ID_CAPTURE_IMAGES, current.capture_images);
@@ -475,6 +480,14 @@ fn save() {
         }
     };
 
+    let ui_scale = match parse_or(win::DEFAULT_UI_SCALE, ID_UI_SCALE) {
+        Ok(value) => value,
+        Err(reason) => {
+            complain(&format!("界面缩放：{reason}"));
+            return;
+        }
+    };
+
     if rescan < 10 {
         complain("重扫间隔不能小于 10 秒。");
         return;
@@ -485,6 +498,16 @@ fn save() {
         return;
     }
 
+    // Refused rather than clamped: a scale that is silently changed under the
+    // cursor is worse than one that is refused, and the range is on screen.
+    if !(win::MIN_UI_SCALE..=win::MAX_UI_SCALE).contains(&ui_scale) {
+        complain(&format!(
+            "界面缩放在 {}% 到 {}% 之间，100% 是系统大小。",
+            win::MIN_UI_SCALE,
+            win::MAX_UI_SCALE
+        ));
+        return;
+    }
     let sync_root = win::window_text(field(ID_SYNC_ROOT)).trim().to_string();
 
     // Canonical spelling, so a hand-edited variant in settings.json is cleaned
@@ -499,6 +522,7 @@ fn save() {
     updated.max_blob_bytes = max_blob_mb as u64 * 1024 * 1024;
     updated.inline_text_limit = inline_limit as usize;
     updated.rescan_seconds = rescan as u64;
+    updated.ui_scale = ui_scale;
     updated.capture_text = is_checked(ID_CAPTURE_TEXT);
     updated.capture_images = is_checked(ID_CAPTURE_IMAGES);
     updated.capture_files = is_checked(ID_CAPTURE_FILES);

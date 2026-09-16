@@ -1,8 +1,11 @@
 //! Clipboard payloads and the row schema.
 //!
 //! `ClipRecord` *is* one row of a synced database: it is built when a clip is
-//! captured and rebuilt when a database is read back. Its field names are the
-//! column names in the SQL, so renaming one means changing both.
+//! `ClipRecord` is what one clip looks like in a synced database: it is built
+//! when a clip is captured and rebuilt when a database is read back. Its field
+//! names are the column names in the SQL — the ones for the source window live in
+//! the `context` table beside `clips` (see `store::CONTEXT_SCHEMA`) — so renaming
+//! one means changing both.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(i32)]
@@ -72,7 +75,20 @@ impl ClipPayload {
     }
 }
 
-/// One clip: what was copied, when, and by which machine.
+/// Where a clip came from: the window that had focus while it was copied.
+///
+/// Best-effort by nature — a window with no title, or one belonging to a process
+/// this one cannot open, yields an empty string. Losing the context must never
+/// cost the clip itself, so there is no failure path here at all.
+#[derive(Clone, Debug, Default)]
+pub struct ClipContext {
+    /// Executable name, e.g. `chrome.exe`. The folder it came from says nothing
+    /// a reader wants.
+    pub app: String,
+    pub title: String,
+}
+
+/// One clip: what was copied, when, by which machine, and out of which window.
 #[derive(Clone, Debug)]
 pub struct ClipRecord {
     /// Row key, and the stem of the `.bin` and `.pin` siblings.
@@ -90,7 +106,12 @@ pub struct ClipRecord {
 
     /// Sibling file name holding the heavy payload (image bytes, long text).
     pub blob: Option<String>,
-}
+
+    /// The source window, as read at capture time. Empty when it could not be
+    /// read, and empty for every clip recorded before it was recorded at all —
+    /// which is why the display has to cope with both being empty.
+    pub app: String,
+    pub title: String,
 
 /// Several clips as one clipboard payload: one per line, in the order they are
 /// listed.

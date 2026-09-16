@@ -60,7 +60,7 @@ impl ClipItem {
         };
 
         let preview = build_preview(kind, &text);
-        let meta = build_meta(kind, record.at, &record.machine, has_blob, local_machine);
+        let meta = build_meta(record, kind, has_blob, local_machine);
 
         ClipItem {
             stem,
@@ -321,9 +321,8 @@ fn truncate_chars(text: &str, limit: usize) -> String {
 }
 
 fn build_meta(
+    record: &ClipRecord,
     kind: ClipKind,
-    at: i64,
-    machine: &str,
     has_blob: bool,
     local_machine: &str,
 ) -> String {
@@ -333,25 +332,35 @@ fn build_meta(
         ClipKind::Text => "文本",
     };
 
-    let when = win::local_datetime(at);
+    let when = win::local_datetime(record.at);
     let time = format!(
         "{:02}-{:02} {:02}:{:02}",
         when.month, when.day, when.hour, when.minute
     );
 
-    let who = if machine.is_empty() {
+    let who = if record.machine.is_empty() {
         "?".to_string()
-    } else if machine == local_machine {
+    } else if record.machine == local_machine {
         "本机".to_string()
     } else {
-        machine.to_string()
+        record.machine.clone()
     };
 
-    if has_blob {
-        format!("{label} · {time} · {who} · 完整内容在 .bin")
-    } else {
-        format!("{label} · {time} · {who}")
+    // The window it came out of, when there was one to read: which application,
+    // and what that window said. A clip from before this was recorded — or from a
+    // window this process could not read — simply stops after the machine, and
+    // the line then reads exactly as it always did.
+    let mut source = String::new();
+    for part in [&record.app, &record.title] {
+        if !part.is_empty() {
+            source.push_str(" · ");
+            source.push_str(part);
+        }
     }
+
+    let blob_note = if has_blob { " · 完整内容在 .bin" } else { "" };
+
+    format!("{label} · {time} · {who}{source}{blob_note}")
 }
 
 #[cfg(test)]
@@ -368,6 +377,8 @@ mod tests {
             text: Some(format!("clip {stem}")),
             length: 8,
             blob: None,
+            app: String::new(),
+            title: String::new(),
         };
 
         ClipItem::from_record(

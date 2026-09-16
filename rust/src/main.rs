@@ -173,6 +173,9 @@ pub fn current_settings() -> Option<settings::Settings> {
 }
 
 pub fn set_settings(updated: settings::Settings) {
+    // Every settings change arrives here — at startup and again on each save —
+    // which makes this the one place the interface scale has to be applied from.
+    win::set_ui_scale(updated.ui_scale);
     *SETTINGS.write().unwrap_or_else(|p| p.into_inner()) = Some(updated);
 }
 
@@ -246,7 +249,7 @@ extern "system" fn wnd_proc(
                     if capture_enabled(&payload) {
                         log::info(&format!("captured {description}"));
                         if let Some(store) = STORE.get() {
-                            store.enqueue(payload);
+                            store.enqueue(payload, clipboard::capture_context());
                         }
                     } else {
                         log::info(&format!("ignored {description} (switched off)"));

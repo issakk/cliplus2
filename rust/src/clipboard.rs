@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use crate::clip::ClipPayload;
+use crate::clip::{ClipContext, ClipPayload};
 use crate::log;
 use crate::win;
 
@@ -45,6 +45,16 @@ pub fn read() -> Option<ClipPayload> {
 
     log::warn("clipboard stayed busy through every retry; this copy was skipped");
     None
+}
+
+/// What the window in front was, to be stored beside the clip.
+///
+/// Read here, at capture time, rather than on the writer thread: by the time a
+/// queued clip is written the user has moved on, and whatever they copied from is
+/// no longer in front.
+pub fn capture_context() -> ClipContext {
+    let (app, title) = win::foreground_context();
+    ClipContext { app, title }
 }
 
 /// Caller must already hold the clipboard open.
