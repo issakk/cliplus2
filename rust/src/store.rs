@@ -784,6 +784,7 @@ fn insert_row(db_path: &Path, record: &ClipRecord) -> Result<(), String> {
             record.length,
             &record.blob,
         ],
+    )
     .map_err(|err| format!("insert into {}: {err}", db_path.display()))?;
 
     // Only when there is something to say: a clip copied out of a window that

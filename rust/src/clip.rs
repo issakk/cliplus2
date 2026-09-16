@@ -112,6 +112,7 @@ pub struct ClipRecord {
     /// which is why the display has to cope with both being empty.
     pub app: String,
     pub title: String,
+}
 
 /// Several clips as one clipboard payload: one per line, in the order they are
 /// listed.
