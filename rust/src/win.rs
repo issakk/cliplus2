@@ -453,6 +453,7 @@ extern "system" {
         uFlags: u32,
     ) -> i32;
     pub fn GetClientRect(hWnd: HWND, lpRect: *mut RECT) -> i32;
+    pub fn GetWindowRect(hWnd: HWND, lpRect: *mut RECT) -> i32;
     pub fn InvalidateRect(hWnd: HWND, lpRect: *const RECT, bErase: i32) -> i32;
     pub fn BeginPaint(hWnd: HWND, lpPaint: *mut PAINTSTRUCT) -> HDC;
     pub fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) -> i32;
@@ -1259,6 +1260,17 @@ pub fn cursor_position() -> POINT {
         GetCursorPos(&mut pt);
     }
     pt
+}
+
+/// The window's own top-left corner, in screen coordinates. `None` when the window
+/// is gone, which is not worth distinguishing from "could not be read".
+pub fn window_position(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        return None;
+    }
+
+    Some((rect.left, rect.top))
 }
 
 /// Work area of the monitor nearest to a point, in device pixels.

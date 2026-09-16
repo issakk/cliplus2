@@ -44,9 +44,6 @@ const LINE1_HEIGHT: i32 = 22;
 const LINE2_TOP: i32 = 26;
 const LINE2_HEIGHT: i32 = 17;
 
-/// How far the popup is pushed away from the cursor.
-const CURSOR_OFFSET: i32 = 18;
-
 const MAX_RESULTS: usize = 300;
 const SUBCLASS_ID: usize = 1;
 
@@ -243,30 +240,23 @@ pub fn show() {
     reload();
 
     let cursor = win::cursor_position();
-    let area = win::work_area_at(cursor);
-    let scale = win::dpi_at(cursor) as f64 / 96.0;
+
+    // The position is remembered rather than derived from the mouse: the user put
+    // the popup where they want it, and having it follow the cursor on every open
+    // is what made dragging it pointless. Only the very first open — before there
+    // is anything to remember — has to pick a monitor, and that is whichever one
+    // the cursor is on.
+    let remembered = crate::current_settings().and_then(|settings| settings.popup_position);
+    let anchor = remembered.map(|(x, y)| win::POINT { x, y }).unwrap_or(cursor);
+    let area = win::work_area_at(anchor);
+    let scale = win::dpi_at(anchor) as f64 / 96.0;
 
     let width = scaled(WIDTH, scale);
     let height = scaled(HEIGHT, scale);
     let pad = scaled(PAD, scale);
     let search_height = scaled(SEARCH_HEIGHT, scale);
-    let offset = scaled(CURSOR_OFFSET, scale);
 
-    // Prefer just below-right of the cursor; flip whichever axis would overflow,
-    // then clamp, so a cursor in a screen corner still gets a fully visible
-    // window rather than one hanging off the edge.
-    let mut left = cursor.x + offset;
-    if left + width > area.right {
-        left = cursor.x - offset - width;
-    }
-
-    let mut top = cursor.y + offset;
-    if top + height > area.bottom {
-        top = cursor.y - offset - height;
-    }
-
-    left = left.clamp(area.left, (area.right - width).max(area.left));
-    top = top.clamp(area.top, (area.bottom - height).max(area.top));
+    let (left, top) = placed(remembered, &area, width, height);
 
     ensure_fonts(p, scale);
 
@@ -710,6 +700,10 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             // which is also why the tab strip is the handle to grab.
             if !tab_click(lparam) {
                 win::begin_drag_move(hwnd);
+
+                // The move loop has returned, so the window is where the user left
+                // it: that is the position to remember for the next open.
+                remember_position();
             }
             0
         }
@@ -1072,4 +1066,70 @@ fn cycle_tab(delta: i32) {
 
 fn text_flags() -> u32 {
     win::DT_LEFT | win::DT_SINGLELINE | win::DT_VCENTER | win::DT_END_ELLIPSIS | win::DT_NOPREFIX
+}
+
+/// Records where the popup is now, which is where the user just left it.
+fn remember_position() {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    if let Some((x, y)) = win::window_position(p.hwnd) {
+        crate::remember_popup_position(x, y);
+    }
+}
+
+/// Where the window goes: where it was left last time, or the middle of the work
+/// area when there is nothing to remember.
+///
+/// Pure, and tested, because one of its two jobs only shows up after a monitor goes
+/// away: a remembered corner can be off-screen by now — that monitor is unplugged,
+/// the resolution changed — and a popup that opens somewhere unreachable is worse
+/// than one that moved.
+fn placed(remembered: Option<(i32, i32)>, area: &win::RECT, width: i32, height: i32) -> (i32, i32) {
+    let (left, top) = remembered.unwrap_or_else(|| {
+        let left = area.left + (area.right - area.left - width) / 2;
+        let top = area.top + (area.bottom - area.top - height) / 2;
+        (left, top)
+    });
+
+    // `max(area.left)`: a window wider than the work area cannot be clamped into it,
+    // and `clamp` panics when its bounds cross. The top-left corner is the fallback.
+    (
+        left.clamp(area.left, (area.right - width).max(area.left)),
+        top.clamp(area.top, (area.bottom - height).max(area.top)),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn work_area() -> win::RECT {
+        win::RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        }
+    }
+
+    /// Placement has two jobs — put it back where it was, and bring it back on
+    /// screen when that is no longer a place — and the second one only ever shows
+    /// up after a monitor changes, which is a bad moment to discover it is wrong.
+    #[test]
+    fn remembered_position_wins_unless_it_is_off_screen() {
+        // Nothing remembered: centred, so the first open does not depend on the mouse.
+        assert_eq!(placed(None, &work_area(), 600, 400), (660, 320));
+
+        // Remembered: exactly where it was left, including against the right edge.
+        assert_eq!(placed(Some((1300, 500)), &work_area(), 600, 400), (1300, 500));
+
+        // From a monitor that is gone now: pulled back into this one.
+        assert_eq!(placed(Some((2500, -300)), &work_area(), 600, 400), (1320, 0));
+
+        // Wider than the screen it has to fit on: the top-left corner is the best
+        // that can be done, and this is the case that panics without the `max`.
+        assert_eq!(placed(Some((-500, -500)), &work_area(), 2000, 1200), (0, 0));
+    }
 }

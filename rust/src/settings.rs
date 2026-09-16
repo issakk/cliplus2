@@ -76,6 +76,13 @@ pub struct Settings {
     #[serde(rename = "SettingsScale")]
     pub settings_scale: u32,
 
+    /// Where the popup was last left, in screen coordinates. `None` until it is
+    /// dragged somewhere: the first open has nothing to go on and centres itself
+    /// on whichever monitor the cursor is on. Written by the popup, not by the
+    /// settings window, which only ever saves the fields it shows.
+    #[serde(rename = "PopupPosition")]
+    pub popup_position: Option<(i32, i32)>,
+
     #[serde(rename = "CaptureText")]
     pub capture_text: bool,
 
@@ -109,6 +116,7 @@ impl Default for Settings {
             inline_text_limit: 8192,
             rescan_seconds: 60,
             settings_scale: win::DEFAULT_SETTINGS_SCALE,
+            popup_position: None,
             capture_text: true,
             capture_images: true,
             capture_files: true,
