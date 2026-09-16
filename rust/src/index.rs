@@ -162,8 +162,11 @@ impl Index {
             return;
         }
 
-        // Both runs descending by time, which is the order the index keeps: merging
-        // them is one walk instead of a sort of everything.
+        // Descending by time, and reversed first so that two clips captured in the
+        // same millisecond keep the order they were captured in: a stable sort of the
+        // reversed batch puts the later one first, which is where `insert` puts it
+        // (before everything of the same age).
+        batch.reverse();
         batch.sort_by(|left, right| right.at.cmp(&left.at));
 
         // Sized before either run is moved out of its vector.
