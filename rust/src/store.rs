@@ -226,6 +226,7 @@ impl Store {
             stem,
             false,
             &self.settings.machine_id,
+            crate::settings::current_year(),
         );
 
         self.index
@@ -390,6 +391,9 @@ impl Store {
         let folder = path.parent().unwrap_or(Path::new(""));
         let mut items = Vec::new();
 
+        // Once for the whole database rather than once per row: every row's
+        // timestamp is formatted against it.
+        let now_year = crate::settings::current_year();
         for row in rows {
             let row = row.map_err(|err| err.to_string())?;
             let pinned = folder
@@ -415,6 +419,7 @@ impl Store {
                 row.stem,
                 pinned,
                 &self.settings.machine_id,
+                now_year,
             ));
         }
 
@@ -1012,7 +1017,14 @@ mod tests {
         fs::write(dir.join("stem-1.pin"), []).unwrap();
 
         let row = record("stem-1", None, Some("stem-1.bin"));
-        let item = ClipItem::from_record(&row, path.clone(), "stem-1".to_string(), true, "3f9a2c81");
+        let item = ClipItem::from_record(
+            &row,
+            path.clone(),
+            "stem-1".to_string(),
+            true,
+            "3f9a2c81",
+            crate::settings::current_year(),
+        );
         delete_clips(&[item]);
 
         assert!(path.exists(), "the database must outlive its own row");

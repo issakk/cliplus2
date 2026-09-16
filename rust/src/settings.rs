@@ -32,6 +32,12 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The local year, which is what a row's timestamp is compared against to decide
+/// whether it has to spell the year out.
+pub fn current_year() -> u16 {
+    win::local_year_month(now_ms()).0
+}
+
 /// `<local yyyy-MM>`: local time, because that is how the folders already on disk
 pub fn month_bucket(ms: i64) -> String {
     let (year, month) = win::local_year_month(ms);

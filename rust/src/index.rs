@@ -49,6 +49,7 @@ impl ClipItem {
         stem: String,
         pinned: bool,
         local_machine: &str,
+        now_year: u16,
     ) -> ClipItem {
         let kind = ClipKind::from_name(&record.kind);
         let text = record.text.clone().unwrap_or_default();
@@ -60,7 +61,7 @@ impl ClipItem {
         };
 
         let preview = build_preview(kind, &text, has_blob);
-        let meta = build_meta(record, kind, has_blob, local_machine);
+        let meta = build_meta(record, kind, has_blob, local_machine, now_year);
 
         ClipItem {
             stem,
@@ -432,11 +433,33 @@ fn truncate_chars(text: &str, limit: usize) -> String {
     out
 }
 
+/// The timestamp a row carries: `MM-DD hh:mm`, with the year in front of it only
+/// when the clip is not from this one. Those four characters come out of the source
+/// column on every row, and the list is in time order — a timestamp without a year
+/// is from this year, and one with a year is old enough that `01-05` alone would
+/// read as five days ago.
+fn format_when(at: i64, now_year: u16) -> String {
+    let when = win::local_datetime(at);
+
+    if when.year == now_year {
+        format!(
+            "{:02}-{:02} {:02}:{:02}",
+            when.month, when.day, when.hour, when.minute
+        )
+    } else {
+        format!(
+            "{}-{:02}-{:02} {:02}:{:02}",
+            when.year, when.month, when.day, when.hour, when.minute
+        )
+    }
+}
+
 fn build_meta(
     record: &ClipRecord,
     kind: ClipKind,
     has_blob: bool,
     local_machine: &str,
+    now_year: u16,
 ) -> String {
     let label = match kind {
         ClipKind::Image => "图片",
@@ -444,11 +467,7 @@ fn build_meta(
         ClipKind::Text => "文本",
     };
 
-    let when = win::local_datetime(record.at);
-    let time = format!(
-        "{:02}-{:02} {:02}:{:02}",
-        when.month, when.day, when.hour, when.minute
-    );
+    let time = format_when(record.at, now_year);
 
     let who = if record.machine.is_empty() {
         "?".to_string()
@@ -499,6 +518,7 @@ mod tests {
             stem.to_string(),
             false,
             "local",
+            crate::settings::current_year(),
         )
     }
 
@@ -593,6 +613,41 @@ mod tests {
         assert_eq!(
             build_preview(ClipKind::Files, "C:\\a.txt\nC:\\b.txt", false),
             "[文件 x2] C:\\a.txt"
+        );
+    }
+
+    /// The timestamp on a row has no year on purpose, which is only readable because
+    /// the list is in time order. What must not happen is the other way round: a clip
+    /// from a previous year keeping the short form, where `01-05` reads as five days
+    /// ago rather than a year and a month.
+    #[test]
+    fn the_year_is_written_only_when_it_is_not_this_one() {
+        const DAY: i64 = 24 * 60 * 60 * 1000;
+
+        let now = crate::settings::now_ms();
+        let this_year = crate::settings::current_year();
+        let when = win::local_datetime(now);
+
+        assert_eq!(
+            format_when(now, this_year),
+            format!(
+                "{:02}-{:02} {:02}:{:02}",
+                when.month, when.day, when.hour, when.minute
+            )
+        );
+
+        // 400 days back is a previous calendar year whichever side of New Year this
+        // happens to run on, and it is still the short form that has to change.
+        let then = now - 400 * DAY;
+        let when = win::local_datetime(then);
+        assert!(when.year < this_year);
+
+        assert_eq!(
+            format_when(then, this_year),
+            format!(
+                "{}-{:02}-{:02} {:02}:{:02}",
+                when.year, when.month, when.day, when.hour, when.minute
+            )
         );
     }
 }
