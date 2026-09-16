@@ -16,18 +16,24 @@ use crate::win::{self, HWND, LPARAM, LRESULT, WPARAM};
 
 /// Client area in logical pixels; the frame is added around it at creation.
 ///
-/// Sized around `win::UI_FONT_HEIGHT`: 16 px text wants a taller row and a wider
-/// caption than the 12 px these were first laid out for. `MARGIN + LABEL_WIDTH +
-/// 8 + FIELD_WIDTH + MARGIN` is exactly `CLIENT_WIDTH` — the right edge of the
-/// last field is the margin.
-const CLIENT_WIDTH: i32 = 620;
-const CLIENT_HEIGHT: i32 = 380;
+/// Both halves are computed from the layout constants below rather than written
+/// down. That is not style: this window was left at its old height when a row was
+/// added, and the checkboxes and the buttons ended up below the bottom edge.
+const CLIENT_WIDTH: i32 = MARGIN + LABEL_WIDTH + FIELD_GAP + FIELD_WIDTH + MARGIN;
+const CLIENT_HEIGHT: i32 = BUTTON_TOP + BUTTON_HEIGHT + MARGIN;
 
 const MARGIN: i32 = 16;
 const LABEL_WIDTH: i32 = 220;
 const FIELD_WIDTH: i32 = 360;
 const ROW_HEIGHT: i32 = 26;
 const ROW_STEP: i32 = 38;
+/// Between a caption and its field, and between two buttons.
+const FIELD_GAP: i32 = 8;
+const BUTTON_GAP: i32 = 10;
+const BUTTON_WIDTH: i32 = 110;
+const BUTTON_HEIGHT: i32 = 26;
+const CHECK_WIDTH: i32 = 130;
+const CHECK_STEP: i32 = 140;
 
 const ID_HOTKEY: usize = 1;
 const ID_SYNC_ROOT: usize = 2;
@@ -40,7 +46,28 @@ const ID_CAPTURE_IMAGES: usize = 8;
 const ID_CAPTURE_FILES: usize = 9;
 const ID_SAVE: usize = 10;
 const ID_CANCEL: usize = 11;
-const ID_UI_SCALE: usize = 12;
+const ID_SETTINGS_SCALE: usize = 12;
+
+/// The rows, top to bottom: the control id and the caption beside it.
+///
+/// A constant rather than a local in `create`, because `CHECKS_TOP` below is derived
+/// from its length — that is what keeps a new row from pushing the controls below
+/// the bottom edge again. `layout` walks the same list, so a row is described in
+/// exactly one place.
+const ROW_LABELS: [(usize, &str); 7] = [
+    (ID_HOTKEY, "热键（点这里按组合键）"),
+    (ID_SYNC_ROOT, "同步目录（留空 = 自动）"),
+    (ID_RETENTION, "保留天数（0 = 不清理）"),
+    (ID_MAX_BLOB_MB, "单条上限（MB）"),
+    (ID_INLINE_LIMIT, "内联文本上限（字符）"),
+    (ID_RESCAN, "重扫间隔（秒）"),
+    (ID_SETTINGS_SCALE, "设置窗口字号（%）"),
+];
+
+/// The three bands under the rows: checkboxes, the note, the buttons.
+const CHECKS_TOP: i32 = MARGIN + ROW_LABELS.len() as i32 * ROW_STEP + 6;
+const NOTE_TOP: i32 = CHECKS_TOP + ROW_STEP;
+const BUTTON_TOP: i32 = CHECKS_TOP + ROW_STEP * 2 + 6;
 
 /// Subclass id for the hotkey field, which is the only control here that has to
 /// intercept its own keystrokes.
@@ -80,6 +107,16 @@ fn frame_size(scale: f64) -> (i32, i32) {
     (frame.right - frame.left, frame.bottom - frame.top)
 }
 
+/// The scale this window draws at: the monitor's DPI, times the user's own
+/// `SettingsScale`.
+///
+/// The multiplication lives here rather than inside `win::scaled` on purpose: the
+/// popup reads that helper too, and it is a fixed-density list that must not follow
+/// the setting.
+fn window_scale(dpi_scale: f64) -> f64 {
+    dpi_scale * win::settings_scale_factor()
+}
+
 pub fn create() -> bool {
     let style = WINDOW_STYLE;
     let ex_style = 0;
@@ -113,19 +150,9 @@ pub fn create() -> bool {
     let check_style = win::WS_CHILD | win::WS_VISIBLE | win::WS_TABSTOP | win::BS_AUTOCHECKBOX;
     let button_style = win::WS_CHILD | win::WS_VISIBLE | win::WS_TABSTOP | win::BS_PUSHBUTTON;
 
-    let field_x = MARGIN + LABEL_WIDTH + 8;
+    let field_x = MARGIN + LABEL_WIDTH + FIELD_GAP;
 
-    let rows: [(usize, &str); 7] = [
-        (ID_HOTKEY, "热键（点这里按组合键）"),
-        (ID_SYNC_ROOT, "同步目录（留空 = 自动）"),
-        (ID_RETENTION, "保留天数（0 = 不清理）"),
-        (ID_MAX_BLOB_MB, "单条上限（MB）"),
-        (ID_INLINE_LIMIT, "内联文本上限（字符）"),
-        (ID_RESCAN, "重扫间隔（秒）"),
-        (ID_UI_SCALE, "界面缩放（%，100=系统）"),
-    ];
-
-    for (index, (id, label)) in rows.iter().copied().enumerate() {
+    for (index, (id, label)) in ROW_LABELS.iter().copied().enumerate() {
         let y = MARGIN + index as i32 * ROW_STEP;
 
         win::create_child_id(
@@ -152,9 +179,7 @@ pub fn create() -> bool {
         win::create_child_id("EDIT", "", style, hwnd, id, field_x, y, FIELD_WIDTH, ROW_HEIGHT);
     }
 
-    // Counted from the array rather than written as a number, so adding a row
-    // cannot leave the checkboxes sitting on top of it.
-    let check_y = MARGIN + rows.len() as i32 * ROW_STEP + 6;
+    let check_y = CHECKS_TOP;
     let checks: [(usize, &str); 3] = [
         (ID_CAPTURE_TEXT, "记录文本"),
         (ID_CAPTURE_IMAGES, "记录图片"),
@@ -162,23 +187,33 @@ pub fn create() -> bool {
     ];
 
     for (index, (id, label)) in checks.iter().copied().enumerate() {
-        let x = MARGIN + index as i32 * 140;
-        win::create_child_id("BUTTON", label, check_style, hwnd, id, x, check_y, 130, ROW_HEIGHT);
+        let x = MARGIN + index as i32 * CHECK_STEP;
+        win::create_child_id(
+            "BUTTON",
+            label,
+            check_style,
+            hwnd,
+            id,
+            x,
+            check_y,
+            CHECK_WIDTH,
+            ROW_HEIGHT,
+        );
     }
 
     win::create_child_id(
         "STATIC",
-        "热键、三个记录开关和界面缩放立即生效；其余项需要重启 ClipPlus。",
+        "热键、三个记录开关和字号立即生效；其余项需要重启 ClipPlus。",
         label_style,
         hwnd,
         NOTE_ID,
         MARGIN,
-        check_y + ROW_STEP,
+        NOTE_TOP,
         CLIENT_WIDTH - MARGIN * 2,
         ROW_HEIGHT,
     );
 
-    let button_y = check_y + ROW_STEP * 2 + 6;
+    let button_y = BUTTON_TOP;
     win::create_child_id(
         "BUTTON",
         "保存",
@@ -187,8 +222,8 @@ pub fn create() -> bool {
         ID_SAVE,
         MARGIN,
         button_y,
-        110,
-        26,
+        BUTTON_WIDTH,
+        BUTTON_HEIGHT,
     );
     win::create_child_id(
         "BUTTON",
@@ -196,10 +231,10 @@ pub fn create() -> bool {
         button_style,
         hwnd,
         ID_CANCEL,
-        MARGIN + 120,
+        MARGIN + BUTTON_WIDTH + BUTTON_GAP,
         button_y,
-        110,
-        26,
+        BUTTON_WIDTH,
+        BUTTON_HEIGHT,
     );
 
     // The hotkey field records combinations instead of accepting text, which
@@ -238,7 +273,7 @@ fn layout(hwnd: HWND, scale: f64) {
     let field_width = win::scaled(FIELD_WIDTH, scale);
     let row_height = win::scaled(ROW_HEIGHT, scale);
     let row_step = win::scaled(ROW_STEP, scale);
-    let field_x = margin + label_width + win::scaled(8, scale);
+    let field_x = margin + label_width + win::scaled(FIELD_GAP, scale);
     let font = win::ui_font_for_scale(scale);
 
     let place = |id: usize, x: i32, y: i32, width: i32, height: i32| {
@@ -261,56 +296,42 @@ fn layout(hwnd: HWND, scale: f64) {
         }
     };
 
-    let fields = [
-        ID_HOTKEY,
-        ID_SYNC_ROOT,
-        ID_RETENTION,
-        ID_MAX_BLOB_MB,
-        ID_INLINE_LIMIT,
-        ID_RESCAN,
-        ID_UI_SCALE,
-    ];
-
-    for index in 0..fields.len() as i32 {
-        let y = margin + index * row_step;
+    for (index, (id, _)) in ROW_LABELS.iter().enumerate() {
+        let y = margin + index as i32 * row_step;
 
         // The caption shares the field's top edge: both draw their text from the
         // top of their box, so an extra offset only pushes the label below the
         // text of the field it belongs to.
-        place(
-            LABEL_ID_BASE + index as usize,
-            margin,
-            y,
-            label_width,
-            row_height,
-        );
-        place(fields[index as usize], field_x, y, field_width, row_height);
+        place(LABEL_ID_BASE + index, margin, y, label_width, row_height);
+        place(*id, field_x, y, field_width, row_height);
     }
 
-    let check_y = margin + fields.len() as i32 * row_step + win::scaled(6, scale);
+    let check_width = win::scaled(CHECK_WIDTH, scale);
+    let check_step = win::scaled(CHECK_STEP, scale);
+    let check_y = win::scaled(CHECKS_TOP, scale);
     let checks = [ID_CAPTURE_TEXT, ID_CAPTURE_IMAGES, ID_CAPTURE_FILES];
 
     for (index, id) in checks.into_iter().enumerate() {
-        let x = margin + index as i32 * win::scaled(140, scale);
-        place(id, x, check_y, win::scaled(130, scale), row_height);
+        let x = margin + index as i32 * check_step;
+        place(id, x, check_y, check_width, row_height);
     }
 
     place(
         NOTE_ID,
         margin,
-        check_y + row_step,
+        win::scaled(NOTE_TOP, scale),
         win::scaled(CLIENT_WIDTH, scale) - margin * 2,
         row_height,
     );
 
-    let button_y = check_y + row_step * 2 + win::scaled(6, scale);
-    let button_width = win::scaled(110, scale);
-    let button_height = win::scaled(26, scale);
+    let button_y = win::scaled(BUTTON_TOP, scale);
+    let button_width = win::scaled(BUTTON_WIDTH, scale);
+    let button_height = win::scaled(BUTTON_HEIGHT, scale);
 
     place(ID_SAVE, margin, button_y, button_width, button_height);
     place(
         ID_CANCEL,
-        margin + win::scaled(120, scale),
+        margin + button_width + win::scaled(BUTTON_GAP, scale),
         button_y,
         button_width,
         button_height,
@@ -334,8 +355,9 @@ pub fn show() {
 
     // Every size in this file is written at 96 DPI, so the monitor's scale has
     // to be applied by hand: Windows does not do it for a per-monitor-DPI
-    // process, and a 4K display would otherwise get 96-DPI text.
-    let scale = win::dpi_at(cursor) as f64 / 96.0;
+    // process, and a 4K display would otherwise get 96-DPI text. The window is the
+    // one place the user's own scale applies on top of that.
+    let scale = window_scale(win::dpi_at(cursor) as f64 / 96.0);
     let (width, height) = frame_size(scale);
 
     let left = area.left + (area.right - area.left - width) / 2;
@@ -376,7 +398,7 @@ fn populate(current: &Settings) {
     );
     set_text(ID_INLINE_LIMIT, &current.inline_text_limit.to_string());
     set_text(ID_RESCAN, &current.rescan_seconds.to_string());
-    set_text(ID_UI_SCALE, &current.ui_scale.to_string());
+    set_text(ID_SETTINGS_SCALE, &current.settings_scale.to_string());
 
     set_checked(ID_CAPTURE_TEXT, current.capture_text);
     set_checked(ID_CAPTURE_IMAGES, current.capture_images);
@@ -480,10 +502,10 @@ fn save() {
         }
     };
 
-    let ui_scale = match parse_or(win::DEFAULT_UI_SCALE, ID_UI_SCALE) {
+    let settings_scale = match parse_or(win::DEFAULT_SETTINGS_SCALE, ID_SETTINGS_SCALE) {
         Ok(value) => value,
         Err(reason) => {
-            complain(&format!("界面缩放：{reason}"));
+            complain(&format!("设置窗口字号：{reason}"));
             return;
         }
     };
@@ -500,11 +522,11 @@ fn save() {
 
     // Refused rather than clamped: a scale that is silently changed under the
     // cursor is worse than one that is refused, and the range is on screen.
-    if !(win::MIN_UI_SCALE..=win::MAX_UI_SCALE).contains(&ui_scale) {
+    if !(win::MIN_SETTINGS_SCALE..=win::MAX_SETTINGS_SCALE).contains(&settings_scale) {
         complain(&format!(
-            "界面缩放在 {}% 到 {}% 之间，100% 是系统大小。",
-            win::MIN_UI_SCALE,
-            win::MAX_UI_SCALE
+            "字号要在 {}% 到 {}% 之间，100% 就跟系统一样大。",
+            win::MIN_SETTINGS_SCALE,
+            win::MAX_SETTINGS_SCALE
         ));
         return;
     }
@@ -522,7 +544,7 @@ fn save() {
     updated.max_blob_bytes = max_blob_mb as u64 * 1024 * 1024;
     updated.inline_text_limit = inline_limit as usize;
     updated.rescan_seconds = rescan as u64;
-    updated.ui_scale = ui_scale;
+    updated.settings_scale = settings_scale;
     updated.capture_text = is_checked(ID_CAPTURE_TEXT);
     updated.capture_images = is_checked(ID_CAPTURE_IMAGES);
     updated.capture_files = is_checked(ID_CAPTURE_FILES);
@@ -702,11 +724,12 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             // this layout is a fixed grid, so its size is computed from the
             // scale instead.
             let dpi = (wparam & 0xFFFF) as u32;
-            let scale = if dpi == 0 {
+            let monitor = if dpi == 0 {
                 win::dpi_scale_of(hwnd)
             } else {
                 dpi as f64 / 96.0
             };
+            let scale = window_scale(monitor);
             let suggested = unsafe { &*(lparam as *const win::RECT) };
             let (width, height) = frame_size(scale);
 

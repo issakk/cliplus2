@@ -1193,34 +1193,40 @@ pub fn dpi_scale_of(hwnd: HWND) -> f64 {
 }
 
 /// Logical pixels to physical. Sizes in this crate are written at 96 DPI and
-/// multiplied by the monitor's scale — and by the user's own `UiScale` — before
-/// they are used.
+/// multiplied by the monitor's scale before they are used.
+///
+/// Deliberately *only* the monitor's scale: the popup is a fixed-density list and
+/// must not move when the user's own scale does. The settings window applies that on
+/// top of this, in `settings_window::window_scale`.
 pub fn scaled(value: i32, scale: f64) -> i32 {
-    (value as f64 * scale * user_scale()).round() as i32
+    (value as f64 * scale).round() as i32
 }
 
-/// The user's own multiplier on top of the display's scale, read by `scaled` and
-/// therefore applied to the whole interface — fonts, boxes and hit tests alike —
-/// rather than to any one window. The default is a size up from what Windows
-/// itself draws at, which is what 100% means here.
-static UI_SCALE: AtomicIsize = AtomicIsize::new(DEFAULT_UI_SCALE as isize);
+/// The user's own multiplier for the settings window, in percent, on top of the
+/// display's scale. That window was laid out at the size Windows draws its own
+/// controls (12 px text), which reads as too small on a 1080p screen at 100%
+/// scaling, and this is the knob for it.
+///
+/// Deliberately not folded into `scaled`: the popup is a fixed-density list, and
+/// the two windows should not be forced to move together.
+static SETTINGS_SCALE: AtomicIsize = AtomicIsize::new(DEFAULT_SETTINGS_SCALE as isize);
 
 /// The range the settings window offers. Below it the interface stops being
-/// readable; above it the popup no longer fits on a 1080p screen.
-pub const MIN_UI_SCALE: u32 = 50;
-pub const MAX_UI_SCALE: u32 = 300;
-pub const DEFAULT_UI_SCALE: u32 = 125;
+/// readable; above it the window no longer fits on a 1080p screen.
+pub const MIN_SETTINGS_SCALE: u32 = 50;
+pub const MAX_SETTINGS_SCALE: u32 = 300;
+pub const DEFAULT_SETTINGS_SCALE: u32 = 125;
 
-/// Sets the user scale, clamped. Changes take effect at the next layout: the
-/// settings window recomputes its own when it is saved and reopened, and the
-/// popup reads the scale on every show.
-pub fn set_ui_scale(percent: u32) {
-    let clamped = percent.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
-    UI_SCALE.store(clamped as isize, Ordering::SeqCst);
+/// Sets the user scale, clamped. A change takes effect at the next layout: the
+/// settings window recomputes its own when it is saved and reopened.
+pub fn set_settings_scale(percent: u32) {
+    let clamped = percent.clamp(MIN_SETTINGS_SCALE, MAX_SETTINGS_SCALE);
+    SETTINGS_SCALE.store(clamped as isize, Ordering::SeqCst);
 }
 
-fn user_scale() -> f64 {
-    UI_SCALE.load(Ordering::SeqCst) as f64 / 100.0
+/// The factor above, as a multiplier.
+pub fn settings_scale_factor() -> f64 {
+    SETTINGS_SCALE.load(Ordering::SeqCst) as f64 / 100.0
 }
 
 pub fn register_hotkey(hwnd: HWND, id: i32, modifiers: u32, vk: u32) -> bool {

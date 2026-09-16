@@ -70,11 +70,11 @@ pub struct Settings {
     #[serde(rename = "RescanSeconds")]
     pub rescan_seconds: u64,
 
-    /// Percent: the user's own multiplier on top of the display's DPI, so a
-    /// 1080p screen at 100% scaling can still have a readable interface. Applied
-    /// by `win::scaled`, so it covers both windows rather than just the font.
-    #[serde(rename = "UiScale")]
-    pub ui_scale: u32,
+    /// Percent: the user's own multiplier for the settings window's controls, on
+    /// top of the display's DPI. The popup is a fixed-density list and deliberately
+    /// does not follow this.
+    #[serde(rename = "SettingsScale")]
+    pub settings_scale: u32,
 
     #[serde(rename = "CaptureText")]
     pub capture_text: bool,
@@ -108,7 +108,7 @@ impl Default for Settings {
             max_blob_bytes: 10 * 1024 * 1024,
             inline_text_limit: 8192,
             rescan_seconds: 60,
-            ui_scale: win::DEFAULT_UI_SCALE,
+            settings_scale: win::DEFAULT_SETTINGS_SCALE,
             capture_text: true,
             capture_images: true,
             capture_files: true,
@@ -144,7 +144,9 @@ impl Settings {
             resolve_sync_root(&settings.app_dir, settings.sync_root_override.as_deref());
         // Hand-edited values are brought back into range here, so nothing
         // downstream has to wonder what a scale of 0 or 9000 would do.
-        settings.ui_scale = settings.ui_scale.clamp(win::MIN_UI_SCALE, win::MAX_UI_SCALE);
+        settings.settings_scale = settings
+            .settings_scale
+            .clamp(win::MIN_SETTINGS_SCALE, win::MAX_SETTINGS_SCALE);
 
         // Rewritten every start so a first run leaves an editable file behind.
         if let Err(err) = settings.save() {
