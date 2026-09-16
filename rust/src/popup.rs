@@ -292,12 +292,23 @@ pub fn show() {
             height,
             win::SWP_SHOWWINDOW,
         );
+    }
+
+    // `SetWindowPos` is meant to activate the window, and from a hotkey it is not
+    // dependable about it. A popup that never got the foreground gets no keystrokes
+    // — Esc does nothing — and never receives the `WM_ACTIVATE` that hides it again,
+    // so clicking elsewhere leaves it on screen. Both halves of that are logged.
+    let foreground = win::focus_window(p.hwnd);
+
+    unsafe {
         win::SetFocus(p.search);
     }
 
+    let active = win::foreground_window() == p.hwnd;
     let rows = p.items.lock().unwrap_or_else(|e| e.into_inner()).len();
     log::info(&format!(
-        "popup shown at {left},{top} {width}x{height} scale {scale:.2} ({rows} rows)"
+        "popup shown at {left},{top} {width}x{height} scale {scale:.2} ({rows} rows), \
+         foreground={foreground} active={active}"
     ));
     p.visible.store(true, Ordering::SeqCst);
 }
@@ -701,6 +712,18 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                 win::begin_drag_move(hwnd);
             }
             0
+        }
+
+        // The window itself can hold the keyboard — a click on its own background
+        // does that, and it is also how a drag starts — and then no subclass is in
+        // play to translate the keys. The same combinations are handled here too, so
+        // Esc and Enter do not depend on which half of the widget is focused.
+        win::WM_KEYDOWN => {
+            if handle_key(wparam as i32) {
+                0
+            } else {
+                win::def_window_proc(hwnd, message, wparam, lparam)
+            }
         }
 
         win::WM_COMMAND => {

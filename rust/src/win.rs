@@ -1327,6 +1327,43 @@ pub fn set_foreground(hwnd: HWND) -> bool {
     unsafe { hwnd != 0 && SetForegroundWindow(hwnd) != 0 }
 }
 
+/// The window Windows considers foreground: the one that gets the keystrokes.
+pub fn foreground_window() -> HWND {
+    unsafe { GetForegroundWindow() }
+}
+
+/// Hands the foreground and the keyboard to a window, and says whether it worked.
+///
+/// `SetForegroundWindow` on its own is refused whenever Windows decides this process
+/// did not earn the foreground, and for a window opened from a hotkey that happens
+/// often enough to matter: the window shows up but never receives a keystroke, and
+/// never gets the `WM_ACTIVATE` that would hide it again. Attaching the two input
+/// queues for the length of the call is the documented way around that.
+pub fn focus_window(hwnd: HWND) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+
+    if set_foreground(hwnd) {
+        return true;
+    }
+
+    let target = unsafe { GetWindowThreadProcessId(foreground_window(), std::ptr::null_mut()) };
+    let own = unsafe { GetCurrentThreadId() };
+
+    // Attaching to our own thread would be a no-op at best and a deadlock at worst.
+    if target == 0 || target == own {
+        return false;
+    }
+
+    unsafe {
+        AttachThreadInput(target, own, 1);
+        let taken = SetForegroundWindow(hwnd) != 0;
+        AttachThreadInput(target, own, 0);
+        taken
+    }
+}
+
 /// Synthesises Ctrl+V into whatever window currently has focus.
 pub fn send_ctrl_v() -> bool {
     let strokes = [
