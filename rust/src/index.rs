@@ -138,33 +138,122 @@ impl Index {
         true
     }
 
-    pub fn forget(&mut self, stem: &str) -> Option<ClipItem> {
-        let position = self.items.iter().position(|item| item.stem == stem)?;
-        let item = self.items.remove(position);
-        self.stems.remove(&item.stem);
+    /// Adds a batch the way `insert` adds one item, in a single merge rather than
+    /// one shift per row. This is the load path: a month of history is thousands
+    /// of rows, and each `insert` moves everything after its position.
+    ///
+    /// The batch does not have to be sorted; stems already known are skipped.
+    pub fn insert_many(&mut self, items: Vec<ClipItem>) {
+        let mut batch: Vec<ClipItem> = Vec::with_capacity(items.len());
 
-        // Only drop the hash when no other clip still carries it: the same
-        // content can legitimately have been stored by a second machine.
-        if !self.items.iter().any(|other| other.hash == item.hash) {
-            self.hashes.remove(&item.hash);
+        for item in items {
+            if !self.stems.insert(item.stem.clone()) {
+                continue;
+            }
+
+            if !item.hash.is_empty() {
+                self.hashes.insert(item.hash.clone());
+            }
+
+            batch.push(item);
         }
 
-        Some(item)
+        if batch.is_empty() {
+            return;
+        }
+
+        // Both runs descending by time, which is the order the index keeps: merging
+        // them is one walk instead of a sort of everything.
+        batch.sort_by(|left, right| right.at.cmp(&left.at));
+
+        // Sized before either run is moved out of its vector.
+        let mut merged = Vec::with_capacity(self.items.len() + batch.len());
+        let mut incoming = batch.into_iter().peekable();
+        let mut existing = std::mem::take(&mut self.items).into_iter().peekable();
+
+        loop {
+            // `>=` on a tie, matching where `insert` puts an item of the same age.
+            let take_incoming = match (incoming.peek(), existing.peek()) {
+                (Some(new), Some(old)) => new.at >= old.at,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+
+            let next = if take_incoming {
+                incoming.next()
+            } else {
+                existing.next()
+            };
+
+            match next {
+                Some(item) => merged.push(item),
+                None => break,
+            }
+        }
+
+        self.items = merged;
+    }
+
+    /// Drops a batch by stem. Retention removes its clips in a burst, and one scan
+    /// of the whole index per stem is quadratic.
+    pub fn forget_many(&mut self, stems: &HashSet<String>) {
+        let mut dropped: HashSet<String> = HashSet::new();
+
+        self.items.retain(|item| {
+            if !stems.contains(&item.stem) {
+                return true;
+            }
+
+            if !item.hash.is_empty() {
+                dropped.insert(item.hash.clone());
+            }
+            false
+        });
+
+        for stem in stems {
+            self.stems.remove(stem);
+        }
+
+        self.forget_hashes(&dropped);
+    }
+
+    /// Takes a batch of hashes out of the set, except the ones another clip still
+    /// carries: the same content can legitimately have been stored by two machines.
+    fn forget_hashes(&mut self, dropped: &HashSet<String>) {
+        if dropped.is_empty() {
+            return;
+        }
+
+        self.hashes.retain(|hash| {
+            !dropped.contains(hash) || self.items.iter().any(|item| &item.hash == hash)
+        });
     }
 
     /// Drops every entry that came out of one container. Used when a database
     /// changed (its rows are re-read from scratch) or disappeared.
+    ///
+    /// One pass over the index rather than a `forget` per stem: this runs again for
+    /// every change to a database, and each of those scans the whole index.
     pub fn forget_db(&mut self, db_path: &std::path::Path) {
-        let doomed: Vec<String> = self
-            .items
-            .iter()
-            .filter(|item| item.db_path == db_path)
-            .map(|item| item.stem.clone())
-            .collect();
+        // Taken rather than borrowed, because the stem and hash sets are updated
+        // from inside the loop and holding a borrow of the items would not allow it.
+        let existing = std::mem::take(&mut self.items);
+        let mut kept = Vec::with_capacity(existing.len());
+        let mut dropped: HashSet<String> = HashSet::new();
 
-        for stem in doomed {
-            self.forget(&stem);
+        for item in existing {
+            if item.db_path == db_path {
+                self.stems.remove(&item.stem);
+                if !item.hash.is_empty() {
+                    dropped.insert(item.hash);
+                }
+            } else {
+                kept.push(item);
+            }
         }
+
+        self.items = kept;
+        self.forget_hashes(&dropped);
     }
 
     pub fn set_pinned(&mut self, stem: &str, pinned: bool) -> bool {
@@ -412,5 +501,54 @@ mod tests {
 
         assert_eq!(index.query(None, None, 10).len(), 3);
         assert!(index.query(Some("bbb"), Some("clip a"), 10).is_empty());
+    }
+
+    /// `insert_many` is the load path — one merge for a whole month instead of one
+    /// shift per row — so it has to land the rows exactly where `insert` would,
+    /// including two clips captured in the same millisecond.
+    #[test]
+    fn batch_insert_and_forget_match_one_at_a_time() {
+        let batch = || {
+            vec![
+                item("a", "aaa", 100),
+                item("b", "aaa", 300),
+                item("c", "aaa", 200),
+                item("d", "aaa", 200),
+                item("e", "aaa", 400),
+            ]
+        };
+
+        let mut one_at_a_time = Index::default();
+        for entry in batch() {
+            assert!(one_at_a_time.insert(entry));
+        }
+
+        let mut merged = Index::default();
+        merged.insert_many(batch());
+
+        fn order(index: &Index) -> Vec<String> {
+            index
+                .query(None, None, 10)
+                .into_iter()
+                .map(|row| row.stem)
+                .collect()
+        }
+
+        assert_eq!(order(&merged), order(&one_at_a_time));
+
+        // A stem that is already known is skipped here too, which is what keeps a
+        // reload of a machine's own month from doubling its rows.
+        let mut again = Index::default();
+        again.insert(item("a", "aaa", 100));
+        again.insert_many(batch());
+        assert_eq!(again.query(None, None, 10).len(), 5);
+
+        // And the batch forget takes exactly those rows back out, newest first.
+        let stems: HashSet<String> = ["a", "c"]
+            .iter()
+            .map(|stem| stem.to_string())
+            .collect();
+        merged.forget_many(&stems);
+        assert_eq!(order(&merged), vec!["e", "b", "d"]);
     }
 }

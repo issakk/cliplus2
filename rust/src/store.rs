@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS clips (
     blob    TEXT,
     app     TEXT,
     title   TEXT
-)
+)";
 
 
 /// `OR IGNORE`: the stem is the primary key, so a capture that is already stored
@@ -423,10 +423,9 @@ impl Store {
         let count = items.len();
         let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
         index.forget_db(path);
-
-        for item in items {
-            index.insert(item);
-        }
+        // One merge rather than one insert per row: this runs again for every change
+        // to a database, and each insert shifts the whole index.
+        index.insert_many(items);
 
         Ok(count)
     }
@@ -553,15 +552,12 @@ impl Store {
             return;
         }
 
-        for item in &doomed {
-            delete_clip(item);
-        }
+        delete_clips(&doomed);
 
         {
+            let stems: HashSet<String> = doomed.iter().map(|item| item.stem.clone()).collect();
             let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
-            for item in &doomed {
-                index.forget(&item.stem);
-            }
+            index.forget_many(&stems);
         }
 
         log::info(&format!(
@@ -745,30 +741,66 @@ fn insert_row(db_path: &Path, record: &ClipRecord) -> Result<(), String> {
     Ok(())
 }
 
-/// Removes one clip from the database that holds it. A delete is the one write
-/// an older, otherwise frozen month can still see, so retention re-uploads
-/// exactly the databases it actually changed.
-fn delete_row(db_path: &Path, stem: &str) {
-    let result = open_rw(db_path).and_then(|conn| {
-        conn.execute("DELETE FROM clips WHERE stem = ?1", params![stem])
-            .map_err(|err| err.to_string())
-            .map(|_| ())
-    });
+/// Deletes a batch of clips: the rows of every database involved, then the blob and
+/// pin files beside them.
+///
+/// A batch rather than one call per clip because retention empties in bursts — one
+/// transaction per database instead of a commit per row, and one file open instead
+/// of one per clip.
+fn delete_clips(items: &[ClipItem]) {
+    let mut stems_by_db: HashMap<&Path, Vec<&str>> = HashMap::new();
 
-    if let Err(err) = result {
-        log::error(&format!("delete {stem} from {}: {err}", db_path.display()));
+    for item in items {
+        stems_by_db
+            .entry(item.db_path.as_path())
+            .or_default()
+            .push(item.stem.as_str());
+    }
+
+    for (db_path, stems) in stems_by_db {
+        delete_rows(db_path, &stems);
+    }
+
+    // The files go even when the row could not: an orphaned blob costs disk, a row
+    // pointing at a missing blob is a broken entry, so this is the safe order.
+    for item in items {
+        if item.has_blob && !item.blob_path.as_os_str().is_empty() {
+            remove_file(&item.blob_path);
+        }
+
+        remove_file(&item.pin_path());
     }
 }
 
-/// Deletes one clip: its row, its blob, and its pin marker.
-fn delete_clip(item: &ClipItem) {
-    delete_row(&item.db_path, &item.stem);
+/// Deletes rows from one database in a single transaction. The transaction is the
+/// whole point: without it SQLite commits per statement, and each of those is a
+/// journal write and an fsync.
+fn delete_rows(db_path: &Path, stems: &[&str]) {
+    let result = open_rw(db_path).and_then(|mut conn| {
+        let transaction = conn.transaction().map_err(|err| err.to_string())?;
 
-    if item.has_blob && !item.blob_path.as_os_str().is_empty() {
-        remove_file(&item.blob_path);
+        {
+            let mut statement = transaction
+                .prepare("DELETE FROM clips WHERE stem = ?1")
+                .map_err(|err| err.to_string())?;
+
+            for stem in stems {
+                statement
+                    .execute(params![stem])
+                    .map_err(|err| err.to_string())?;
+            }
+        }
+
+        transaction.commit().map_err(|err| err.to_string())
+    });
+
+    if let Err(err) = result {
+        log::error(&format!(
+            "delete {} clip(s) from {}: {err}",
+            stems.len(),
+            db_path.display()
+        ));
     }
-
-    remove_file(&item.pin_path());
 }
 
 fn open_rw(path: &Path) -> Result<Connection, String> {
@@ -911,7 +943,7 @@ mod tests {
         assert_eq!(second.text, None);
         assert_eq!(second.blob.as_deref(), Some("stem-2.bin"));
 
-        delete_row(&path, "stem-1");
+        delete_rows(&path, &["stem-1"]);
         let left = read_all(&path);
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].stem, "stem-2");
@@ -960,7 +992,7 @@ mod tests {
         assert_eq!(plain.app.as_deref(), Some(""));
         assert_eq!(plain.title.as_deref(), Some(""));
 
-        delete_row(&path, "stem-1");
+        delete_rows(&path, &["stem-1"]);
         assert_eq!(read_all(&path).len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
@@ -981,7 +1013,7 @@ mod tests {
 
         let row = record("stem-1", None, Some("stem-1.bin"));
         let item = ClipItem::from_record(&row, path.clone(), "stem-1".to_string(), true, "3f9a2c81");
-        delete_clip(&item);
+        delete_clips(&[item]);
 
         assert!(path.exists(), "the database must outlive its own row");
         assert_eq!(read_all(&path).len(), 1);
