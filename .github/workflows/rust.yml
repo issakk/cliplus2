@@ -6,7 +6,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # Write, not read: the build publishes the exe as a release, which is the only
+  # thing in this workflow that touches the repository.
+  contents: write
 
 env:
   # Forced colour puts ANSI escapes into the captured log, which both breaks the
@@ -123,3 +125,25 @@ jobs:
           path: rust/target/release/ClipPlus.exe
           if-no-files-found: error
           retention-days: 30
+
+      # The artifact above needs a login and a trip through the run page. The
+      # release is the file someone actually wants, at a URL that never changes:
+      #   https://github.com/<repo>/releases/latest/download/ClipPlus.exe
+      # Recreated rather than updated so the `latest` tag names the commit the exe
+      # was built from.
+      - name: Publish the release
+        if: success() && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view latest >/dev/null 2>&1; then
+            gh release delete latest --yes --cleanup-tag
+          fi
+
+          gh release create latest target/release/ClipPlus.exe \
+            --target "${{ github.sha }}" \
+            --title "ClipPlus 最新构建" \
+            --notes "main 分支最新一次构建 · commit ${{ github.sha }}"
+
+          echo "### [下载 ClipPlus.exe](https://github.com/${{ github.repository }}/releases/latest/download/ClipPlus.exe)" >> "$GITHUB_STEP_SUMMARY"

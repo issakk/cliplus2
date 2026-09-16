@@ -51,45 +51,21 @@ CREATE TABLE IF NOT EXISTS clips (
     hash    TEXT NOT NULL,
     text    TEXT,
     length  INTEGER NOT NULL,
-    blob    TEXT
-)";
+    blob    TEXT,
+    app     TEXT,
+    title   TEXT
+)
 
-/// Where each clip was copied from, keyed by stem.
-///
-/// A table of its own rather than two more columns on `clips`, because this has to
-/// keep working in both directions across machines: older months — and older
-/// installs that have not been updated yet — read `clips` with a fixed column
-/// list, and a table they never mention is a table they never miss. Created on the
-/// first write that has any context to store, so an untouched month is untouched.
-const CONTEXT_SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS context (
-    stem  TEXT PRIMARY KEY,
-    app   TEXT,
-    title TEXT
-)";
 
 /// `OR IGNORE`: the stem is the primary key, so a capture that is already stored
 /// is a no-op instead of an error.
 const INSERT_ROW: &str = "
-INSERT OR IGNORE INTO clips (stem, at, machine, kind, hash, text, length, blob)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+INSERT OR IGNORE INTO clips (stem, at, machine, kind, hash, text, length, blob, app, title)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
 
-/// `OR IGNORE` for the same reason as the row itself: this machine's own copy of a
-/// clip can be re-stored after a crash, and the context that arrives with it is the
-/// one already recorded.
-const INSERT_CONTEXT: &str = "
-INSERT OR IGNORE INTO context (stem, app, title)
-VALUES (?1, ?2, ?3)";
 
-/// The source window is read back as two trailing columns that this query supplies
-/// itself, so the rows below have one shape whether or not the file has a `context`
-/// table: `select_rows_sql` picks between this and the join.
 const SELECT_ROWS: &str = "
-SELECT stem, at, machine, kind, hash, text, length, blob, NULL, NULL FROM clips";
-
-const SELECT_ROWS_WITH_CONTEXT: &str = "
-SELECT c.stem, c.at, c.machine, c.kind, c.hash, c.text, c.length, c.blob, ctx.app, ctx.title
-FROM clips c LEFT JOIN context ctx ON ctx.stem = c.stem";
+SELECT stem, at, machine, kind, hash, text, length, blob, app, title FROM clips";
 
 /// How much of an over-long text is kept inline for searching. The tail exists
 /// only in the `.bin` sibling, which a search never opens.
@@ -406,9 +382,7 @@ impl Store {
         .map_err(|err| err.to_string())?;
         let _ = conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS));
 
-        let mut statement = conn
-            .prepare(select_rows_sql(&conn))
-            .map_err(|err| err.to_string())?;
+        let mut statement = conn.prepare(SELECT_ROWS).map_err(|err| err.to_string())?;
         let rows = statement
             .query_map([], Row::read)
             .map_err(|err| err.to_string())?;
@@ -702,29 +676,6 @@ impl Store {
     }
 }
 
-/// The query to read a database with, context and all when it has any.
-///
-/// The `context` table is missing from every database written before it existed —
-/// this machine's own older months included, and they are never rewritten — so the
-/// query is chosen from the schema the file actually has instead of assuming one.
-/// Reading such a file still works: the join disappears and the two columns come
-/// back NULL.
-fn select_rows_sql(conn: &Connection) -> &'static str {
-    let has_context = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'context'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|count| count > 0)
-        .unwrap_or(false);
-
-    if has_context {
-        SELECT_ROWS_WITH_CONTEXT
-    } else {
-        SELECT_ROWS
-    }
-}
 
 /// One row, straight out of the database.
 struct Row {
@@ -736,8 +687,9 @@ struct Row {
     text: Option<String>,
     length: i64,
     blob: Option<String>,
-    /// NULL for a database written before the `context` table existed, which is
-    /// the whole point of reading them as `Option`.
+    /// The source window. `Option` so a row that leaves them NULL reads as empty
+    /// rather than failing the whole database; empty is what "could not be read"
+    /// looks like downstream.
     app: Option<String>,
     title: Option<String>,
 }
@@ -783,23 +735,12 @@ fn insert_row(db_path: &Path, record: &ClipRecord) -> Result<(), String> {
             &record.text,
             record.length,
             &record.blob,
+            &record.app,
+            &record.title,
         ],
     )
     .map_err(|err| format!("insert into {}: {err}", db_path.display()))?;
 
-    // Only when there is something to say: a clip copied out of a window that
-    // could not be read leaves the table uncreated, which is what keeps this
-    // database readable by a build that has never heard of it.
-    if !record.app.is_empty() || !record.title.is_empty() {
-        conn.execute_batch(CONTEXT_SCHEMA)
-            .map_err(|err| format!("context schema {}: {err}", db_path.display()))?;
-
-        conn.execute(
-            INSERT_CONTEXT,
-            params![&record.id, &record.app, &record.title],
-        )
-        .map_err(|err| format!("insert context into {}: {err}", db_path.display()))?;
-    }
 
     Ok(())
 }
@@ -809,13 +750,7 @@ fn insert_row(db_path: &Path, record: &ClipRecord) -> Result<(), String> {
 /// exactly the databases it actually changed.
 fn delete_row(db_path: &Path, stem: &str) {
     let result = open_rw(db_path).and_then(|conn| {
-        // The schema call is unconditional even though the row is going away: a
-        // month written before the table existed still has to be deletable.
-        conn.execute_batch(CONTEXT_SCHEMA)
-            .map_err(|err| err.to_string())?;
         conn.execute("DELETE FROM clips WHERE stem = ?1", params![stem])
-            .map_err(|err| err.to_string())?;
-        conn.execute("DELETE FROM context WHERE stem = ?1", params![stem])
             .map_err(|err| err.to_string())
             .map(|_| ())
     });
@@ -990,8 +925,7 @@ mod tests {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .unwrap();
-        // The same chooser `load_db` uses, so the join is exercised here too.
-        let mut statement = conn.prepare(select_rows_sql(&conn)).unwrap();
+        let mut statement = conn.prepare(SELECT_ROWS).unwrap();
         let rows = statement
             .query_map([], Row::read)
             .unwrap()
@@ -1000,26 +934,12 @@ mod tests {
         rows
     }
 
-    /// Counts what is in the context table, which is how the delete half is
-    /// checked: a row that goes without its context leaves an orphan behind for
-    /// good, since nothing else ever refers to those stems again.
-    fn context_rows(path: &Path) -> i64 {
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .unwrap();
 
-        conn.query_row("SELECT count(*) FROM context", [], |row| row.get(0))
-            .unwrap()
-    }
-
-    /// The context is a second table, so the two halves of a clip can drift: the
-    /// join has to find the row, an old database without the table has to still
-    /// read, and retention has to take the context away with the clip.
+    /// The source window is two columns on the row itself, so the round trip is
+    /// where a mix-up would show: written when it is known, empty when it is not.
     #[test]
-    fn context_follows_its_row() {
-        let dir = scratch("context");
+    fn source_window_round_trips() {
+        let dir = scratch("source");
         let path = dir.join(DB_NAME);
 
         let mut sourced = record("stem-1", Some("hello"), None);
@@ -1034,15 +954,14 @@ mod tests {
         assert_eq!(sourced.app.as_deref(), Some("chrome.exe"));
         assert_eq!(sourced.title.as_deref(), Some("GitHub"));
 
-        // A clip with nothing to say about its window reads as NULL rather than
-        // dropping out of the join.
+        // A clip out of a window that could not be read stores empty strings,
+        // which is what the meta line treats as "no source".
         let plain = rows.iter().find(|row| row.stem == "stem-2").unwrap();
-        assert_eq!(plain.app, None);
-        assert_eq!(context_rows(&path), 1);
+        assert_eq!(plain.app.as_deref(), Some(""));
+        assert_eq!(plain.title.as_deref(), Some(""));
 
         delete_row(&path, "stem-1");
         assert_eq!(read_all(&path).len(), 1);
-        assert_eq!(context_rows(&path), 0);
 
         let _ = fs::remove_dir_all(&dir);
     }

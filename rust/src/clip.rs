@@ -1,11 +1,8 @@
 //! Clipboard payloads and the row schema.
 //!
 //! `ClipRecord` *is* one row of a synced database: it is built when a clip is
-//! `ClipRecord` is what one clip looks like in a synced database: it is built
-//! when a clip is captured and rebuilt when a database is read back. Its field
-//! names are the column names in the SQL — the ones for the source window live in
-//! the `context` table beside `clips` (see `store::CONTEXT_SCHEMA`) — so renaming
-//! one means changing both.
+//! captured and rebuilt when a database is read back. Its field names are the
+//! column names in the SQL, so renaming one means changing both.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(i32)]
@@ -108,8 +105,7 @@ pub struct ClipRecord {
     pub blob: Option<String>,
 
     /// The source window, as read at capture time. Empty when it could not be
-    /// read, and empty for every clip recorded before it was recorded at all —
-    /// which is why the display has to cope with both being empty.
+    /// read, which is why the display has to cope with both being empty.
     pub app: String,
     pub title: String,
 }

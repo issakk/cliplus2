@@ -27,7 +27,6 @@ Windows 剪贴板增强工具。捕获 → 本地落盘 → 通过网盘目录�
 
 - ✅ 一个文件只有一个写者（`clips.db` 只由 machineId 那台机器写），**冲突在物理上不可能发生**，不需要锁、不需要协议、不需要服务器。
 - ✅ 合并 = 打开每个库、按 stem 取并集。删除是一条 `DELETE`，跟着库文件传播，不需要墓碑文件。
-- ✅ 来源窗口（哪个程序、什么标题）存在同库里一张单独的 `context` 表里，而不是 `clips` 上加两列：多出来的表老版本/frozen 的旧月份**看不见也就不会读错**，双向兼容；哪天真的换了列名才会需要一次真正的迁移。
 - ✅ **只有当月那个库在被写**。月份一翻旧库就冻结，早就传完、永不再动，所以复制一条的代价是「重传当月这一个库」，不是重传整个历史。
 - ❌ 不能开 WAL。`-wal` / `-shm` 得跟着 `.db` 一起搬，而 `-shm` 是本机专属的，别人拿到副本根本打不开；默认的 DELETE 日志让 `.db` 单文件自包含。
 - ❌ 图片不进库。网盘搬的是整个文件，图进库就等于「每复制一条，把当月所有图片重传一遍」。图片和超长文本仍然拆到 `.bin`，列历史不碰那些几 MB 的文件。
@@ -48,11 +47,13 @@ git add -A && git commit -m "..." && git push
 
 `rust.yml` 跑 `windows-latest` → `cargo test` → `cargo build --release`，产出 `rust/target/release/ClipPlus.exe` 上传为 artifact。单文件、静态 CRT、SQLite 静态链接进去，不需要任何运行时。想在本机跑也一样：`cargo test` 就行。
 
+同一个 exe 还会挂到 [latest release](https://github.com/issakk/cliplus2/releases/latest) 上，所以下载地址是固定的、不用点进 run 页面：**https://github.com/issakk/cliplus2/releases/latest/download/ClipPlus.exe** （每次 push 到 main 都重新发布一次；artifact 也还在，30 天过期）。
+
 编译错误会直接以 check-run annotations 的形式挂在 commit 上，不用去下载 workflow 日志。
 
 ## 运行
 
-1. 下载 artifact 里的 `ClipPlus.exe`，双击运行，托盘出现图标。
+1. 下载 [`ClipPlus.exe`](https://github.com/issakk/cliplus2/releases/latest/download/ClipPlus.exe)（固定地址，每次 push 到 main 会刷新），双击运行，托盘出现图标。
 2. 按 `Win+Alt+V` 打开历史，输入即过滤，`↑↓` 选择，`Enter` 粘贴回原窗口，`Esc` 取消。
 3. `Ctrl+C` 把选中的放回剪贴板但**不粘贴**（不切窗口、不注入按键），`Ctrl+P` 固定/取消固定，`Ctrl+Tab` 在实例 tab 之间切换。
 4. 每条记录都带来源，弹窗第二行就是它：`文本 · 02-14 15:32 · 本机 · chrome.exe · 那个窗口当时的标题`。来源在**复制的那一刻**读，所以标题就是当时那个窗口的标题（最长存 120 字，行里放不下会省略）。搜索会一起匹配来源，输入 `chrome` 就是「Chrome 里复制过的东西」，输入标题里的词也能找到。
