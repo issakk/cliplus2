@@ -15,14 +15,19 @@ use crate::settings::{self, Hotkey, Settings};
 use crate::win::{self, HWND, LPARAM, LRESULT, WPARAM};
 
 /// Client area in logical pixels; the frame is added around it at creation.
-const CLIENT_WIDTH: i32 = 560;
-const CLIENT_HEIGHT: i32 = 344;
+///
+/// Sized around `win::UI_FONT_HEIGHT`: 16 px text wants a taller row and a wider
+/// caption than the 12 px these were first laid out for. `MARGIN + LABEL_WIDTH +
+/// 8 + FIELD_WIDTH + MARGIN` is exactly `CLIENT_WIDTH` — the right edge of the
+/// last field is the margin.
+const CLIENT_WIDTH: i32 = 620;
+const CLIENT_HEIGHT: i32 = 380;
 
 const MARGIN: i32 = 16;
-const LABEL_WIDTH: i32 = 180;
-const FIELD_WIDTH: i32 = 320;
-const ROW_HEIGHT: i32 = 24;
-const ROW_STEP: i32 = 34;
+const LABEL_WIDTH: i32 = 220;
+const FIELD_WIDTH: i32 = 360;
+const ROW_HEIGHT: i32 = 26;
+const ROW_STEP: i32 = 38;
 
 const ID_HOTKEY: usize = 1;
 const ID_SYNC_ROOT: usize = 2;

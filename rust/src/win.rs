@@ -153,6 +153,13 @@ pub const WM_CTLCOLOREDIT: u32 = 0x0133;
 pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
 pub const WM_PAINT: u32 = 0x000F;
 pub const WM_LBUTTONDOWN: u32 = 0x0201;
+
+/// Hit-test code for "the title bar": the popup hands it to `DefWindowProc` so
+/// Windows runs the window move itself. Not a control id, it just happens to be 2.
+pub const HTCAPTION: usize = 2;
+/// What `begin_drag_move` sends, because the button came down on the window's own
+/// background rather than on a child control.
+pub const WM_NCLBUTTONDOWN: u32 = 0x00A1;
 pub const WM_SETFONT: u32 = 0x0030;
 pub const WM_CHAR: u32 = 0x0102;
 pub const WM_SYSKEYDOWN: u32 = 0x0104;
@@ -427,6 +434,7 @@ extern "system" {
 
     // --- popup support ---
     pub fn SendMessageW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
+    pub fn ReleaseCapture() -> i32;
     pub fn SetFocus(hWnd: HWND) -> HWND;
     pub fn GetKeyState(nVirtKey: i32) -> i16;
     pub fn IsWindowVisible(hWnd: HWND) -> i32;
@@ -833,6 +841,19 @@ pub fn post_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> boo
     unsafe { PostMessageW(hwnd, msg, wparam, lparam) != 0 }
 }
 
+/// Starts moving a window that has no title bar, the way a caption drag would:
+/// called from a `WM_LBUTTONDOWN` that landed on the window's own background.
+/// Windows then runs its move loop, so snapping, multi-monitor handling and Esc
+/// to cancel come for free rather than being reimplemented here.
+pub fn begin_drag_move(hwnd: HWND) {
+    unsafe {
+        // Anything that captured the mouse has to let go first, or the move loop
+        // gets the buttons while the drag does not.
+        ReleaseCapture();
+        SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+    }
+}
+
 /// Current text of a control. Shared so the popup and the settings window do
 /// not each carry their own copy of the two-call dance.
 pub fn window_text(hwnd: HWND) -> String {
@@ -1020,12 +1041,12 @@ pub fn destroy_window(hwnd: HWND) {
 /// supported Windows and covers the CJK the interface is written in.
 pub const UI_FACE: &str = "Microsoft YaHei UI";
 
-/// The stock Windows UI text height at 96 DPI: 9 pt, the size every other
-/// window on the desktop draws at, scaled by the monitor's DPI exactly as
-/// Windows scales it. A size of our own is what made this window's text look
-/// off beside the rest of the screen — at 150% this gives the same 18 px
-/// every other window there uses.
-pub const UI_FONT_HEIGHT: i32 = 12;
+/// The height the settings window's controls draw at, in logical pixels at 96 DPI:
+/// 16 px, which is what the popup's own rows use. It used to be 12 px — Windows'
+/// stock 9 pt, the size every other window draws at — and that is the size that
+/// reads as too small on a 1080p display at 100% scaling, where 12 px is all the
+/// font ever gets.
+pub const UI_FONT_HEIGHT: i32 = 16;
 
 /// A font in the app's face. The height is in pixels and negative, the
 /// character-height convention `CreateFontW` wants; callers that need another

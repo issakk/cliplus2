@@ -319,7 +319,10 @@ fn ensure_fonts(p: &'static Popup, scale: f64) {
         return;
     }
 
-    let main_height = -scaled(16, scale);
+    // The same size the settings window uses, so the two windows read as one
+    // interface: `UI_FONT_HEIGHT` is that size, and this is the one place the
+    // popup wants it. The metadata line stays deliberately smaller.
+    let main_height = -scaled(win::UI_FONT_HEIGHT, scale);
     let meta_height = -scaled(12, scale);
 
     unsafe {
@@ -690,7 +693,13 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
         }
 
         win::WM_LBUTTONDOWN => {
-            tab_click(lparam);
+            // A tab click switches tabs; anywhere else on the popup's own
+            // background starts a window drag. The search box and the list are
+            // child controls, so a click that lands on them never gets here —
+            // which is also why the tab strip is the handle to grab.
+            if !tab_click(lparam) {
+                win::begin_drag_move(hwnd);
+            }
             0
         }
 
@@ -966,9 +975,13 @@ fn tab_text_flags() -> u32 {
 
 /// The strip is not a control, so clicks are hit tested by hand against the same
 /// rectangles `paint` draws.
-fn tab_click(lparam: LPARAM) {
+///
+/// Returns whether the click landed on a tab. A `false` is how the caller knows
+/// the mouse came down on the popup's own background — the padding, or a gap in
+/// the strip — which is the only place a drag can start.
+fn tab_click(lparam: LPARAM) -> bool {
     let Some(p) = popup() else {
-        return;
+        return false;
     };
 
     let x = (lparam & 0xFFFF) as u16 as i16 as i32;
@@ -982,18 +995,22 @@ fn tab_click(lparam: LPARAM) {
     let step = width + scaled(TAB_GAP, scale);
 
     if x < left || y < top || y >= top + height {
-        return;
+        return false;
     }
 
     let index = (x - left).div_euclid(step);
     // A click in the gap between two tabs belongs to neither of them.
     if (x - left) - index * step > width {
-        return;
+        return false;
     }
 
     let tabs = p.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if let Some(tab) = tabs.get(index as usize) {
-        set_tab(tab.id.clone());
+    match tabs.get(index as usize) {
+        Some(tab) => {
+            set_tab(tab.id.clone());
+            true
+        }
+        None => false,
     }
 }
 
