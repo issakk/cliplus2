@@ -56,6 +56,10 @@ pub const MOD_NOREPEAT: u32 = 0x4000;
 pub const WS_POPUP: u32 = 0x8000_0000;
 pub const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 
+/// The popup is resizable while showing no frame: this style keeps the resize
+/// edges real, and the frame it brings is taken back off in `WM_NCCALCSIZE`.
+pub const WS_THICKFRAME: u32 = 0x0004_0000;
+
 // --- settings window ---
 pub const WS_CAPTION: u32 = 0x00C0_0000;
 pub const WS_SYSMENU: u32 = 0x0008_0000;
@@ -158,12 +162,31 @@ pub const WM_CTLCOLOREDIT: u32 = 0x0133;
 pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
 pub const WM_PAINT: u32 = 0x000F;
 pub const WM_LBUTTONDOWN: u32 = 0x0201;
+pub const WM_SIZE: u32 = 0x0005;
+pub const WM_GETMINMAXINFO: u32 = 0x0024;
+pub const WM_NCCALCSIZE: u32 = 0x0083;
+pub const WM_NCHITTEST: u32 = 0x0084;
+/// Sent when a move or a resize the system ran is over — the moment the popup
+/// writes its layout back to disk.
+pub const WM_EXITSIZEMOVE: u32 = 0x0232;
 
 /// Hit-test code for "the title bar": the popup hands it to `DefWindowProc` so
 /// Windows runs the window move itself. Not a control id, it just happens to be 2.
 pub const HTCAPTION: usize = 2;
 /// What `begin_drag_move` sends, because the button came down on the window's own
 /// background rather than on a child control.
+
+/// The resize edges, as `WM_NCHITTEST` returns them. A frameless window has none
+/// for Windows to find, so the popup hands them back by hand.
+pub const HTCLIENT: usize = 1;
+pub const HTLEFT: usize = 10;
+pub const HTRIGHT: usize = 11;
+pub const HTTOP: usize = 12;
+pub const HTTOPLEFT: usize = 13;
+pub const HTTOPRIGHT: usize = 14;
+pub const HTBOTTOM: usize = 15;
+pub const HTBOTTOMLEFT: usize = 16;
+pub const HTBOTTOMRIGHT: usize = 17;
 pub const WM_NCLBUTTONDOWN: u32 = 0x00A1;
 pub const WM_SETFONT: u32 = 0x0030;
 pub const WM_CHAR: u32 = 0x0102;
@@ -237,6 +260,19 @@ pub struct RECT {
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
+}
+
+/// What `WM_GETMINMAXINFO` hands over. The popup fills in the minimum tracking
+/// size and leaves the rest: Windows' own values are right for a window with no
+/// maximum worth enforcing.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MINMAXINFO {
+    pub pt_reserved: POINT,
+    pub pt_max_size: POINT,
+    pub pt_max_position: POINT,
+    pub pt_min_track_size: POINT,
+    pub pt_max_track_size: POINT,
 }
 
 /// Only ever filled in by `BeginPaint`, never read field by field here.
@@ -454,6 +490,7 @@ extern "system" {
     ) -> i32;
     pub fn GetClientRect(hWnd: HWND, lpRect: *mut RECT) -> i32;
     pub fn GetWindowRect(hWnd: HWND, lpRect: *mut RECT) -> i32;
+    fn ScreenToClient(hWnd: HWND, lpPoint: *mut POINT) -> i32;
     pub fn InvalidateRect(hWnd: HWND, lpRect: *const RECT, bErase: i32) -> i32;
     pub fn BeginPaint(hWnd: HWND, lpPaint: *mut PAINTSTRUCT) -> HDC;
     pub fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) -> i32;
@@ -1271,6 +1308,27 @@ pub fn window_position(hwnd: HWND) -> Option<(i32, i32)> {
     }
 
     Some((rect.left, rect.top))
+}
+
+/// The client area's size. For the popup that is the window's size too — it
+/// answers `WM_NCCALCSIZE` with 0 — and it is the box the rows live in.
+pub fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut rect = RECT::default();
+    if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
+        return None;
+    }
+
+    Some((rect.right - rect.left, rect.bottom - rect.top))
+}
+
+/// Screen coordinates in, this window's client coordinates out.
+pub fn screen_to_client(hwnd: HWND, x: i32, y: i32) -> (i32, i32) {
+    let mut point = POINT { x, y };
+    unsafe {
+        ScreenToClient(hwnd, &mut point);
+    }
+
+    (point.x, point.y)
 }
 
 /// Work area of the monitor nearest to a point, in device pixels.

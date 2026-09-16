@@ -8,6 +8,12 @@
 //! Every pixel value below is a *logical* pixel at 96 DPI and is multiplied by
 //! the monitor's scale factor before use — including the row layout, which is
 //! what keeps the two text lines from colliding on a scaled display.
+//!
+//! The window is stretchable although it draws no frame: `WS_THICKFRAME` keeps the
+//! resize edges real, `WM_NCCALCSIZE` takes the frame back off them, and
+//! `WM_NCHITTEST` hands the edges over by hand. Both where it was left and how
+//! big are remembered in `settings.json`, so the next open is the window the user
+//! last left behind.
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -44,6 +50,19 @@ const LINE1_HEIGHT: i32 = 22;
 const LINE2_TOP: i32 = 26;
 const LINE2_HEIGHT: i32 = 17;
 
+/// How thick the invisible resize edge is, in logical pixels. It comes out of the
+/// padding around the controls, so it has to stay smaller than `PAD`.
+const GRIP: i32 = 5;
+
+/// Length of the two bars drawn in the bottom-right corner, the only visible sign
+/// that the window can be stretched.
+const GRIP_ARM: i32 = 8;
+
+/// Smallest the user can drag it down to: the search box, the tab strip and three
+/// rows of list.
+const MIN_WIDTH: i32 = 420;
+const MIN_HEIGHT: i32 = LIST_TOP + ROW_HEIGHT * 3 + PAD;
+
 const MAX_RESULTS: usize = 300;
 const SUBCLASS_ID: usize = 1;
 
@@ -79,6 +98,7 @@ struct Popup {
     brush_bg: HBRUSH,
     brush_input: HBRUSH,
     brush_selected: HBRUSH,
+    brush_meta: HBRUSH,
 }
 
 static POPUP: OnceLock<Popup> = OnceLock::new();
@@ -107,7 +127,9 @@ pub fn create(store: Arc<Store>) -> bool {
         "ClipPlus.Popup",
         "ClipPlus",
         window_proc,
-        win::WS_POPUP,
+        // Resizable without a frame: `WM_NCCALCSIZE` answers 0, so the frame this
+        // style brings never takes a band off the client area.
+        win::WS_POPUP | win::WS_THICKFRAME,
         win::WS_EX_TOOLWINDOW,
         0,
         0,
@@ -178,6 +200,7 @@ pub fn create(store: Arc<Store>) -> bool {
         brush_bg: unsafe { win::CreateSolidBrush(COLOR_BG) },
         brush_input: unsafe { win::CreateSolidBrush(COLOR_INPUT_BG) },
         brush_selected: unsafe { win::CreateSolidBrush(COLOR_SELECTED) },
+        brush_meta: unsafe { win::CreateSolidBrush(COLOR_META) },
     };
 
     if POPUP.set(state).is_err() {
@@ -245,24 +268,28 @@ pub fn show() {
     // the popup where they want it, and having it follow the cursor on every open
     // is what made dragging it pointless. Only the very first open — before there
     // is anything to remember — has to pick a monitor, and that is whichever one
-    // the cursor is on.
-    let remembered = crate::current_settings().and_then(|settings| settings.popup_position);
+    // the cursor is on. The size is remembered the same way, in logical pixels, so
+    // a monitor with another scale gets the size it would have had.
+    let saved = crate::current_settings();
+    let remembered = saved.as_ref().and_then(|settings| settings.popup_position);
+    let size = saved
+        .as_ref()
+        .and_then(|settings| settings.popup_size)
+        .unwrap_or((WIDTH, HEIGHT));
+
     let anchor = remembered.map(|(x, y)| win::POINT { x, y }).unwrap_or(cursor);
     let area = win::work_area_at(anchor);
     let scale = win::dpi_at(anchor) as f64 / 96.0;
 
-    let width = scaled(WIDTH, scale);
-    let height = scaled(HEIGHT, scale);
-    let pad = scaled(PAD, scale);
-    let search_height = scaled(SEARCH_HEIGHT, scale);
+    // Floored by the same minimum a drag enforces, and never larger than the work
+    // area: a size remembered from a monitor that is gone must not open the popup
+    // hanging off the screen this one is on.
+    let width = scaled(size.0.max(MIN_WIDTH), scale).min(area.right - area.left);
+    let height = scaled(size.1.max(MIN_HEIGHT), scale).min(area.bottom - area.top);
 
     let (left, top) = placed(remembered, &area, width, height);
 
     ensure_fonts(p, scale);
-
-    let inner = width - pad * 2;
-    let list_top = scaled(LIST_TOP, scale);
-    let list_height = height - list_top - pad;
 
     unsafe {
         // Scaled: the row boxes have to grow with the font, or the two lines
@@ -271,8 +298,6 @@ pub fn show() {
         let row_height = scaled(ROW_HEIGHT, scale) as LPARAM;
         win::SendMessageW(p.list, win::LB_SETITEMHEIGHT, 0, row_height);
 
-        win::SetWindowPos(p.search, 0, pad, pad, inner, search_height, win::SWP_NOACTIVATE);
-        win::SetWindowPos(p.list, 0, pad, list_top, inner, list_height, win::SWP_NOACTIVATE);
         win::SetWindowPos(
             p.hwnd,
             win::HWND_TOPMOST,
@@ -283,6 +308,10 @@ pub fn show() {
             win::SWP_SHOWWINDOW,
         );
     }
+
+    // The controls sit inside the client area, which is what `WM_SIZE` reports from
+    // here on: this is the same call that lays them out again after a stretch.
+    layout(p, width, height, scale);
 
     // `SetWindowPos` is meant to activate the window, and from a hotkey it is not
     // dependable about it. A popup that never got the foreground gets no keystrokes
@@ -312,6 +341,38 @@ pub fn hide() {
         win::ShowWindow(p.hwnd, win::SW_HIDE);
     }
     p.visible.store(false, Ordering::SeqCst);
+}
+
+/// Places the two controls inside a client area of `width` x `height`. Shared by
+/// the first open and by every stretch, so the two can never disagree about where
+/// the list starts.
+fn layout(p: &Popup, width: i32, height: i32, scale: f64) {
+    let pad = scaled(PAD, scale);
+    let list_top = scaled(LIST_TOP, scale);
+    // `max(0)`: a window squeezed below the minimum still has to place its
+    // children somewhere, and a negative height is not one of the answers.
+    let list_height = (height - list_top - pad).max(0);
+
+    unsafe {
+        win::SetWindowPos(
+            p.search,
+            0,
+            pad,
+            pad,
+            width - pad * 2,
+            scaled(SEARCH_HEIGHT, scale),
+            win::SWP_NOACTIVATE,
+        );
+        win::SetWindowPos(
+            p.list,
+            0,
+            pad,
+            list_top,
+            width - pad * 2,
+            list_height,
+            win::SWP_NOACTIVATE,
+        );
+    }
 }
 
 fn ensure_fonts(p: &'static Popup, scale: f64) {
@@ -688,6 +749,57 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             1
         }
 
+        // The resize frame is real — `WS_THICKFRAME` is in the style — but the frame
+        // itself is not wanted, so answering 0 makes the client area cover the whole
+        // window and leaves nothing for Windows to draw around the edges.
+        win::WM_NCCALCSIZE if wparam != 0 => 0,
+
+        // The end of a move or of a stretch the system ran, which are the only two
+        // things about this window worth writing down. One save covers both, so a
+        // drag that only moved does not also rewrite the size.
+        win::WM_EXITSIZEMOVE => {
+            remember_layout();
+            0
+        }
+
+        win::WM_SIZE => {
+            // The client area changed, so the controls inside it move with it. This
+            // is the stretch path; `show` lays out the first open.
+            if let Some(p) = popup() {
+                let width = (lparam & 0xFFFF) as u16 as i32;
+                let height = ((lparam >> 16) & 0xFFFF) as u16 as i32;
+                layout(p, width, height, current_scale());
+            }
+            0
+        }
+
+        // DefWindowProc runs first so the maximum side of the struct is filled in the
+        // way Windows fills it; the minimum track size is the one field this window
+        // has an opinion about, and without it the window can be dragged down to a
+        // sliver of padding with no room for a single row in it.
+        win::WM_GETMINMAXINFO => {
+            win::def_window_proc(hwnd, message, wparam, lparam);
+
+            if let Some(info) = unsafe { (lparam as *mut win::MINMAXINFO).as_mut() } {
+                let scale = current_scale();
+                info.pt_min_track_size = win::POINT {
+                    x: scaled(MIN_WIDTH, scale),
+                    y: scaled(MIN_HEIGHT, scale),
+                };
+            }
+            0
+        }
+
+        // The edges are invisible, so this is what makes them work: the codes come
+        // back from here and Windows runs the rest of it, cursor and sizing loop
+        // included.
+        win::WM_NCHITTEST => match resize_edge(hwnd, lparam) {
+            Some(code) => code,
+            // The client area — the padding and the tab strip — where a drag starts
+            // and where the controls hit test themselves.
+            None => win::HTCLIENT as LRESULT,
+        },
+
         win::WM_PAINT => {
             paint(hwnd);
             0
@@ -696,14 +808,11 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
         win::WM_LBUTTONDOWN => {
             // A tab click switches tabs; anywhere else on the popup's own
             // background starts a window drag. The search box and the list are
-            // child controls, so a click that lands on them never gets here —
-            // which is also why the tab strip is the handle to grab.
+            // child controls, so a click that lands on them never gets here, and the
+            // outermost pixels are the resize edge rather than this — what is left
+            // to grab is the padding inside that, and the tab strip.
             if !tab_click(lparam) {
                 win::begin_drag_move(hwnd);
-
-                // The move loop has returned, so the window is where the user left
-                // it: that is the position to remember for the next open.
-                remember_position();
             }
             0
         }
@@ -982,6 +1091,37 @@ fn paint(hwnd: HWND) {
         }
 
         win::SelectObject(dc, previous);
+
+        // Two bars in the bottom-right corner: nothing else says the window can be
+        // stretched, because there is no frame to say it. Sized to the padding they
+        // sit in, so they never cover a row.
+        let mut client = win::RECT::default();
+        win::GetClientRect(hwnd, &mut client);
+        let arm = scaled(GRIP_ARM, scale);
+        let thickness = scaled(2, scale).max(1);
+        let right = client.right - scaled(2, scale);
+        let bottom = client.bottom - scaled(2, scale);
+
+        win::FillRect(
+            dc,
+            &win::RECT {
+                left: right - arm,
+                top: bottom - thickness,
+                right,
+                bottom,
+            },
+            p.brush_meta,
+        );
+        win::FillRect(
+            dc,
+            &win::RECT {
+                left: right - thickness,
+                top: bottom - arm,
+                right,
+                bottom,
+            },
+            p.brush_meta,
+        );
         win::EndPaint(hwnd, &ps);
     }
 }
@@ -1068,15 +1208,30 @@ fn text_flags() -> u32 {
     win::DT_LEFT | win::DT_SINGLELINE | win::DT_VCENTER | win::DT_END_ELLIPSIS | win::DT_NOPREFIX
 }
 
-/// Records where the popup is now, which is where the user just left it.
-fn remember_position() {
+/// Records where the popup is now and how big it is, which is where the user just
+/// left it. The size is written in logical pixels, the units every constant above
+/// is written in, so it comes back the right size on a monitor with another scale.
+fn remember_layout() {
     let Some(p) = popup() else {
         return;
     };
 
-    if let Some((x, y)) = win::window_position(p.hwnd) {
-        crate::remember_popup_position(x, y);
-    }
+    let (Some((x, y)), Some((width, height))) =
+        (win::window_position(p.hwnd), win::client_size(p.hwnd))
+    else {
+        return;
+    };
+
+    // The window's own DPI rather than `current_scale()`: that one is stored as a
+    // truncated percentage, and a size divided by a slightly wrong scale would
+    // drift a little further off on every save.
+    let scale = win::dpi_scale_of(p.hwnd);
+    let logical = (
+        (width as f64 / scale).round() as i32,
+        (height as f64 / scale).round() as i32,
+    );
+
+    crate::remember_popup_layout((x, y), logical);
 }
 
 /// Where the window goes: where it was left last time, or the middle of the work
@@ -1099,6 +1254,45 @@ fn placed(remembered: Option<(i32, i32)>, area: &win::RECT, width: i32, height: 
         left.clamp(area.left, (area.right - width).max(area.left)),
         top.clamp(area.top, (area.bottom - height).max(area.top)),
     )
+}
+
+/// The resize edge under the cursor, as the hit-test code Windows expects back.
+/// `None` is the client area — the padding and the tab strip — where nothing about
+/// resizing happens.
+///
+/// The coordinates arrive packed as two signed 16-bit values, in screen space: the
+/// hit test is answered before anything here knows where the window is.
+fn resize_edge(hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
+    let x = lparam as i16 as i32;
+    let y = (lparam >> 16) as i16 as i32;
+    let (x, y) = win::screen_to_client(hwnd, x, y);
+    let (width, height) = win::client_size(hwnd)?;
+
+    edge_hit(x, y, width, height, scaled(GRIP, current_scale())).map(|code| code as LRESULT)
+}
+
+/// Which side a point is on, as a hit-test code, or `None` for the inside.
+///
+/// Pure, and tested, because this is the whole of the resize: a code that is wrong
+/// by one is an edge that does nothing when it is dragged, and the two diagonal
+/// codes only exist for the corners, where two of the four sides are hit at once.
+fn edge_hit(x: i32, y: i32, width: i32, height: i32, grip: i32) -> Option<usize> {
+    let left = x < grip;
+    let right = x >= width - grip;
+    let top = y < grip;
+    let bottom = y >= height - grip;
+
+    match (left, right, top, bottom) {
+        (true, _, true, _) => Some(win::HTTOPLEFT),
+        (_, true, true, _) => Some(win::HTTOPRIGHT),
+        (true, _, _, true) => Some(win::HTBOTTOMLEFT),
+        (_, true, _, true) => Some(win::HTBOTTOMRIGHT),
+        (true, _, _, _) => Some(win::HTLEFT),
+        (_, true, _, _) => Some(win::HTRIGHT),
+        (_, _, true, _) => Some(win::HTTOP),
+        (_, _, _, true) => Some(win::HTBOTTOM),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1131,5 +1325,32 @@ mod tests {
         // Wider than the screen it has to fit on: the top-left corner is the best
         // that can be done, and this is the case that panics without the `max`.
         assert_eq!(placed(Some((-500, -500)), &work_area(), 2000, 1200), (0, 0));
+    }
+
+    /// The resize border is invisible, so this is the only thing that makes the
+    /// window stretchable at all: a code that is off by one is an edge that does
+    /// nothing when it is dragged, or a resize where a click was meant.
+    #[test]
+    fn the_border_answers_with_the_side_it_is_on() {
+        let (width, height, grip) = (600, 440, 5);
+
+        // Corners: two sides at once, which is what the four comparisons have to
+        // combine into the diagonal codes.
+        assert_eq!(edge_hit(0, 0, width, height, grip), Some(win::HTTOPLEFT));
+        assert_eq!(edge_hit(599, 0, width, height, grip), Some(win::HTTOPRIGHT));
+        assert_eq!(edge_hit(0, 439, width, height, grip), Some(win::HTBOTTOMLEFT));
+        assert_eq!(edge_hit(599, 439, width, height, grip), Some(win::HTBOTTOMRIGHT));
+
+        // A band along each side, and the last pixel that is still client area.
+        assert_eq!(edge_hit(0, 200, width, height, grip), Some(win::HTLEFT));
+        assert_eq!(edge_hit(599, 200, width, height, grip), Some(win::HTRIGHT));
+        assert_eq!(edge_hit(200, 0, width, height, grip), Some(win::HTTOP));
+        assert_eq!(edge_hit(200, 439, width, height, grip), Some(win::HTBOTTOM));
+
+        // Inside is the client area: no resizing there, that is the popup's own
+        // background, the tab strip and the controls.
+        assert_eq!(edge_hit(5, 5, width, height, grip), None);
+        assert_eq!(edge_hit(300, 220, width, height, grip), None);
+        assert_eq!(edge_hit(594, 434, width, height, grip), None);
     }
 }

@@ -179,26 +179,31 @@ pub fn set_settings(updated: settings::Settings) {
     *SETTINGS.write().unwrap_or_else(|p| p.into_inner()) = Some(updated);
 }
 
-/// Remembers where the popup was left, so the next open puts it back there instead
-/// of jumping to wherever the cursor happens to be.
+/// Remembers where the popup was left and how big, so the next open puts it back
+/// there instead of jumping to wherever the cursor happens to be.
 ///
 /// Goes into the settings file because that is already the one place this app keeps
 /// state between runs. The settings window never touches these fields — it saves a
 /// copy of the current settings with only the fields it shows replaced — so a drag
 /// and a settings save cannot lose each other's work.
-pub fn remember_popup_position(x: i32, y: i32) {
+///
+/// `size` is in logical pixels at 96 DPI, the units the popup's own constants are
+/// written in, so a monitor with another scale gets the size it would have had
+/// rather than the one measured on the display it was stretched on.
+pub fn remember_popup_layout(position: (i32, i32), size: (i32, i32)) {
     let Some(mut settings) = current_settings() else {
         return;
     };
 
-    if settings.popup_position == Some((x, y)) {
+    if settings.popup_position == Some(position) && settings.popup_size == Some(size) {
         return;
     }
 
-    settings.popup_position = Some((x, y));
+    settings.popup_position = Some(position);
+    settings.popup_size = Some(size);
 
     if let Err(err) = settings.save() {
-        log::error(&format!("popup position could not be saved: {err}"));
+        log::error(&format!("popup layout could not be saved: {err}"));
         return;
     }
 

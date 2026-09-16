@@ -83,6 +83,14 @@ pub struct Settings {
     #[serde(rename = "PopupPosition")]
     pub popup_position: Option<(i32, i32)>,
 
+    /// How big the popup was last left, in logical pixels at 96 DPI — the units its
+    /// own constants are written in, so a monitor with a different scale gets a popup
+    /// of the size it would have had rather than the one measured before. `None`
+    /// until it is stretched, and the popup's own default size until then. Written by
+    /// the popup, not by the settings window.
+    #[serde(rename = "PopupSize")]
+    pub popup_size: Option<(i32, i32)>,
+
     #[serde(rename = "CaptureText")]
     pub capture_text: bool,
 
@@ -117,6 +125,7 @@ impl Default for Settings {
             rescan_seconds: 60,
             settings_scale: win::DEFAULT_SETTINGS_SCALE,
             popup_position: None,
+            popup_size: None,
             capture_text: true,
             capture_images: true,
             capture_files: true,
