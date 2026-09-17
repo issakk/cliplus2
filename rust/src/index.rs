@@ -30,6 +30,13 @@ pub struct ClipItem {
     /// Precomputed once at index time so a keystroke never formats anything.
     preview: String,
     meta: String,
+    /// The values the second line is built from, kept apart so `app:chrome` cannot
+    /// reach a window title and `title:` cannot reach an application. Only the
+    /// qualified search terms read these; the row paints `meta`.
+    when: String,
+    who: String,
+    app: String,
+    title: String,
 }
 
 /// What the list needs to render one row. Deliberately small: the full text can
@@ -61,7 +68,7 @@ impl ClipItem {
         };
 
         let preview = build_preview(kind, &text, has_blob);
-        let meta = build_meta(record, kind, has_blob, local_machine, now_year);
+        let line = Meta::of(record, kind, has_blob, local_machine, now_year);
 
         ClipItem {
             stem,
@@ -75,7 +82,11 @@ impl ClipItem {
             blob_path,
             pinned,
             preview,
-            meta,
+            meta: line.text(),
+            when: line.when,
+            who: line.who,
+            app: line.app,
+            title: line.title,
         }
     }
 
@@ -304,12 +315,16 @@ impl Index {
     }
 
     /// Pinned rows first, then newest first. Two passes rather than a sort.
+    ///
+    /// `needle` is the search box, split into terms: every one of them has to match,
+    /// and a term without a `field:` prefix reads the clip's own text.
     pub fn query(
         &self,
         machine: Option<&str>,
         needle: Option<&str>,
         limit: usize,
     ) -> Vec<ClipSummary> {
+        let terms = needle.map(parse_query).unwrap_or_default();
         let mut out = Vec::with_capacity(limit.min(self.items.len()));
 
         for want_pinned in [true, false] {
@@ -324,10 +339,8 @@ impl Index {
                     }
                 }
 
-                if let Some(needle) = needle {
-                    if !matches(item, needle) {
-                        continue;
-                    }
+                if !matches(item, &terms) {
+                    continue;
                 }
 
                 out.push(item.summary());
@@ -341,8 +354,68 @@ impl Index {
     }
 }
 
-fn matches(item: &ClipItem, needle_lower: &str) -> bool {
-    contains_ignore_case(&item.text, needle_lower) || contains_ignore_case(&item.meta, needle_lower)
+/// One search term: which field it reads, and the word to look for in it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Field {
+    Text,
+    When,
+    Machine,
+    App,
+    Title,
+    Kind,
+}
+
+/// Splits the search box into terms: whitespace-separated, each one either a bare
+/// word or `field:value`.
+///
+/// A prefix that is not one of the known names is left in the term, so a clip that
+/// says `12:30` or `http://…` is still found by what it says rather than being read
+/// as a field nobody has. The values are already lowercased by the caller, which is
+/// what the case-insensitive compare below wants.
+fn parse_query(raw: &str) -> Vec<(Field, String)> {
+    raw.split_whitespace()
+        .map(|token| match token.split_once(':').and_then(|(name, value)| {
+            field_of(name).map(|field| (field, value.to_string()))
+        }) {
+            Some(term) => term,
+            None => (Field::Text, token.to_string()),
+        })
+        .collect()
+}
+
+fn field_of(name: &str) -> Option<Field> {
+    Some(match name {
+        "time" => Field::When,
+        "machine" => Field::Machine,
+        "app" => Field::App,
+        "title" => Field::Title,
+        "kind" => Field::Kind,
+        _ => return None,
+    })
+}
+
+/// Every term has to match: `foo bar` is what says both, and `kind:image foo` is the
+/// images that say foo.
+fn matches(item: &ClipItem, terms: &[(Field, String)]) -> bool {
+    terms
+        .iter()
+        .all(|(field, value)| matches_term(item, *field, value))
+}
+
+/// One term against one item. Two fields answer to more than one spelling: the
+/// machine to what the row shows (`本机`) as well as to its id, and the kind to
+/// `图片` as well as to `image`.
+fn matches_term(item: &ClipItem, field: Field, needle: &str) -> bool {
+    let hits = |haystack: &str| contains_ignore_case(haystack, needle);
+
+    match field {
+        Field::Text => hits(&item.text),
+        Field::When => hits(&item.when),
+        Field::Machine => hits(&item.machine) || hits(&item.who),
+        Field::App => hits(&item.app),
+        Field::Title => hits(&item.title),
+        Field::Kind => hits(item.kind.label()) || hits(item.kind.name()),
+    }
 }
 
 /// ASCII-case-insensitive substring search with no allocation.
@@ -454,44 +527,71 @@ fn format_when(at: i64, now_year: u16) -> String {
     }
 }
 
-fn build_meta(
-    record: &ClipRecord,
-    kind: ClipKind,
-    has_blob: bool,
-    local_machine: &str,
-    now_year: u16,
-) -> String {
-    let label = match kind {
-        ClipKind::Image => "图片",
-        ClipKind::Files => "文件",
-        ClipKind::Text => "文本",
-    };
+/// The row's second line, held as its parts.
+///
+/// One function builds both, so the line and the searchable fields cannot drift:
+/// the line is what gets painted, and the parts are what the qualified search terms
+/// read — `app:` finds an application, `title:` a window title, never each other.
+struct Meta {
+    label: &'static str,
+    when: String,
+    who: String,
+    app: String,
+    title: String,
+    blob_note: &'static str,
+}
 
-    let time = format_when(record.at, now_year);
+impl Meta {
+    fn of(
+        record: &ClipRecord,
+        kind: ClipKind,
+        has_blob: bool,
+        local_machine: &str,
+        now_year: u16,
+    ) -> Meta {
+        let who = if record.machine.is_empty() {
+            "?".to_string()
+        } else if record.machine == local_machine {
+            "本机".to_string()
+        } else {
+            record.machine.clone()
+        };
 
-    let who = if record.machine.is_empty() {
-        "?".to_string()
-    } else if record.machine == local_machine {
-        "本机".to_string()
-    } else {
-        record.machine.clone()
-    };
-
-    // The window it came out of, when there was one to read: which application,
-    // and what that window said. A clip from before this was recorded — or from a
-    // window this process could not read — simply stops after the machine, and
-    // the line then reads exactly as it always did.
-    let mut source = String::new();
-    for part in [&record.app, &record.title] {
-        if !part.is_empty() {
-            source.push_str(" · ");
-            source.push_str(part);
+        Meta {
+            label: kind.label(),
+            when: format_when(record.at, now_year),
+            who,
+            app: record.app.clone(),
+            title: record.title.clone(),
+            blob_note: if has_blob { " · 完整内容在 .bin" } else { "" },
         }
     }
 
-    let blob_note = if has_blob { " · 完整内容在 .bin" } else { "" };
+    /// The line the row shows.
+    fn text(&self) -> String {
+        let Meta {
+            label,
+            when,
+            who,
+            app,
+            title,
+            blob_note,
+        } = self;
 
-    format!("{label} · {time} · {who}{source}{blob_note}")
+        // The window it came out of, when there was one to read: which application,
+        // and what that window said. A clip from before this was recorded — or from a
+        // window this process could not read — simply stops after the machine, and
+        // the line then reads exactly as it always did.
+        let mut source = String::new();
+        for part in [app, title] {
+            if !part.is_empty() {
+                source.push_str(" · ");
+                source.push_str(part);
+            }
+        }
+
+        format!("{label} · {when} · {who}{source}{blob_note}")
+    }
 }
 
 #[cfg(test)]
@@ -520,6 +620,80 @@ mod tests {
             "local",
             crate::settings::current_year(),
         )
+    }
+
+    /// The same, but with everything the row's second line is built from filled in:
+    /// the fields the qualified search terms read.
+    fn sourced(stem: &str, kind: &str, text: &str, app: &str, title: &str) -> ClipItem {
+        let record = ClipRecord {
+            id: stem.to_string(),
+            at: 1_769_000_000_000,
+            machine: "local".to_string(),
+            kind: kind.to_string(),
+            hash: format!("hash-{stem}"),
+            text: Some(text.to_string()),
+            length: text.len() as i64,
+            blob: None,
+            app: app.to_string(),
+            title: title.to_string(),
+        };
+
+        ClipItem::from_record(
+            &record,
+            PathBuf::from("C:/sync/clips.db"),
+            stem.to_string(),
+            false,
+            "local",
+            crate::settings::current_year(),
+        )
+    }
+
+    /// The search box reads the clip's own text unless a term names a field, and the
+    /// fields stay apart from each other: `app:chrome` cannot reach a window title and
+    /// `title:` cannot reach an application. A prefix nobody knows stays a word, so a
+    /// clip that says `12:30` is still found by what it says.
+    #[test]
+    fn the_filter_reads_text_unless_a_term_names_a_field() {
+        let mut index = Index::default();
+        index.insert(sourced("a", "text", "hello world", "chrome.exe", "Inbox"));
+        index.insert(sourced("b", "image", "", "paint.exe", "chrome.exe — untitled"));
+        index.insert(sourced("c", "text", "meeting at 12:30", "teams.exe", "Calendar"));
+
+        // The same lowercasing the store does before it hands the filter over.
+        let hits = |needle: &str| {
+            let needle = needle.trim().to_ascii_lowercase();
+            index
+                .query(None, Some(&needle), 10)
+                .into_iter()
+                .map(|summary| summary.stem)
+                .collect::<Vec<_>>()
+        };
+
+        // Content only: the app name on another row's title is not content.
+        assert_eq!(hits("hello"), vec!["a"]);
+        assert_eq!(hits("chrome"), Vec::<String>::new());
+
+        // Words are separate terms now, so order and distance stop mattering.
+        assert_eq!(hits("world hello"), vec!["a"]);
+        assert_eq!(hits("hello nope"), Vec::<String>::new());
+
+        // One prefix per field, and each one reads only its own part.
+        assert_eq!(hits("app:chrome"), vec!["a"]);
+        assert_eq!(hits("title:chrome"), vec!["b"]);
+        assert_eq!(hits("title:inbox"), vec!["a"]);
+        assert_eq!(hits("kind:image"), vec!["b"]);
+        assert_eq!(hits("kind:图片"), vec!["b"]);
+        assert_eq!(hits("app:paint kind:image"), vec!["b"]);
+
+        // The machine answers to what the row shows as well as to its id, and the
+        // time to what the row prints.
+        assert_eq!(hits("machine:本机"), vec!["a", "b", "c"]);
+        assert_eq!(hits("machine:local"), vec!["a", "b", "c"]);
+
+        // A colon in the text is text: the prefix is only a prefix when it names a
+        // field this program has.
+        assert_eq!(hits("12:30"), vec!["c"]);
+        assert_eq!(hits("meeting"), vec!["c"]);
     }
 
     /// The instance strip and the per-instance filter are what the popup tabs

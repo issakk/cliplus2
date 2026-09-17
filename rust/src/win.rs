@@ -138,6 +138,16 @@ pub const WS_CHILD: u32 = 0x4000_0000;
 pub const WS_VISIBLE: u32 = 0x1000_0000;
 pub const WS_VSCROLL: u32 = 0x0020_0000;
 pub const ES_AUTOHSCROLL: u32 = 0x0080;
+/// Single-line edits only, and the text is a banner rather than the window text.
+pub const EM_SETCUEBANNER: u32 = 0x1501;
+
+pub const SS_CENTER: u32 = 0x0000_0001;
+/// Centres a single line of text vertically as well, which is what makes the fixed
+/// `?` square next to the search box sit in the middle of its box rather than at the
+/// top of it.
+pub const SS_CENTERIMAGE: u32 = 0x0000_0200;
+/// The one style a `STATIC` needs to report its clicks instead of swallowing them.
+pub const SS_NOTIFY: u32 = 0x0000_0100;
 pub const LBS_NOTIFY: u32 = 0x0001;
 pub const LBS_OWNERDRAWFIXED: u32 = 0x0010;
 pub const LBS_HASSTRINGS: u32 = 0x0040;
@@ -162,6 +172,9 @@ pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_COMMAND: u32 = 0x0111;
 pub const WM_CTLCOLOREDIT: u32 = 0x0133;
 pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
+/// Sent for the `?` beside the search box as well: the parent paints every static's
+/// background, and the default is the light system face colour.
+pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
 pub const WM_PAINT: u32 = 0x000F;
 pub const WM_LBUTTONDOWN: u32 = 0x0201;
 pub const WM_SIZE: u32 = 0x0005;
@@ -200,6 +213,9 @@ pub const EN_SETFOCUS: u32 = 0x0100;
 pub const EN_KILLFOCUS: u32 = 0x0200;
 pub const LBN_DBLCLK: u32 = 2;
 pub const LBN_SELCHANGE: u32 = 1;
+/// A static with `SS_NOTIFY` clicked: the notification code is zero, which is why
+/// this one has a name of its own.
+pub const STN_CLICKED: u32 = 0;
 
 pub const SW_SHOW: i32 = 5;
 pub const SW_HIDE: i32 = 0;
@@ -240,6 +256,7 @@ pub const FW_SEMIBOLD: i32 = 600;
 pub const CHARSET_DEFAULT: u32 = 1;
 pub const QUALITY_CLEARTYPE: u32 = 5;
 
+pub const MB_ICONINFORMATION: u32 = 0x0000_0040;
 pub const MB_OK: u32 = 0x0000_0000;
 pub const MB_ICONERROR: u32 = 0x0000_0010;
 pub const MB_ICONWARNING: u32 = 0x0000_0030;

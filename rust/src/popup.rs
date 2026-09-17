@@ -79,6 +79,26 @@ const MIN_HEIGHT: i32 = PAD + ROW_HEIGHT * 3 + BOTTOM_BANDS;
 const MAX_RESULTS: usize = 300;
 const SUBCLASS_ID: usize = 1;
 
+/// The `?` next to the search box, and the gap before it. Fixed size, like the box it
+/// explains, and square so it reads as a button in the corner of the input row.
+const HELP_SIZE: i32 = 30;
+const HELP_GAP: i32 = 6;
+const ID_HELP: usize = 1;
+
+/// What the `?` says. The prefix list is the whole of the search syntax, and it is
+/// the one place it can be read without leaving the popup.
+const HELP_TEXT: &str = "\
+默认只搜记录内容（前 512 字），空格分开的每个词都要命中，顺序和距离随便。
+
+按字段搜就加前缀，可以混着用：
+  app:chrome        来源程序（只存 exe 名）
+  title:报表        当时那个窗口的标题（存 120 字）
+  time:02-14        行上显示的时间，也能写 time:2025-02
+  machine:本机      机器：本机，或对方的机器 id
+  kind:图片         类型：文本/图片/文件，也可写 text/image/files
+
+不认识的词缀不算词缀——文本里写着 12:30 的照样搜得到。";
+
 /// COLORREF is 0x00BBGGRR, not RGB.
 const COLOR_BG: u32 = 0x001E_1E1E;
 const COLOR_INPUT_BG: u32 = 0x002A_2A2A;
@@ -91,6 +111,9 @@ struct Popup {
     hwnd: HWND,
     search: HWND,
     list: HWND,
+    /// The `?` that explains the search box. A control of its own so it can be clicked
+    /// without the popup having to hit test anything.
+    help: HWND,
     store: Arc<Store>,
     items: Mutex<Vec<ClipSummary>>,
     /// Which instance the list is showing. `None` is the "everything" tab.
@@ -104,6 +127,9 @@ struct Popup {
     /// Window that had focus before the popup opened: the paste target.
     target: AtomicIsize,
     visible: AtomicBool,
+    /// Whether the help box is up. The popup hides itself the moment it loses the
+    /// activation, and a help box is the one thing allowed to take it.
+    help_open: AtomicBool,
     /// Scale factor x100, so a plain integer atomic can carry it.
     scale: AtomicIsize,
     font_main: AtomicIsize,
@@ -190,9 +216,34 @@ pub fn create(store: Arc<Store>) -> bool {
         HEIGHT - PAD - BOTTOM_BANDS,
     );
 
-    if search == 0 || list == 0 {
+    let help = win::create_child_id(
+        "STATIC",
+        "?",
+        win::WS_CHILD
+            | win::WS_VISIBLE
+            | win::SS_CENTER
+            | win::SS_CENTERIMAGE
+            | win::SS_NOTIFY,
+        hwnd,
+        ID_HELP,
+        WIDTH - PAD - HELP_SIZE,
+        HEIGHT - SEARCH_FROM_BOTTOM,
+        HELP_SIZE,
+        SEARCH_HEIGHT,
+    );
+
+    if search == 0 || list == 0 || help == 0 {
         log::error("popup child controls could not be created");
         return false;
+    }
+
+    // What the box can do besides plain text, said in the one place the user looks
+    // when it is empty. Only the field names: the README has the long version, and a
+    // banner that wraps is worse than none. `1` keeps it visible while focused, which
+    // the popup does as soon as it opens.
+    let cue = win::wide("搜索内容 · app: title: time: machine: kind:");
+    unsafe {
+        win::SendMessageW(search, win::EM_SETCUEBANNER, 1, cue.as_ptr() as LPARAM);
     }
 
     // The list's scrollbar is the one thing in this window Windows draws itself,
@@ -204,6 +255,7 @@ pub fn create(store: Arc<Store>) -> bool {
         hwnd,
         search,
         list,
+        help,
         store: Arc::clone(&store),
         items: Mutex::new(Vec::new()),
         tab: Mutex::new(None),
@@ -211,6 +263,7 @@ pub fn create(store: Arc<Store>) -> bool {
         anchor: AtomicIsize::new(0),
         target: AtomicIsize::new(0),
         visible: AtomicBool::new(false),
+        help_open: AtomicBool::new(false),
         scale: AtomicIsize::new(100),
         font_main: AtomicIsize::new(0),
         font_meta: AtomicIsize::new(0),
@@ -361,6 +414,33 @@ pub fn hide() {
     p.visible.store(false, Ordering::SeqCst);
 }
 
+/// The `?` beside the search box: what the field prefixes are.
+///
+/// A message box rather than a panel drawn inside the popup: this is a list of text,
+/// and a box brings its own wrapping and its own Esc.
+fn show_help() {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    // The box takes the activation, and the popup hides itself the moment it loses it
+    // — which would take the help down with it. This flag is what keeps the popup up
+    // for as long as the box is; it is cleared as soon as the box closes, and the
+    // focus goes back to the search box, because the box has it by then.
+    p.help_open.store(true, Ordering::SeqCst);
+    win::message_box(
+        "ClipPlus 搜索",
+        HELP_TEXT,
+        win::MB_OK | win::MB_ICONINFORMATION,
+    );
+    p.help_open.store(false, Ordering::SeqCst);
+
+    win::focus_window(p.hwnd);
+    unsafe {
+        win::SetFocus(p.search);
+    }
+}
+
 /// Places the two controls inside a client area of `width` x `height`. Shared by
 /// the first open and by every stretch, so the two can never disagree about where
 /// the list ends.
@@ -380,13 +460,27 @@ fn layout(p: &Popup, width: i32, height: i32, scale: f64) {
     let list_height = rows * row_height;
     let list_top = list_bottom - list_height;
 
+    let help_width = scaled(HELP_SIZE, scale);
+    let search_top = height - scaled(SEARCH_FROM_BOTTOM, scale);
+
     unsafe {
         win::SetWindowPos(
             p.search,
             0,
             pad,
-            height - scaled(SEARCH_FROM_BOTTOM, scale),
-            width - pad * 2,
+            search_top,
+            // The `?` takes its corner out of the box rather than sitting over it,
+            // so a long query is never hidden behind the thing that explains it.
+            width - pad * 2 - help_width - scaled(HELP_GAP, scale),
+            scaled(SEARCH_HEIGHT, scale),
+            win::SWP_NOACTIVATE,
+        );
+        win::SetWindowPos(
+            p.help,
+            0,
+            width - pad - help_width,
+            search_top,
+            help_width,
             scaled(SEARCH_HEIGHT, scale),
             win::SWP_NOACTIVATE,
         );
@@ -446,9 +540,11 @@ fn ensure_fonts(p: &'static Popup, scale: f64) {
         let main = win::ui_font(main_height);
         let meta = win::ui_font(meta_height);
 
-        // The search box is a real EDIT, so it has to be told; the rows beside
-        // it are drawn by this file and would otherwise not match it.
+        // The two real controls in the input row, the search box and the `?` beside
+        // it, are told their font; they were created at whatever DPI the popup was
+        // first opened on, and the rows between them are drawn by this file anyway.
         win::SendMessageW(p.search, win::WM_SETFONT, main as usize, 1);
+        win::SendMessageW(p.help, win::WM_SETFONT, main as usize, 1);
 
         // Stored rather than deleted on replacement: `win::ui_font` owns the
         // handle and hands the same one back for the same height.
@@ -841,6 +937,20 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             0
         }
 
+        // The `?` is a static, and a static does not paint its own background: left
+        // alone it would be a light rectangle in the corner of a dark input row.
+        win::WM_CTLCOLORSTATIC => {
+            if let Some(p) = popup() {
+                let dc = wparam as win::HDC;
+                unsafe {
+                    win::SetTextColor(dc, COLOR_META);
+                    win::SetBkColor(dc, COLOR_BG);
+                }
+                return p.brush_bg as LRESULT;
+            }
+            0
+        }
+
         win::WM_DRAWITEM => {
             draw_item(lparam);
             1
@@ -928,9 +1038,12 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
         }
 
         win::WM_COMMAND => {
+            let id = (wparam & 0xFFFF) as usize;
             let notification = ((wparam >> 16) & 0xFFFF) as u32;
 
-            if notification == win::EN_CHANGE {
+            if id == ID_HELP && notification == win::STN_CLICKED {
+                show_help();
+            } else if notification == win::EN_CHANGE {
                 reload();
             } else if notification == win::LBN_DBLCLK {
                 commit();
@@ -945,8 +1058,11 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
         }
 
         win::WM_ACTIVATE => {
-            // WA_INACTIVE == 0: the user clicked somewhere else.
-            if (wparam & 0xFFFF) == 0 {
+            // WA_INACTIVE == 0: the user clicked somewhere else. The help box is the
+            // one thing allowed to take the activation — hiding the popup under it would
+            // take the help with it — and the flag is cleared when it closes.
+            let inactive = (wparam & 0xFFFF) == 0;
+            if inactive && !popup().is_some_and(|p| p.help_open.load(Ordering::SeqCst)) {
                 hide();
             }
             0

@@ -240,8 +240,9 @@ impl Store {
     // ------------------------------------------------------------------- reading
 
     /// One instance's clips, or every instance's when `machine` is `None`.
-    /// `filter` is matched with an allocation-free case-insensitive substring
-    /// search.
+    /// `filter` is the search box, lowercased here and split into `field:value` terms in
+    /// the index; every term is then matched with an allocation-free case-insensitive
+    /// substring search against the one field it names.
     pub fn query(&self, machine: Option<&str>, filter: &str, limit: usize) -> Vec<ClipSummary> {
         let needle = filter.trim().to_ascii_lowercase();
         let index = self.index.lock().unwrap_or_else(|p| p.into_inner());

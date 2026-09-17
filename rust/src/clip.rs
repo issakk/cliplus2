@@ -23,6 +23,16 @@ impl ClipKind {
         }
     }
 
+    /// The word the popup puts on the row's second line, and what `kind:图片`
+    /// matches beside `kind:image`.
+    pub fn label(self) -> &'static str {
+        match self {
+            ClipKind::Text => "文本",
+            ClipKind::Image => "图片",
+            ClipKind::Files => "文件",
+        }
+    }
+
     /// Turns the `kind` column back into an enum. An unknown value reads as
     /// text, which is the harmless choice for a hand-edited database.
     pub fn from_name(name: &str) -> ClipKind {
