@@ -5,6 +5,9 @@
 //! list is a real `LISTBOX` with owner-drawn rows, which keeps scrolling,
 //! keyboard navigation and hit testing out of this file too.
 //!
+//! The window reads bottom-up: the newest clip is the row just above the search
+//! box — where the input and the cursor are — and older clips stack up from there.
+//!
 //! Every pixel value below is a *logical* pixel at 96 DPI and is multiplied by
 //! the monitor's scale factor before use — including the row layout, which is
 //! what keeps the two text lines from colliding on a scaled display.
@@ -31,19 +34,28 @@ const PAD: i32 = 10;
 const SEARCH_HEIGHT: i32 = 30;
 const GAP: i32 = 8;
 
-/// The instance strip sits between the search box and the list. One fixed
-/// width per tab, because measuring labels would mean a DC and a font round
-/// trip for a strip that is two or three tabs wide in practice.
+/// The instance strip sits between the list and the search box, both of which are
+/// anchored to the bottom edge. One fixed width per tab, because measuring labels
+/// would mean a DC and a font round trip for a strip that is two or three tabs
+/// wide in practice.
 // ponytail: a sixth instance runs off the right edge; measure and wrap then.
-const TAB_TOP: i32 = PAD + SEARCH_HEIGHT + 6;
 const TAB_HEIGHT: i32 = 26;
 const TAB_WIDTH: i32 = 96;
 const TAB_GAP: i32 = 6;
 
-const LIST_TOP: i32 = TAB_TOP + TAB_HEIGHT + GAP;
+/// The bottom bands, measured from the client's bottom edge: the search box, the
+/// gap over it, the instance strip. The list is what grows above them, and it
+/// reads bottom-up — the newest clip is the row nearest the search box — so the
+/// input sits down here with it, and the newest row and the cursor end up in the
+/// same corner of the window.
+const SEARCH_FROM_BOTTOM: i32 = PAD + SEARCH_HEIGHT;
+const TAB_FROM_BOTTOM: i32 = SEARCH_FROM_BOTTOM + 6 + TAB_HEIGHT;
 
-/// Chosen so the list still holds exactly eight whole rows: 80 + 46*8 + 10.
-const HEIGHT: i32 = LIST_TOP + ROW_HEIGHT * 8 + PAD;
+/// Everything below the list: the strip, the search box and the padding under it.
+const BOTTOM_BANDS: i32 = TAB_FROM_BOTTOM + GAP;
+
+/// Chosen so the list still holds exactly eight whole rows: 10 + 46*8 + 80.
+const HEIGHT: i32 = PAD + ROW_HEIGHT * 8 + BOTTOM_BANDS;
 const ROW_HEIGHT: i32 = 46;
 const LINE1_TOP: i32 = 4;
 const LINE1_HEIGHT: i32 = 22;
@@ -54,14 +66,15 @@ const LINE2_HEIGHT: i32 = 17;
 /// padding around the controls, so it has to stay smaller than `PAD`.
 const GRIP: i32 = 5;
 
-/// Length of the two bars drawn in the bottom-right corner, the only visible sign
-/// that the window can be stretched.
+/// Length of the two bars drawn in the top-right corner, the only visible sign
+/// that the window can be stretched. It used to be the bottom-right corner; the
+/// search box owns that edge now, and a child control would draw over the bars.
 const GRIP_ARM: i32 = 8;
 
-/// Smallest the user can drag it down to: the search box, the tab strip and three
-/// rows of list.
+/// Smallest the user can drag it down to: three rows of list, the tab strip and the
+/// search box.
 const MIN_WIDTH: i32 = 420;
-const MIN_HEIGHT: i32 = LIST_TOP + ROW_HEIGHT * 3 + PAD;
+const MIN_HEIGHT: i32 = PAD + ROW_HEIGHT * 3 + BOTTOM_BANDS;
 
 const MAX_RESULTS: usize = 300;
 const SUBCLASS_ID: usize = 1;
@@ -152,7 +165,7 @@ pub fn create(store: Arc<Store>) -> bool {
         win::WS_CHILD | win::WS_VISIBLE | win::ES_AUTOHSCROLL,
         hwnd,
         PAD,
-        PAD,
+        HEIGHT - SEARCH_FROM_BOTTOM,
         WIDTH - PAD * 2,
         SEARCH_HEIGHT,
     );
@@ -166,16 +179,15 @@ pub fn create(store: Arc<Store>) -> bool {
         | win::LBS_EXTENDEDSEL
         | win::LBS_NOINTEGRALHEIGHT;
 
-    let list_top = LIST_TOP;
     let list = win::create_child(
         "LISTBOX",
         "",
         list_style,
         hwnd,
         PAD,
-        list_top,
+        PAD,
         WIDTH - PAD * 2,
-        HEIGHT - list_top - PAD,
+        HEIGHT - PAD - BOTTOM_BANDS,
     );
 
     if search == 0 || list == 0 {
@@ -317,6 +329,7 @@ pub fn show() {
     // The controls sit inside the client area, which is what `WM_SIZE` reports from
     // here on: this is the same call that lays them out again after a stretch.
     layout(p, width, height, scale);
+    scroll_to_newest(p);
 
     // `SetWindowPos` is meant to activate the window, and from a hotkey it is not
     // dependable about it. A popup that never got the foreground gets no keystrokes
@@ -350,20 +363,29 @@ pub fn hide() {
 
 /// Places the two controls inside a client area of `width` x `height`. Shared by
 /// the first open and by every stretch, so the two can never disagree about where
-/// the list starts.
+/// the list ends.
+///
+/// The list is anchored by its bottom edge and is only as tall as the rows it
+/// holds, so with fewer rows than fit the newest clip stays right above the search
+/// box instead of drifting to the top of the window with a hole under it.
 fn layout(p: &Popup, width: i32, height: i32, scale: f64) {
     let pad = scaled(PAD, scale);
-    let list_top = scaled(LIST_TOP, scale);
-    // `max(0)`: a window squeezed below the minimum still has to place its
-    // children somewhere, and a negative height is not one of the answers.
-    let list_height = (height - list_top - pad).max(0);
+    let row_height = scaled(ROW_HEIGHT, scale).max(1);
+    let list_bottom = (height - scaled(BOTTOM_BANDS, scale)).max(pad);
+    let rows = {
+        let items = p.items.lock().unwrap_or_else(|e| e.into_inner());
+        rows_for(items.len(), list_bottom - pad, row_height)
+    };
+
+    let list_height = rows * row_height;
+    let list_top = list_bottom - list_height;
 
     unsafe {
         win::SetWindowPos(
             p.search,
             0,
             pad,
-            pad,
+            height - scaled(SEARCH_FROM_BOTTOM, scale),
             width - pad * 2,
             scaled(SEARCH_HEIGHT, scale),
             win::SWP_NOACTIVATE,
@@ -377,6 +399,34 @@ fn layout(p: &Popup, width: i32, height: i32, scale: f64) {
             list_height,
             win::SWP_NOACTIVATE,
         );
+    }
+}
+
+/// How many rows the list gets: the rows it holds, or the whole area when it holds
+/// none — this is a list with a filter, and a list that collapses to nothing looks
+/// broken rather than empty.
+///
+/// `available` is the space above the bottom bands and `row_height` is one row of
+/// it, both in physical pixels. `max(1)` on the way in: a window squeezed below the
+/// minimum still has to place its children somewhere, and a row count of zero is not
+/// one of the answers.
+fn rows_for(count: usize, available: i32, row_height: i32) -> i32 {
+    let fits = (available / row_height).max(1);
+    if count == 0 {
+        fits
+    } else {
+        (count as i32).min(fits)
+    }
+}
+
+/// Where a band anchored to the bottom edge starts, in physical pixels:
+/// `above_bottom` is the distance from the client's bottom edge to the band's top
+/// edge, in logical pixels. Zero when the size is not known yet, which draws the
+/// strip off the bottom rather than in the wrong place.
+fn bottom_band_top(hwnd: HWND, above_bottom: i32, scale: f64) -> i32 {
+    match win::client_size(hwnd) {
+        Some((_, height)) => (height - scaled(above_bottom, scale)).max(0),
+        None => 0,
     }
 }
 
@@ -427,7 +477,10 @@ fn reload() {
         current.clone()
     };
 
-    let summaries = p.store.query(selected.as_deref(), &filter, MAX_RESULTS);
+    // Bottom-up: the newest clip is the last row, the one next to the search box, so
+    // this is the reverse of the ranking order the index hands out.
+    let mut summaries = p.store.query(selected.as_deref(), &filter, MAX_RESULTS);
+    summaries.reverse();
 
     let strip_changed = {
         let mut drawn = p.tabs.lock().unwrap_or_else(|e| e.into_inner());
@@ -446,11 +499,13 @@ fn reload() {
         }
 
         if !summaries.is_empty() {
-            // Oldest first row selected, and the caret on it: a multiple-selection
-            // list box keeps the two separate.
-            win::SendMessageW(p.list, win::LB_SETSEL, 1, 0);
-            win::SendMessageW(p.list, win::LB_SETCURSEL, 0, 0);
-            p.anchor.store(0, Ordering::SeqCst);
+            // The newest row is the last one, and it is the row the caret starts on:
+            // Enter still pastes what was just copied. A multiple-selection list box
+            // keeps the caret and the selection apart, which is why both are set.
+            let newest = summaries.len() - 1;
+            win::SendMessageW(p.list, win::LB_SETSEL, 1, newest as isize);
+            win::SendMessageW(p.list, win::LB_SETCURSEL, newest, 0);
+            p.anchor.store(newest as isize, Ordering::SeqCst);
         }
 
         win::InvalidateRect(p.list, std::ptr::null(), 1);
@@ -460,7 +515,44 @@ fn reload() {
         }
     }
 
-    *p.items.lock().unwrap_or_else(|e| e.into_inner()) = summaries;
+    {
+        *p.items.lock().unwrap_or_else(|e| e.into_inner()) = summaries;
+    }
+
+    // The list is only as tall as the rows it has, so the new count has to reach
+    // `layout`, and the view has to end up at the bottom of it.
+    if let Some((width, height)) = win::client_size(p.hwnd) {
+        layout(p, width, height, current_scale());
+    }
+    scroll_to_newest(p);
+}
+
+/// Scrolls the view to the last row, which is the newest clip.
+///
+/// `LB_SETCURSEL` is documented to bring the caret into view, but the newest row is
+/// the whole point of the bottom-up order and is worth the second call: the count
+/// that fits is measured from the control's own height, which `layout` has just set
+/// to exactly the number of rows it holds.
+fn scroll_to_newest(p: &Popup) {
+    let count = p.items.lock().unwrap_or_else(|e| e.into_inner()).len();
+    if count == 0 {
+        return;
+    }
+
+    let row_height = scaled(ROW_HEIGHT, current_scale()).max(1);
+    let visible = match win::client_size(p.list) {
+        Some((_, height)) => (height / row_height).max(1),
+        None => 1,
+    };
+
+    unsafe {
+        win::SendMessageW(
+            p.list,
+            win::LB_SETTOPINDEX,
+            (count as i32 - visible).max(0) as usize,
+            0,
+        );
+    }
 }
 
 fn commit() {
@@ -735,8 +827,8 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
         }
 
         // The list is owner-drawn, so the rows are ours, but the control still
-        // erases itself with this brush — including the empty space below the
-        // last row.
+        // erases itself with this brush — the whole box, when a filter matches
+        // nothing and the list keeps the full height it was given.
         win::WM_CTLCOLORLISTBOX => {
             if let Some(p) = popup() {
                 let dc = wparam as win::HDC;
@@ -815,7 +907,8 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             // background starts a window drag. The search box and the list are
             // child controls, so a click that lands on them never gets here, and the
             // outermost pixels are the resize edge rather than this — what is left
-            // to grab is the padding inside that, and the tab strip.
+            // to grab is the padding inside that, the tab strip, and the space over
+            // a list too short to fill it.
             if !tab_click(lparam) {
                 win::begin_drag_move(hwnd);
             }
@@ -1062,7 +1155,7 @@ fn paint(hwnd: HWND) {
 
     let scale = current_scale();
     let mut left = scaled(PAD, scale);
-    let top = scaled(TAB_TOP, scale);
+    let top = bottom_band_top(hwnd, TAB_FROM_BOTTOM, scale);
     let width = scaled(TAB_WIDTH, scale);
     let height = scaled(TAB_HEIGHT, scale);
     let step = width + scaled(TAB_GAP, scale);
@@ -1097,23 +1190,24 @@ fn paint(hwnd: HWND) {
 
         win::SelectObject(dc, previous);
 
-        // Two bars in the bottom-right corner: nothing else says the window can be
+        // Two bars in the top-right corner: nothing else says the window can be
         // stretched, because there is no frame to say it. Sized to the padding they
-        // sit in, so they never cover a row.
+        // sit in, so they never cover a row — and they sit up here because the search
+        // box has the bottom-right corner now, where a child control would hide them.
         let mut client = win::RECT::default();
         win::GetClientRect(hwnd, &mut client);
         let arm = scaled(GRIP_ARM, scale);
         let thickness = scaled(2, scale).max(1);
         let right = client.right - scaled(2, scale);
-        let bottom = client.bottom - scaled(2, scale);
+        let grip_top = scaled(2, scale);
 
         win::FillRect(
             dc,
             &win::RECT {
                 left: right - arm,
-                top: bottom - thickness,
+                grip_top,
                 right,
-                bottom,
+                bottom: grip_top + thickness,
             },
             p.brush_meta,
         );
@@ -1121,9 +1215,9 @@ fn paint(hwnd: HWND) {
             dc,
             &win::RECT {
                 left: right - thickness,
-                top: bottom - arm,
+                grip_top,
                 right,
-                bottom,
+                bottom: grip_top + arm,
             },
             p.brush_meta,
         );
@@ -1151,7 +1245,7 @@ fn tab_click(lparam: LPARAM) -> bool {
 
     let scale = current_scale();
     let left = scaled(PAD, scale);
-    let top = scaled(TAB_TOP, scale);
+    let top = bottom_band_top(p.hwnd, TAB_FROM_BOTTOM, scale);
     let width = scaled(TAB_WIDTH, scale);
     let height = scaled(TAB_HEIGHT, scale);
     let step = width + scaled(TAB_GAP, scale);
@@ -1262,8 +1356,8 @@ fn placed(remembered: Option<(i32, i32)>, area: &win::RECT, width: i32, height: 
 }
 
 /// The resize edge under the cursor, as the hit-test code Windows expects back.
-/// `None` is the client area — the padding and the tab strip — where nothing about
-/// resizing happens.
+/// `None` is the client area — the padding, the tab strip, the space over a short
+/// list — where nothing about resizing happens.
 ///
 /// The coordinates arrive packed as two signed 16-bit values, in screen space: the
 /// hit test is answered before anything here knows where the window is.
@@ -1357,5 +1451,20 @@ mod tests {
         assert_eq!(edge_hit(5, 5, width, height, grip), None);
         assert_eq!(edge_hit(300, 220, width, height, grip), None);
         assert_eq!(edge_hit(594, 434, width, height, grip), None);
+    }
+
+    /// The list is measured from its bottom edge, and where it ends decides where
+    /// the newest clip lands: right above the search box, or at the top of a hole.
+    #[test]
+    fn the_list_is_as_tall_as_the_rows_it_holds() {
+        // Three rows of space (the minimum window), five clips: three rows shown.
+        assert_eq!(rows_for(5, 138, 46), 3);
+        // Two clips in the same space: the list shrinks to them, so the newest one
+        // is still the row next to the search box.
+        assert_eq!(rows_for(2, 138, 46), 2);
+        // Nothing matched: the area stays, an empty list is not a broken one.
+        assert_eq!(rows_for(0, 138, 46), 3);
+        // Squeezed to nothing: one row is still placed rather than zero.
+        assert_eq!(rows_for(4, 0, 46), 1);
     }
 }

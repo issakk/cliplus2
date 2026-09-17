@@ -151,6 +151,7 @@ pub const LB_GETCURSEL: u32 = 0x0188;
 pub const LB_GETSELCOUNT: u32 = 0x0190;
 pub const LB_GETSELITEMS: u32 = 0x0191;
 pub const LB_SELITEMRANGE: u32 = 0x0196;
+pub const LB_SETTOPINDEX: u32 = 0x0197;
 pub const LB_SETITEMHEIGHT: u32 = 0x01A0;
 
 pub const WM_ACTIVATE: u32 = 0x0006;
