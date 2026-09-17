@@ -157,19 +157,23 @@ fn main() {
     log::info("=== ClipPlus stopping ===");
 }
 
-/// The three per-kind switches are consulted at capture time rather than at
-/// startup, which is what lets the settings window turn them off and have it
-/// take effect on the next copy instead of the next launch.
+/// The capture switches are consulted at capture time rather than at startup,
+/// which is what lets the settings window turn them off and have it take effect
+/// on the next copy instead of the next launch.
 fn capture_enabled(payload: &ClipPayload) -> bool {
     let Some(settings) = current_settings() else {
         return true;
     };
 
-    match payload {
+    let enabled = match payload {
         ClipPayload::Text(_) => settings.capture_text,
         ClipPayload::Image(_) => settings.capture_images,
         ClipPayload::Files(_) => settings.capture_files,
-    }
+    };
+
+    // A clip that would need a `.bin` sibling is dropped whole when blobs are
+    // off, rather than kept as a stub a search cannot see past.
+    enabled && (settings.write_blobs || !store::needs_blob(payload, &settings))
 }
 
 /// Snapshot of the live settings. Cloned, because callers outlive the lock.

@@ -67,7 +67,7 @@ git add -A && git commit -m "..." && git push
 
 ## 配置
 
-`%LOCALAPPDATA%\ClipPlus\settings.json`。托盘右键 →「设置…」直接改（热键和三个记录开关**立即生效**，其余项下次启动生效）：
+`%LOCALAPPDATA%\ClipPlus\settings.json`。托盘右键 →「设置…」直接改（热键和记录开关**立即生效**，其余项下次启动生效）：
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -80,6 +80,7 @@ git add -A && git commit -m "..." && git push
 | `PopupPosition` | `null` | 弹窗上次被拖到哪儿，`[x, y]`。程序自己写，不用手改；`null` = 还没拖过 |
 | `PopupSize` | `null` | 弹窗上次被拉到多大，`[宽, 高]`，单位是 96 DPI 下的逻辑像素（按显示器缩放还原）。程序自己写，不用手改；`null` = 还没拉过 |
 | `CaptureText` / `CaptureImages` / `CaptureFiles` | `true` | 分别开关 |
+| `WriteBlobs` | `true` | 关掉 = 需要 `.bin` 的内容（超长文本、图片）直接丢弃，当没复制过，不会再产生 `.bin`。只留 512 字前缀又搜不到后面的内容，所以宁可整条不要 |
 | `RetentionDays` | `0` | 自动删除本机 N 天前的记录。0 = 关闭；固定过的一律不删 |
 
 日志在同目录的 `clipplus.log`。

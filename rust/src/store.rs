@@ -828,6 +828,16 @@ fn stamp_of(path: &Path) -> Option<(u64, i64)> {
     Some((meta.len(), mtime))
 }
 
+/// Whether this payload would need a `.bin` sibling, which is the same question
+/// as whether `WriteBlobs` off means dropping it. A path list never does.
+pub fn needs_blob(payload: &ClipPayload, settings: &Settings) -> bool {
+    match payload {
+        ClipPayload::Text(text) => text.chars().count() > settings.inline_text_limit,
+        ClipPayload::Image(_) => true,
+        ClipPayload::Files(_) => false,
+    }
+}
+
 /// Decides what stays inline and whether a `.bin` sibling is needed.
 /// Inline text is what a search can see, so the split trades coverage against size.
 fn plan_payload(
@@ -839,7 +849,7 @@ fn plan_payload(
 
     match payload {
         ClipPayload::Text(text) => {
-            if text.chars().count() > settings.inline_text_limit {
+            if needs_blob(payload, settings) {
                 let retained: String = text.chars().take(RETAINED_CHARS).collect();
                 (Some(retained), Some(blob_name))
             } else {
@@ -920,6 +930,22 @@ mod tests {
             app: String::new(),
             title: String::new(),
         }
+    }
+
+    /// Turning `WriteBlobs` off drops exactly what this says needs a blob, so the
+    /// boundary is worth pinning: text of exactly the limit still stays inline.
+    #[test]
+    fn needs_blob_follows_the_inline_split() {
+        let settings = Settings {
+            inline_text_limit: 4,
+            ..Settings::default()
+        };
+
+        let text = |chars: usize| ClipPayload::Text("x".repeat(chars));
+        assert!(!needs_blob(&text(4), &settings));
+        assert!(needs_blob(&text(5), &settings));
+        assert!(needs_blob(&ClipPayload::Image(vec![1]), &settings));
+        assert!(!needs_blob(&ClipPayload::Files(vec!["a".to_string()]), &settings));
     }
 
     /// A clip now lives only in the database, so the two things that would

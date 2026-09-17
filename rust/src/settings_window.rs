@@ -47,6 +47,7 @@ const ID_CAPTURE_FILES: usize = 9;
 const ID_SAVE: usize = 10;
 const ID_CANCEL: usize = 11;
 const ID_SETTINGS_SCALE: usize = 12;
+const ID_WRITE_BLOBS: usize = 13;
 
 /// The rows, top to bottom: the control id and the caption beside it.
 ///
@@ -180,10 +181,11 @@ pub fn create() -> bool {
     }
 
     let check_y = CHECKS_TOP;
-    let checks: [(usize, &str); 3] = [
+    let checks: [(usize, &str); 4] = [
         (ID_CAPTURE_TEXT, "记录文本"),
         (ID_CAPTURE_IMAGES, "记录图片"),
         (ID_CAPTURE_FILES, "记录文件"),
+        (ID_WRITE_BLOBS, "超限写 .bin"),
     ];
 
     for (index, (id, label)) in checks.iter().copied().enumerate() {
@@ -203,7 +205,7 @@ pub fn create() -> bool {
 
     win::create_child_id(
         "STATIC",
-        "热键、三个记录开关和字号立即生效；其余项需要重启 ClipPlus。",
+        "热键、记录开关和字号立即生效；勾掉「超限写 .bin」= 超长文本和图片直接丢弃。其余项需重启。",
         label_style,
         hwnd,
         NOTE_ID,
@@ -309,7 +311,12 @@ fn layout(hwnd: HWND, scale: f64) {
     let check_width = win::scaled(CHECK_WIDTH, scale);
     let check_step = win::scaled(CHECK_STEP, scale);
     let check_y = win::scaled(CHECKS_TOP, scale);
-    let checks = [ID_CAPTURE_TEXT, ID_CAPTURE_IMAGES, ID_CAPTURE_FILES];
+    let checks = [
+        ID_CAPTURE_TEXT,
+        ID_CAPTURE_IMAGES,
+        ID_CAPTURE_FILES,
+        ID_WRITE_BLOBS,
+    ];
 
     for (index, id) in checks.into_iter().enumerate() {
         let x = margin + index as i32 * check_step;
@@ -403,6 +410,7 @@ fn populate(current: &Settings) {
     set_checked(ID_CAPTURE_TEXT, current.capture_text);
     set_checked(ID_CAPTURE_IMAGES, current.capture_images);
     set_checked(ID_CAPTURE_FILES, current.capture_files);
+    set_checked(ID_WRITE_BLOBS, current.write_blobs);
 }
 
 fn set_checked(id: usize, checked: bool) {
@@ -548,6 +556,7 @@ fn save() {
     updated.capture_text = is_checked(ID_CAPTURE_TEXT);
     updated.capture_images = is_checked(ID_CAPTURE_IMAGES);
     updated.capture_files = is_checked(ID_CAPTURE_FILES);
+    updated.write_blobs = is_checked(ID_WRITE_BLOBS);
 
     if let Err(err) = updated.save() {
         complain(&format!("写入 settings.json 失败：{err}"));

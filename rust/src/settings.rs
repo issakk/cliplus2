@@ -106,6 +106,13 @@ pub struct Settings {
     #[serde(rename = "CaptureFiles")]
     pub capture_files: bool,
 
+    /// Whether a clip that needs a `.bin` sibling (text over `InlineTextLimit`,
+    /// or an image) is written at all. Off drops it instead, the same as if the
+    /// kind were switched off: only the first 512 characters would be searchable
+    /// anyway, which is not worth a row.
+    #[serde(rename = "WriteBlobs")]
+    pub write_blobs: bool,
+
     #[serde(rename = "RetentionDays")]
     pub retention_days: u32,
 
@@ -135,6 +142,7 @@ impl Default for Settings {
             capture_text: true,
             capture_images: true,
             capture_files: true,
+            write_blobs: true,
             retention_days: 0,
             sync_root_override: None,
             app_dir: PathBuf::new(),
