@@ -624,10 +624,10 @@ mod tests {
 
     /// The same, but with everything the row's second line is built from filled in:
     /// the fields the qualified search terms read.
-    fn sourced(stem: &str, kind: &str, text: &str, app: &str, title: &str) -> ClipItem {
+    fn sourced(stem: &str, at: i64, kind: &str, text: &str, app: &str, title: &str) -> ClipItem {
         let record = ClipRecord {
             id: stem.to_string(),
-            at: 1_769_000_000_000,
+            at,
             machine: "local".to_string(),
             kind: kind.to_string(),
             hash: format!("hash-{stem}"),
@@ -655,9 +655,11 @@ mod tests {
     #[test]
     fn the_filter_reads_text_unless_a_term_names_a_field() {
         let mut index = Index::default();
-        index.insert(sourced("a", "text", "hello world", "chrome.exe", "Inbox"));
-        index.insert(sourced("b", "image", "", "paint.exe", "chrome.exe — untitled"));
-        index.insert(sourced("c", "text", "meeting at 12:30", "teams.exe", "Calendar"));
+        // Distinct timestamps, newest first: the list is in time order, so this is the
+        // order the rows come back in.
+        index.insert(sourced("a", 3_000, "text", "hello world", "chrome.exe", "Inbox"));
+        index.insert(sourced("b", 2_000, "image", "", "paint.exe", "chrome.exe — untitled"));
+        index.insert(sourced("c", 1_000, "text", "meeting at 12:30", "teams.exe", "Calendar"));
 
         // The same lowercasing the store does before it hands the filter over.
         let hits = |needle: &str| {
