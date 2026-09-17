@@ -1205,7 +1205,7 @@ fn paint(hwnd: HWND) {
             dc,
             &win::RECT {
                 left: right - arm,
-                grip_top,
+                top: grip_top,
                 right,
                 bottom: grip_top + thickness,
             },
@@ -1215,7 +1215,7 @@ fn paint(hwnd: HWND) {
             dc,
             &win::RECT {
                 left: right - thickness,
-                grip_top,
+                top: grip_top,
                 right,
                 bottom: grip_top + arm,
             },
