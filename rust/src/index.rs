@@ -94,6 +94,11 @@ impl ClipItem {
         pin_path_for(&self.db_path, &self.stem)
     }
 
+    /// The tombstone beside this clip, if one was left for it.
+    pub fn hidden_path(&self) -> PathBuf {
+        hidden_path_for(&self.db_path, &self.stem)
+    }
+
     pub fn summary(&self) -> ClipSummary {
         ClipSummary {
             stem: self.stem.clone(),
@@ -111,12 +116,29 @@ pub fn pin_path_for(db_path: &std::path::Path, stem: &str) -> PathBuf {
     folder.join(format!("{stem}{}", crate::store::PIN_SUFFIX))
 }
 
+/// `<stem>.del`, in the database's own folder: a tombstone. Same shape and the same
+/// reasoning as the pin marker — an empty file has identical content on every
+/// machine, so two machines leaving one cannot be seen as a conflict.
+///
+/// It is a *request* as much as a record: the row it names is still there, and only
+/// the machine that owns it may take it out. Until that machine does, this file is
+/// what keeps the clip off the list everywhere.
+pub fn hidden_path_for(db_path: &std::path::Path, stem: &str) -> PathBuf {
+    let folder = db_path.parent().unwrap_or(std::path::Path::new(""));
+    folder.join(format!("{stem}{}", crate::store::HIDDEN_SUFFIX))
+}
+
 #[derive(Default)]
 pub struct Index {
     /// Descending by `at`, maintained by binary insertion so a query never sorts.
     items: Vec<ClipItem>,
     stems: HashSet<String>,
     hashes: HashSet<String>,
+    /// Stems another instance has tombstoned. Held as a set rather than as a flag on
+    /// the item, because the items are rebuilt from scratch whenever a database
+    /// changes: a flag would come back false and the clip would reappear, whereas a
+    /// read consults this set and `forget_db` never touches it.
+    hidden: HashSet<String>,
 }
 
 impl Index {
@@ -139,7 +161,9 @@ impl Index {
             return false;
         }
 
-        if !item.hash.is_empty() {
+        // A hidden clip does not answer the capture path with its hash — see
+        // `rebuild_hashes` — and a database reload puts its rows back through here.
+        if !item.hash.is_empty() && !self.hidden.contains(&item.stem) {
             self.hashes.insert(item.hash.clone());
         }
 
@@ -163,7 +187,9 @@ impl Index {
                 continue;
             }
 
-            if !item.hash.is_empty() {
+            // Same guard as `insert`: this is the path a reloaded database comes
+            // back in, and a tombstoned row must not put its hash back in the set.
+            if !item.hash.is_empty() && !self.hidden.contains(&item.stem) {
                 self.hashes.insert(item.hash.clone());
             }
 
@@ -232,16 +258,37 @@ impl Index {
         self.forget_hashes(&dropped);
     }
 
-    /// Takes a batch of hashes out of the set, except the ones another clip still
-    /// carries: the same content can legitimately have been stored by two machines.
+    /// Takes a batch of hashes out of the set, except the ones another *visible* clip
+    /// still carries: the same content can legitimately have been stored by two
+    /// machines, and it can also be hiding behind a tombstone — which does not count,
+    /// see `rebuild_hashes`.
     fn forget_hashes(&mut self, dropped: &HashSet<String>) {
         if dropped.is_empty() {
             return;
         }
 
         self.hashes.retain(|hash| {
-            !dropped.contains(hash) || self.items.iter().any(|item| &item.hash == hash)
+            !dropped.contains(hash)
+                || self
+                    .items
+                    .iter()
+                    .any(|item| !self.hidden.contains(&item.stem) && &item.hash == hash)
         });
+    }
+
+    /// Rebuilds `hashes` from the clips that can still be seen.
+    ///
+    /// `hashes` is the capture path's "already stored" set, so a clip nobody can see
+    /// must not be in it: with a tombstone still answering for its hash, copying that
+    /// content again would store nothing and then show nothing either. One pass, and
+    /// only when the hidden set actually changed.
+    fn rebuild_hashes(&mut self) {
+        self.hashes = self
+            .items
+            .iter()
+            .filter(|item| !item.hash.is_empty() && !self.hidden.contains(&item.stem))
+            .map(|item| item.hash.clone())
+            .collect();
     }
 
     /// Drops every entry that came out of one container. Used when a database
@@ -288,6 +335,59 @@ impl Index {
         }
     }
 
+    /// Re-applies the authoritative hidden set gathered by a full folder walk.
+    ///
+    /// Replaced rather than merged: the walk saw every marker in the folder, so a
+    /// tombstone somebody removed by hand is a clip that comes back. Skipped when the
+    /// set is unchanged, which is the normal case — this runs on every rescan.
+    pub fn apply_hidden_state(&mut self, hidden: &HashSet<String>) {
+        if self.hidden == *hidden {
+            return;
+        }
+
+        self.hidden = hidden.clone();
+        self.rebuild_hashes();
+    }
+
+    /// Hides a batch the user just deleted. Additive, unlike the walk's replace: the
+    /// popup knows the rows it was asked about, not every marker in the folder.
+    pub fn hide_many(&mut self, stems: &HashSet<String>) {
+        self.hidden.extend(stems.iter().cloned());
+        self.rebuild_hashes();
+    }
+
+    /// One marker appeared or went away: the single-row version of the two above, for
+    /// the file watcher, which sees one file at a time. Answers whether the set
+    /// changed — a stem nobody has a row for is still worth remembering, because the
+    /// database it belongs to may only sync in later.
+    pub fn set_hidden(&mut self, stem: &str, hidden: bool) -> bool {
+        let changed = if hidden {
+            self.hidden.insert(stem.to_string())
+        } else {
+            self.hidden.remove(stem)
+        };
+
+        if changed {
+            self.rebuild_hashes();
+        }
+
+        changed
+    }
+
+    /// Clips another instance has tombstoned here: ours to take out for real, because
+    /// this is the only machine allowed to write them. Pinned ones are left alone — a
+    /// pin is a promise that this clip survives cleanup, made by whoever pinned it,
+    /// and a tombstone does not get to break it.
+    pub fn hidden_clips(&self, local_machine: &str) -> Vec<ClipItem> {
+        self.items
+            .iter()
+            .filter(|item| {
+                item.machine == local_machine && !item.pinned && self.hidden.contains(&item.stem)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Every instance that has a clip here, newest activity first. One pass: the
     /// items are already sorted by time, so the first clip seen for an instance
     /// is its newest.
@@ -295,6 +395,12 @@ impl Index {
         let mut out: Vec<(String, i64)> = Vec::new();
 
         for item in &self.items {
+            // An instance whose clips are all tombstoned has nothing to show, and a
+            // tab that opens on an empty list is worse than no tab at all.
+            if self.hidden.contains(&item.stem) {
+                continue;
+            }
+
             if !out.iter().any(|(id, _)| id == &item.machine) {
                 out.push((item.machine.clone(), item.at));
             }
@@ -329,7 +435,7 @@ impl Index {
 
         for want_pinned in [true, false] {
             for item in &self.items {
-                if item.pinned != want_pinned {
+                if self.hidden.contains(&item.stem) || item.pinned != want_pinned {
                     continue;
                 }
 
@@ -696,6 +802,44 @@ mod tests {
         // field this program has.
         assert_eq!(hits("12:30"), vec!["c"]);
         assert_eq!(hits("meeting"), vec!["c"]);
+    }
+
+    /// A tombstone is how one machine asks another to drop a clip it may not delete
+    /// itself. Two things have to hold for that to work: the row goes off every list
+    /// at once, and its hash stops answering the capture path — otherwise copying that
+    /// content again would be "already stored" and then show up nowhere.
+    #[test]
+    fn a_tombstoned_clip_is_off_the_list_and_off_the_hash_set() {
+        let mut index = Index::default();
+        index.insert(item("a", "local", 300));
+        index.insert(item("b", "local", 200));
+        index.insert(item("c", "other", 100));
+
+        let hidden: HashSet<String> = ["b"].iter().map(|stem| stem.to_string()).collect();
+        index.hide_many(&hidden);
+
+        let visible = |index: &Index| {
+            index
+                .query(None, None, 10)
+                .into_iter()
+                .map(|row| row.stem)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(visible(&index), vec!["a", "c"]);
+        assert!(!index.has_hash("hash-b"));
+
+        // The machine that owns the row works from here, and it leaves a pinned clip
+        // alone: a pin is a promise that this clip survives cleanup.
+        assert_eq!(index.hidden_clips("local").len(), 1);
+        index.set_pinned("b", true);
+        assert!(index.hidden_clips("local").is_empty());
+        index.set_pinned("b", false);
+
+        // A marker somebody removed by hand is a clip that comes back.
+        assert!(index.set_hidden("b", false));
+        assert_eq!(visible(&index), vec!["a", "b", "c"]);
+        assert!(index.has_hash("hash-b"));
     }
 
     /// The instance strip and the per-instance filter are what the popup tabs

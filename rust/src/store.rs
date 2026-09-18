@@ -37,6 +37,10 @@ use crate::settings::{self, Settings};
 
 pub const PIN_SUFFIX: &str = ".pin";
 const BIN_SUFFIX: &str = ".bin";
+/// The tombstone another instance leaves when it wants a clip gone but may not
+/// write the database that holds it. Empty, like the pin marker, so that the same
+/// file created on two machines is the same file.
+pub const HIDDEN_SUFFIX: &str = ".del";
 
 /// Matched exactly rather than by extension, so an unrelated `.db` that happens
 /// to sit in the synced folder is never opened as a clip store.
@@ -321,25 +325,28 @@ impl Store {
 
     // ---------------------------------------------------------------- indexing
 
-    /// Full folder walk: every database under the sync root, plus pin markers.
-    /// Databases are stamped, so one that has not changed costs a `stat`.
+    /// Full folder walk: every database under the sync root, plus the pin and
+    /// tombstone markers beside them. Databases are stamped, so one that has not
+    /// changed costs a `stat`.
     pub fn rescan(&self) {
         let root = self.settings.sync_root.clone();
         let mut pinned = HashSet::new();
-        self.walk(&root, &mut pinned);
+        let mut hidden = HashSet::new();
+        self.walk(&root, &mut pinned, &mut hidden);
 
-        let (clips, pinned_count) = {
+        let (clips, pinned_count, hidden_count) = {
             let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
             index.apply_pin_state(&pinned);
-            (index.len(), pinned.len())
+            index.apply_hidden_state(&hidden);
+            (index.len(), pinned.len(), hidden.len())
         };
 
         log::info(&format!(
-            "rescan: {clips} clip(s) indexed, {pinned_count} pinned"
+            "rescan: {clips} clip(s) indexed, {pinned_count} pinned, {hidden_count} hidden"
         ));
     }
 
-    fn walk(&self, directory: &Path, pinned: &mut HashSet<String>) {
+    fn walk(&self, directory: &Path, pinned: &mut HashSet<String>, hidden: &mut HashSet<String>) {
         let Ok(entries) = fs::read_dir(directory) else {
             return;
         };
@@ -351,7 +358,7 @@ impl Store {
             };
 
             if file_type.is_dir() {
-                self.walk(&path, pinned);
+                self.walk(&path, pinned, hidden);
                 continue;
             }
 
@@ -366,6 +373,11 @@ impl Store {
                 let stem = stem_of(&path, PIN_SUFFIX);
                 if !stem.is_empty() {
                     pinned.insert(stem);
+                }
+            } else if name.ends_with(HIDDEN_SUFFIX) {
+                let stem = stem_of(&path, HIDDEN_SUFFIX);
+                if !stem.is_empty() {
+                    hidden.insert(stem);
                 }
             }
         }
@@ -574,46 +586,94 @@ impl Store {
 
     // ------------------------------------------------------------------- deletion
 
-    /// Deletes the clips the user picked in the list, and reports how many were left
-    /// alone because another instance is still writing their month.
+    /// Deletes the clips the user picked in the list, and reports `(deleted, marked)`.
     ///
-    /// This machine's own rows are always its own to delete. Another instance's are
-    /// deletable once their month is over, because a month that is over has no
-    /// writer: nothing ever writes a past bucket, so the file is only ever read and
-    /// a stray deletion there costs nothing — two machines deleting from one frozen
-    /// month can lose a deletion to the sync client's last-writer-wins, never a clip.
+    /// This machine's own rows are its own to delete, and so is any row in a month
+    /// that is over: nothing ever writes a past bucket, so a stray deletion there
+    /// costs nothing — two machines deleting from one frozen month can lose a deletion
+    /// to the sync client's last-writer-wins, never a clip.
     ///
-    /// A live month does have a writer, and it is not us. The whole layout rests on
-    /// one writer per file; a second one working from a snapshot that may be an hour
-    /// old would not undo a rival deletion, it would drop every clip that machine
-    /// captured since that snapshot was taken.
-    ///
-    /// Returns `(deleted, refused)`.
+    /// Another instance's live month is the one thing that cannot be written: it has
+    /// a writer, and it is not us. A second writer working from a snapshot that may be
+    /// an hour old would not undo a rival deletion, it would drop every clip that
+    /// machine captured since that snapshot was taken. So those rows are *marked*
+    /// instead — an empty `<stem>.del` beside the clip, which every machine reads as
+    /// "this one is gone" and which the machine that owns the row acts on in
+    /// `reap_hidden`. Hidden here at once, and really gone there within a minute of
+    /// that machine looking.
     pub fn delete_selected(&self, stems: &[String]) -> (usize, usize) {
         let month = settings::month_bucket(settings::now_ms());
 
-        let (doomed, refused) = {
+        let (doomed, marked) = {
             let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
             let mut doomed: Vec<ClipItem> = Vec::new();
-            let mut refused = 0;
+            let mut marked: Vec<ClipItem> = Vec::new();
 
             for stem in stems {
                 match index.find(stem) {
                     Some(item) if deletable(item, &self.settings.machine_id, &month) => {
                         doomed.push(item.clone());
                     }
-                    Some(_) => refused += 1,
-                    // Already gone: the file was reloaded since the popup was
-                    // drawn. Nothing to delete and nothing to complain about.
+                    // Another instance's live month: a tombstone is all we may write.
+                    Some(item) => marked.push(item.clone()),
+                    // Already gone: the file was reloaded since the popup was drawn.
                     None => {}
                 }
             }
 
-            (doomed, refused)
+            (doomed, marked)
+        };
+
+        if !doomed.is_empty() {
+            delete_clips(&doomed);
+
+            let removed: HashSet<String> = doomed.iter().map(|item| item.stem.clone()).collect();
+            let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            index.forget_many(&removed);
+        }
+
+        // Only the ones whose marker actually landed: a row left on this list with no
+        // tombstone behind it is a delete that did not happen, and staying visible is
+        // the honest report of that. `write_marker` logged why it failed.
+        let mut hidden: HashSet<String> = HashSet::new();
+        for item in &marked {
+            if write_marker(item) {
+                hidden.insert(item.stem.clone());
+            }
+        }
+
+        if !hidden.is_empty() {
+            let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            index.hide_many(&hidden);
+        }
+
+        log::info(&format!(
+            "deleted {} clip(s) by hand, tombstoned {}",
+            doomed.len(),
+            hidden.len()
+        ));
+
+        (doomed.len(), hidden.len())
+    }
+
+    /// Carries out the tombstones another instance left in our folders.
+    ///
+    /// A tombstone is a request, and this is the only machine that can grant it: the
+    /// row belongs to us and the folder it lives in is ours to write. The row, its
+    /// blob, its pin and the tombstone itself all go, so the clip is gone for real
+    /// rather than hidden.
+    ///
+    /// Deliberately not on the capture path or the window thread: it runs on the
+    /// rescan beat, so a deletion that arrives with a sync becomes real within a
+    /// minute — and it was already invisible everywhere the marker had landed.
+    pub fn reap_hidden(&self) {
+        let doomed = {
+            let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            index.hidden_clips(&self.settings.machine_id)
         };
 
         if doomed.is_empty() {
-            return (0, refused);
+            return;
         }
 
         delete_clips(&doomed);
@@ -624,12 +684,7 @@ impl Store {
             index.forget_many(&removed);
         }
 
-        log::info(&format!(
-            "deleted {} clip(s) by hand ({refused} refused)",
-            doomed.len()
-        ));
-
-        (doomed.len(), refused)
+        log::info(&format!("reaped {} tombstoned clip(s) of our own", doomed.len()));
     }
 
     // -------------------------------------------------------------------- watch
@@ -646,6 +701,13 @@ impl Store {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .set_pinned(&stem, exists);
+        } else if name.ends_with(HIDDEN_SUFFIX) {
+            let stem = stem_of(path, HIDDEN_SUFFIX);
+            let exists = path.exists();
+            self.index
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .set_hidden(&stem, exists);
         }
     }
 
@@ -669,6 +731,12 @@ impl Store {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .set_pinned(&stem, false);
+        } else if name.ends_with(HIDDEN_SUFFIX) {
+            let stem = stem_of(path, HIDDEN_SUFFIX);
+            self.index
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .set_hidden(&stem, false);
         }
     }
 
@@ -725,6 +793,10 @@ impl Store {
         loop {
             thread::sleep(period);
             self.rescan();
+            // The same beat as the rescan that read the markers: a tombstone sitting
+            // in one of our own folders is ours to carry out, and the walk above has
+            // just brought the set up to date.
+            self.reap_hidden();
         }
     }
 
@@ -807,8 +879,30 @@ fn insert_row(db_path: &Path, record: &ClipRecord) -> Result<(), String> {
     Ok(())
 }
 
-/// Deletes a batch of clips: the rows of every database involved, then the blob and
-/// pin files beside them.
+/// Leaves the tombstone for one clip: an empty `<stem>.del` beside it, in the folder
+/// of the database that holds the row.
+///
+/// Same file and same reasoning as the pin marker — see `hidden_path_for` — and the
+/// same failure handling: a marker that cannot be written is logged and the clip
+/// stays visible, because a delete nobody can see the record of is worse than one
+/// that did not happen.
+fn write_marker(item: &ClipItem) -> bool {
+    let path = item.hidden_path();
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+
+    match fs::write(&path, []) {
+        Ok(()) => true,
+        Err(err) => {
+            log::error(&format!("tombstone {}: {err}", path.display()));
+            false
+        }
+    }
+}
+
+/// Deletes a batch of clips: the rows of every database involved, then the blob, the
+/// pin and the tombstone beside them.
 ///
 /// A batch rather than one call per clip because retention empties in bursts — one
 /// transaction per database instead of a commit per row, and one file open instead
@@ -835,6 +929,9 @@ fn delete_clips(items: &[ClipItem]) {
         }
 
         remove_file(&item.pin_path());
+        // The tombstone has done its job the moment the row is gone, so it goes with
+        // it — whether it was ours or another instance's request that this happen.
+        remove_file(&item.hidden_path());
     }
 }
 
@@ -1165,6 +1262,7 @@ mod tests {
         insert_row(&path, &record("stem-2", Some("bye"), None)).unwrap();
         fs::write(dir.join("stem-1.bin"), b"blob").unwrap();
         fs::write(dir.join("stem-1.pin"), []).unwrap();
+        fs::write(dir.join("stem-1.del"), []).unwrap();
 
         let row = record("stem-1", None, Some("stem-1.bin"));
         let item = ClipItem::from_record(
@@ -1181,6 +1279,7 @@ mod tests {
         assert_eq!(read_all(&path).len(), 1);
         assert!(!dir.join("stem-1.bin").exists());
         assert!(!dir.join("stem-1.pin").exists());
+        assert!(!dir.join("stem-1.del").exists());
 
         let _ = fs::remove_dir_all(&dir);
     }

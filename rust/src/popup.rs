@@ -949,9 +949,9 @@ fn select_row(index: usize) {
 /// destroys something, and there is nothing here to undo it with.
 ///
 /// This machine's own rows go, and another instance's go once their month is over.
-/// What is left is another instance's month still being written, and that is said out
-/// loud rather than quietly skipped — a delete that does nothing reads as a broken
-/// delete.
+/// What is left is another instance's month still being written: those are hidden by
+/// a tombstone — gone from this list now, and really deleted by the machine that owns
+/// them the next time it looks, which is what `Store::reap_hidden` is for.
 fn delete_selected_rows() {
     let Some(p) = popup() else {
         return;
@@ -968,30 +968,19 @@ fn delete_selected_rows() {
 
     let question = format!(
         "删除选中的 {count} 条记录？\n\n\
-         同步目录里的记录会一起删掉，其他机器同步之后也会跟着消失，删了找不回来。"
+         同步目录里的记录会一起删掉，其他机器同步之后也会跟着消失，删了找不回来。\n\n\
+         别的机器当月那份只能先记个「已删」的空标记（一样马上看不见），由那台机器自己清。"
     );
 
     if boxed("ClipPlus 删除", &question, win::MB_YESNO | win::MB_ICONWARNING) != win::IDYES {
         return;
     }
 
-    let (deleted, refused) = p.store.delete_selected(&stems);
-    log::info(&format!("{deleted} clip(s) deleted by hand, {refused} refused"));
+    let (deleted, marked) = p.store.delete_selected(&stems);
+    log::info(&format!("{deleted} clip(s) deleted by hand, {marked} tombstoned"));
 
     reload();
     select_row(caret);
-
-    if refused > 0 {
-        boxed(
-            "ClipPlus 删除",
-            &format!(
-                "{refused} 条没有删：它们属于别的机器，而那个月还没过完。\n\n\
-                 那个库现在正被对方写入，我们改它会把对方期间新采集的记录一起覆盖掉。\n\
-                 等这个月过去再删，或者到那台机器上删。"
-            ),
-            win::MB_OK | win::MB_ICONINFORMATION,
-        );
-    }
 
     // Back to the list rather than the search box, which the box above leaves the
     // focus in: the caret is on the row that took the deleted one's place, and deleting
