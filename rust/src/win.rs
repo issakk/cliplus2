@@ -113,6 +113,7 @@ pub const WM_APP: u32 = 0x8000;
 pub const WM_NULL: u32 = 0x0000;
 pub const WM_LBUTTONUP: u32 = 0x0202;
 pub const WM_RBUTTONUP: u32 = 0x0205;
+pub const WM_MOUSEWHEEL: u32 = 0x020A;
 pub const WM_CONTEXTMENU: u32 = 0x007B;
 
 pub const MF_STRING: u32 = 0x0000;

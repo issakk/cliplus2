@@ -532,6 +532,13 @@ fn rows_for(count: usize, available: i32, row_height: i32) -> i32 {
     }
 }
 
+/// One page of the page keys: the rows that fit, less one, so the row the caret
+/// left stays on screen instead of the next page landing with no context. Never
+/// zero — a window squeezed down to one row still has to move somewhere.
+fn page_rows(visible: i32) -> i32 {
+    (visible - 1).max(1)
+}
+
 /// Where a band anchored to the bottom edge starts, in physical pixels:
 /// `above_bottom` is the distance from the client's bottom edge to the band's top
 /// edge, in logical pixels. Zero when the size is not known yet, which draws the
@@ -654,11 +661,7 @@ fn scroll_to_newest(p: &Popup) {
         return;
     }
 
-    let row_height = scaled(ROW_HEIGHT, current_scale()).max(1);
-    let visible = match win::client_size(p.list) {
-        Some((_, height)) => (height / row_height).max(1),
-        None => 1,
-    };
+    let visible = visible_rows(p);
 
     unsafe {
         win::SendMessageW(
@@ -667,6 +670,29 @@ fn scroll_to_newest(p: &Popup) {
             (count as i32 - visible).max(0) as usize,
             0,
         );
+    }
+}
+
+/// How many whole rows the list is showing right now. Measured rather than assumed:
+/// the popup stretches, and both the step down to the newest row and the page keys
+/// have to agree with what is actually on screen.
+fn visible_rows(p: &Popup) -> i32 {
+    let row_height = scaled(ROW_HEIGHT, current_scale()).max(1);
+    match win::client_size(p.list) {
+        Some((_, height)) => (height / row_height).max(1),
+        None => 1,
+    }
+}
+
+/// The wheel is the list's wherever it is spun in the popup. Over the list the
+/// control sees the message itself; from the search box — where the cursor sits
+/// while typing — or from the strip and the padding it has to be handed over by
+/// hand. Whoever calls this swallows the message, so the control gets it once.
+fn scroll_list(wparam: WPARAM, lparam: LPARAM) {
+    if let Some(p) = popup() {
+        unsafe {
+            win::SendMessageW(p.list, win::WM_MOUSEWHEEL, wparam, lparam);
+        }
     }
 }
 
@@ -1206,6 +1232,14 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             0
         }
 
+        // Spun over the strip, the padding or the `?`: the search box and the list
+        // are child controls, so this window is where Windows walks the message up
+        // to, and the rows are what the user is aiming at either way.
+        win::WM_MOUSEWHEEL => {
+            scroll_list(wparam, lparam);
+            0
+        }
+
         // DefWindowProc runs first so the maximum side of the struct is filled in the
         // way Windows fills it; the minimum track size is the one field this window
         // has an opinion about, and without it the window can be dragged down to a
@@ -1320,13 +1354,18 @@ fn handle_key(key: i32, typing: bool) -> bool {
     // VK_CONTROL is declared as u16 for SendInput; GetKeyState wants i32.
     let control_down = unsafe { win::GetKeyState(win::VK_CONTROL as i32) } < 0;
 
+    // A page is what the list actually shows, not a constant: the popup stretches,
+    // and eight rows is only the size it opens at. `page_rows` keeps one row of
+    // overlap, so a page never lands without the row it came from still on screen.
+    let page = popup().map_or(8, |p| page_rows(visible_rows(p)));
+
     match key {
         win::VK_ESCAPE => hide(),
         win::VK_RETURN => commit(),
         win::VK_UP => move_selection(-1),
         win::VK_DOWN => move_selection(1),
-        win::VK_PRIOR => move_selection(-8),
-        win::VK_NEXT => move_selection(8),
+        win::VK_PRIOR => move_selection(-page),
+        win::VK_NEXT => move_selection(page),
         win::VK_DELETE if !typing => delete_selected_rows(),
         win::VK_P if control_down => toggle_pin(),
         win::VK_C if control_down => copy_selected(),
@@ -1351,6 +1390,14 @@ extern "system" fn search_proc(
     _subclass_id: usize,
     _ref_data: usize,
 ) -> LRESULT {
+    // The cursor sits here while typing and this is the control with the focus, so
+    // this is the common half of the wheel: the box has nothing of its own to
+    // scroll, and the list is right above it.
+    if message == win::WM_MOUSEWHEEL {
+        scroll_list(wparam, lparam);
+        return 0;
+    }
+
     if message == win::WM_KEYDOWN && handle_key(wparam as i32, true) {
         return 0;
     }
@@ -1829,5 +1876,15 @@ mod tests {
         assert_eq!(rows_for(0, 138, 46), 3);
         // Squeezed to nothing: one row is still placed rather than zero.
         assert_eq!(rows_for(4, 0, 46), 1);
+    }
+
+    /// The page keys and the step to the newest row both read the list's real
+    /// height, and the page keeps one row of overlap so a jump never lands blind.
+    #[test]
+    fn a_page_is_one_row_short_of_what_fits() {
+        assert_eq!(page_rows(8), 7);
+        assert_eq!(page_rows(3), 2);
+        // The minimum window still has somewhere to go.
+        assert_eq!(page_rows(1), 1);
     }
 }
