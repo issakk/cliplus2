@@ -113,6 +113,7 @@ pub const WM_APP: u32 = 0x8000;
 pub const WM_NULL: u32 = 0x0000;
 pub const WM_LBUTTONUP: u32 = 0x0202;
 pub const WM_RBUTTONUP: u32 = 0x0205;
+pub const WM_CONTEXTMENU: u32 = 0x007B;
 
 pub const MF_STRING: u32 = 0x0000;
 pub const MF_SEPARATOR: u32 = 0x0800;
@@ -163,6 +164,7 @@ pub const LB_GETSELITEMS: u32 = 0x0191;
 pub const LB_SELITEMRANGE: u32 = 0x0196;
 pub const LB_SETTOPINDEX: u32 = 0x0197;
 pub const LB_SETITEMHEIGHT: u32 = 0x01A0;
+pub const LB_ITEMFROMPOINT: u32 = 0x01A9;
 
 pub const WM_ACTIVATE: u32 = 0x0006;
 pub const WM_SETFOCUS: u32 = 0x0007;
@@ -233,6 +235,7 @@ pub const VK_DOWN: i32 = 0x28;
 pub const VK_P: i32 = 0x50;
 pub const VK_A: i32 = 0x41;
 pub const VK_C: i32 = 0x43;
+pub const VK_DELETE: i32 = 0x2E;
 pub const VK_TAB: i32 = 0x09;
 pub const VK_SHIFT: i32 = 0x10;
 pub const VK_MENU: i32 = 0x12;
@@ -262,6 +265,8 @@ pub const MB_ICONERROR: u32 = 0x0000_0010;
 pub const MB_ICONWARNING: u32 = 0x0000_0030;
 pub const MB_SETFOREGROUND: u32 = 0x0001_0000;
 pub const MB_TOPMOST: u32 = 0x0004_0000;
+pub const MB_YESNO: u32 = 0x0000_0004;
+pub const IDYES: i32 = 6;
 
 // --------------------------------------------------------------------- structs
 
@@ -1026,7 +1031,10 @@ pub fn child_by_id(parent: HWND, id: usize) -> HWND {
 
 /// A daemon has no window to fail in front of, so a fatal startup problem would
 /// otherwise be completely invisible to whoever just double-clicked the exe.
-pub fn message_box(title: &str, text: &str, flags: u32) {
+///
+/// The button the user pressed comes back, which is what lets the same box ask a
+/// question rather than only report: `MB_YESNO` with `IDYES` is the asking half.
+pub fn message_box(title: &str, text: &str, flags: u32) -> i32 {
     let title = wide(title);
     let text = wide(text);
     unsafe {
@@ -1035,7 +1043,7 @@ pub fn message_box(title: &str, text: &str, flags: u32) {
             text.as_ptr(),
             title.as_ptr(),
             flags | MB_SETFOREGROUND | MB_TOPMOST,
-        );
+        )
     }
 }
 

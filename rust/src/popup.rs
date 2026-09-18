@@ -85,6 +85,14 @@ const HELP_SIZE: i32 = 30;
 const HELP_GAP: i32 = 6;
 const ID_HELP: usize = 1;
 
+/// What the row menu's items come back as. The menu is tracked with `TPM_RETURNCMD`
+/// and the id is read from its return value, so these never travel as a `WM_COMMAND`.
+const CMD_PASTE: i32 = 1;
+const CMD_COPY: i32 = 2;
+const CMD_PIN: i32 = 3;
+const CMD_DELETE: i32 = 4;
+const CMD_SELECT_ALL: i32 = 5;
+
 /// What the `?` says. The prefix list is the whole of the search syntax, and it is
 /// the one place it can be read without leaving the popup.
 const HELP_TEXT: &str = "\
@@ -127,9 +135,10 @@ struct Popup {
     /// Window that had focus before the popup opened: the paste target.
     target: AtomicIsize,
     visible: AtomicBool,
-    /// Whether the help box is up. The popup hides itself the moment it loses the
-    /// activation, and a help box is the one thing allowed to take it.
-    help_open: AtomicBool,
+    /// Whether a message box the popup itself put up is open. The popup hides itself
+    /// the moment it loses the activation, and a box is the one thing allowed to take
+    /// it — otherwise the box would take the popup down with it.
+    modal_open: AtomicBool,
     /// Scale factor x100, so a plain integer atomic can carry it.
     scale: AtomicIsize,
     font_main: AtomicIsize,
@@ -263,7 +272,7 @@ pub fn create(store: Arc<Store>) -> bool {
         anchor: AtomicIsize::new(0),
         target: AtomicIsize::new(0),
         visible: AtomicBool::new(false),
-        help_open: AtomicBool::new(false),
+        modal_open: AtomicBool::new(false),
         scale: AtomicIsize::new(100),
         font_main: AtomicIsize::new(0),
         font_meta: AtomicIsize::new(0),
@@ -419,26 +428,36 @@ pub fn hide() {
 /// A message box rather than a panel drawn inside the popup: this is a list of text,
 /// and a box brings its own wrapping and its own Esc.
 fn show_help() {
-    let Some(p) = popup() else {
-        return;
-    };
-
-    // The box takes the activation, and the popup hides itself the moment it loses it
-    // — which would take the help down with it. This flag is what keeps the popup up
-    // for as long as the box is; it is cleared as soon as the box closes, and the
-    // focus goes back to the search box, because the box has it by then.
-    p.help_open.store(true, Ordering::SeqCst);
-    win::message_box(
+    boxed(
         "ClipPlus 搜索",
         HELP_TEXT,
         win::MB_OK | win::MB_ICONINFORMATION,
     );
-    p.help_open.store(false, Ordering::SeqCst);
+}
+
+/// A message box the popup has to survive.
+///
+/// The box takes the activation, and the popup hides itself the moment it loses it —
+/// which would take the box down with it. This flag is what keeps the popup up for as
+/// long as the box is; it is cleared as soon as the box closes, and the focus goes
+/// back to the search box, because by then the box has it.
+///
+/// Returns the button the user pressed.
+fn boxed(title: &str, text: &str, flags: u32) -> i32 {
+    let Some(p) = popup() else {
+        return win::message_box(title, text, flags);
+    };
+
+    p.modal_open.store(true, Ordering::SeqCst);
+    let answer = win::message_box(title, text, flags);
+    p.modal_open.store(false, Ordering::SeqCst);
 
     win::focus_window(p.hwnd);
     unsafe {
         win::SetFocus(p.search);
     }
+
+    answer
 }
 
 /// Places the two controls inside a client area of `width` x `height`. Shared by
@@ -731,9 +750,7 @@ fn toggle_pin() {
     };
 
     if let Some(position) = moved {
-        unsafe {
-            win::SendMessageW(p.list, win::LB_SETCURSEL, position, 0);
-        }
+        select_row(position);
     }
 }
 
@@ -808,13 +825,7 @@ fn copy_selected() {
         return;
     };
 
-    let items: Vec<ClipSummary> = {
-        let summaries = p.items.lock().unwrap_or_else(|e| e.into_inner());
-        selected_indices()
-            .into_iter()
-            .filter_map(|index| summaries.get(index).cloned())
-            .collect()
-    };
+    let items = selected_summaries();
 
     if items.is_empty() {
         return;
@@ -886,6 +897,232 @@ fn select_all() {
         win::SendMessageW(p.list, win::LB_SETSEL, 1, -1);
     }
     p.anchor.store(0, Ordering::SeqCst);
+}
+
+// -------------------------------------------------------------------- row menu
+
+/// The rows the user has selected, in list order. Cloned, because every caller then
+/// reloads the list out from under them.
+fn selected_summaries() -> Vec<ClipSummary> {
+    let Some(p) = popup() else {
+        return Vec::new();
+    };
+
+    let indices = selected_indices();
+    let items = p.items.lock().unwrap_or_else(|e| e.into_inner());
+    indices
+        .into_iter()
+        .filter_map(|index| items.get(index).cloned())
+        .collect()
+}
+
+/// Moves the caret to one row and makes that row the selection, clamped to what is
+/// left of it.
+///
+/// Used after a reload has moved the rows under the user — a pin, a delete — where
+/// `reload`'s own "caret back on the newest row" is not where they were looking.
+fn select_row(index: usize) {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    let count = {
+        let items = p.items.lock().unwrap_or_else(|e| e.into_inner());
+        items.len()
+    };
+    if count == 0 {
+        return;
+    }
+
+    let index = index.min(count - 1);
+    unsafe {
+        win::SendMessageW(p.list, win::LB_SETSEL, 0, -1);
+        win::SendMessageW(p.list, win::LB_SETSEL, 1, index as isize);
+        win::SendMessageW(p.list, win::LB_SETCURSEL, index, 0);
+    }
+
+    // The same anchor the arrows keep, so a later Shift+arrow extends from here.
+    p.anchor.store(index as isize, Ordering::SeqCst);
+}
+
+/// Deletes the selected rows, after asking: this is the only thing in the popup that
+/// destroys something, and there is nothing here to undo it with.
+///
+/// This machine's own rows go, and another instance's go once their month is over.
+/// What is left is another instance's month still being written, and that is said out
+/// loud rather than quietly skipped — a delete that does nothing reads as a broken
+/// delete.
+fn delete_selected_rows() {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    let items = selected_summaries();
+    if items.is_empty() {
+        return;
+    }
+
+    let count = items.len();
+    let stems: Vec<String> = items.into_iter().map(|item| item.stem).collect();
+    let caret = selected_index().unwrap_or(0);
+
+    let question = format!(
+        "删除选中的 {count} 条记录？\n\n\
+         同步目录里的记录会一起删掉，其他机器同步之后也会跟着消失，删了找不回来。"
+    );
+
+    if boxed("ClipPlus 删除", &question, win::MB_YESNO | win::MB_ICONWARNING) != win::IDYES {
+        return;
+    }
+
+    let (deleted, refused) = p.store.delete_selected(&stems);
+    log::info(&format!("{deleted} clip(s) deleted by hand, {refused} refused"));
+
+    reload();
+    select_row(caret);
+
+    if refused > 0 {
+        boxed(
+            "ClipPlus 删除",
+            &format!(
+                "{refused} 条没有删：它们属于别的机器，而那个月还没过完。\n\n\
+                 那个库现在正被对方写入，我们改它会把对方期间新采集的记录一起覆盖掉。\n\
+                 等这个月过去再删，或者到那台机器上删。"
+            ),
+            win::MB_OK | win::MB_ICONINFORMATION,
+        );
+    }
+
+    // Back to the list rather than the search box, which the box above leaves the
+    // focus in: the caret is on the row that took the deleted one's place, and deleting
+    // that one too is the likely next move.
+    unsafe {
+        win::SetFocus(p.list);
+    }
+}
+
+/// The row under a screen position, if there is one. The listbox answers this itself,
+/// in its own client coordinates — which is also how a point that is not over the list
+/// at all comes back flagged, so nothing here has to know the row height.
+fn row_at(p: &Popup, x: i32, y: i32) -> Option<usize> {
+    let (x, y) = win::screen_to_client(p.list, x, y);
+    let point = ((x as u16 as usize) | ((y as u16 as usize) << 16)) as LPARAM;
+    let answer = unsafe { win::SendMessageW(p.list, win::LB_ITEMFROMPOINT, 0, point) } as u32;
+
+    // The high word says the point was not over an item, and the index in the low word
+    // is then the nearest one rather than the one under the cursor.
+    if answer >> 16 != 0 {
+        return None;
+    }
+
+    let index = (answer & 0xFFFF) as usize;
+    let items = p.items.lock().unwrap_or_else(|e| e.into_inner());
+    items.get(index).map(|_| index)
+}
+
+/// The row menu, at the point the right-click happened.
+///
+/// Right-clicking a row that is not already selected selects it first, the way every
+/// list on Windows behaves: the menu then acts on what the user pointed at, or on the
+/// whole selection when they pointed at part of one.
+fn context_menu(x: i32, y: i32) {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    let Some(index) = row_at(p, x, y) else {
+        return;
+    };
+
+    if !selected_indices().contains(&index) {
+        select_row(index);
+    }
+
+    let pinned = {
+        let items = p.items.lock().unwrap_or_else(|e| e.into_inner());
+        items.get(index).is_some_and(|item| item.pinned)
+    };
+
+    unsafe {
+        let menu = win::CreatePopupMenu();
+        if menu == 0 {
+            log::warn("CreatePopupMenu failed");
+            return;
+        }
+
+        append(menu, win::MF_STRING, CMD_PASTE, "粘贴\tEnter");
+        append(menu, win::MF_STRING, CMD_COPY, "复制\tCtrl+C");
+        append(
+            menu,
+            win::MF_STRING,
+            CMD_PIN,
+            if pinned {
+                "取消固定\tCtrl+P"
+            } else {
+                "固定\tCtrl+P"
+            },
+        );
+        append(menu, win::MF_SEPARATOR, 0, "");
+        append(menu, win::MF_STRING, CMD_DELETE, "删除\tDel");
+        append(menu, win::MF_SEPARATOR, 0, "");
+        append(menu, win::MF_STRING, CMD_SELECT_ALL, "全选\tCtrl+A");
+
+        // The same two calls the tray menu needs: without the window as foreground the
+        // menu never notices a click away from it and stays on screen, and without the
+        // trailing `WM_NULL` that first click is swallowed by the menu coming down.
+        win::set_foreground(p.hwnd);
+
+        let chosen = win::TrackPopupMenu(
+            menu,
+            win::TPM_RIGHTBUTTON | win::TPM_RETURNCMD,
+            x,
+            y,
+            0,
+            p.hwnd,
+            std::ptr::null(),
+        );
+
+        win::DestroyMenu(menu);
+        win::post_message(p.hwnd, win::WM_NULL, 0, 0);
+
+        // `TPM_RETURNCMD`: the choice comes back here rather than as a `WM_COMMAND`,
+        // so there is no id table to keep in step with a message loop.
+        match chosen {
+            CMD_PASTE => commit(),
+            CMD_COPY => copy_selected(),
+            CMD_PIN => toggle_pin(),
+            CMD_DELETE => delete_selected_rows(),
+            CMD_SELECT_ALL => select_all(),
+            _ => {} // 0: dismissed without a choice
+        }
+    }
+}
+
+/// The row menu for a `WM_CONTEXTMENU`.
+///
+/// The coordinates are screen coordinates, and `(-1, -1)` is the keyboard invocation
+/// — the menu key or Shift+F10 — which has no pointer position to open a menu at.
+/// The caret row is what those keys act on anyway, so there is nothing to open.
+///
+/// The list's default handling forwards this message to the window that owns it, and
+/// the popup's own arm catches it there; which of the two it reaches is not worth
+/// depending on, so both call this.
+fn row_menu_at(lparam: LPARAM) {
+    let x = lparam as i16 as i32;
+    let y = (lparam >> 16) as i16 as i32;
+
+    if x == -1 && y == -1 {
+        return;
+    }
+
+    context_menu(x, y);
+}
+
+fn append(menu: win::HMENU, flags: u32, id: i32, label: &str) {
+    let text = win::wide(label);
+    unsafe {
+        win::AppendMenuW(menu, flags, id as usize, text.as_ptr());
+    }
 }
 
 // ------------------------------------------------------------------ window procs
@@ -1012,6 +1249,14 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             0
         }
 
+        // A right-click on a row opens the row menu there. The list forwards this
+        // message up by default; a point anywhere else in the popup has no row under
+        // it and the menu stays shut.
+        win::WM_CONTEXTMENU => {
+            row_menu_at(lparam);
+            0
+        }
+
         win::WM_LBUTTONDOWN => {
             // A tab click switches tabs; anywhere else on the popup's own
             // background starts a window drag. The search box and the list are
@@ -1030,7 +1275,7 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
         // play to translate the keys. The same combinations are handled here too, so
         // Esc and Enter do not depend on which half of the widget is focused.
         win::WM_KEYDOWN => {
-            if handle_key(wparam as i32) {
+            if handle_key(wparam as i32, false) {
                 0
             } else {
                 win::def_window_proc(hwnd, message, wparam, lparam)
@@ -1058,11 +1303,12 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
         }
 
         win::WM_ACTIVATE => {
-            // WA_INACTIVE == 0: the user clicked somewhere else. The help box is the
-            // one thing allowed to take the activation — hiding the popup under it would
-            // take the help with it — and the flag is cleared when it closes.
+            // WA_INACTIVE == 0: the user clicked somewhere else. The boxes this popup
+            // opens itself are the one thing allowed to take the activation — hiding the
+            // popup under one would take the box with it — and the flag is cleared when
+            // the box closes.
             let inactive = (wparam & 0xFFFF) == 0;
-            if inactive && !popup().is_some_and(|p| p.help_open.load(Ordering::SeqCst)) {
+            if inactive && !popup().is_some_and(|p| p.modal_open.load(Ordering::SeqCst)) {
                 hide();
             }
             0
@@ -1076,10 +1322,12 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
 /// and everything else is handed back to the control.
 /// Keys that mean the same thing whichever half of the widget has focus: the
 /// search box and the list are two halves of one thing, and the user should not
-/// have to know which one the focus is in.
+/// have to know which one the focus is in. Delete is the exception — `typing` says
+/// the keystroke is going into the query, where it deletes a character rather than
+/// a row.
 ///
 /// Returns true when the key was consumed.
-fn handle_key(key: i32) -> bool {
+fn handle_key(key: i32, typing: bool) -> bool {
     // VK_CONTROL is declared as u16 for SendInput; GetKeyState wants i32.
     let control_down = unsafe { win::GetKeyState(win::VK_CONTROL as i32) } < 0;
 
@@ -1090,6 +1338,7 @@ fn handle_key(key: i32) -> bool {
         win::VK_DOWN => move_selection(1),
         win::VK_PRIOR => move_selection(-8),
         win::VK_NEXT => move_selection(8),
+        win::VK_DELETE if !typing => delete_selected_rows(),
         win::VK_P if control_down => toggle_pin(),
         win::VK_C if control_down => copy_selected(),
         win::VK_TAB if control_down => {
@@ -1113,7 +1362,7 @@ extern "system" fn search_proc(
     _subclass_id: usize,
     _ref_data: usize,
 ) -> LRESULT {
-    if message == win::WM_KEYDOWN && handle_key(wparam as i32) {
+    if message == win::WM_KEYDOWN && handle_key(wparam as i32, true) {
         return 0;
     }
 
@@ -1151,6 +1400,15 @@ extern "system" fn list_proc(
         }
     }
 
+    // The right-click menu of a row. The list hands a `WM_CONTEXTMENU` up to the
+    // window that owns it by default and the popup's own arm would catch it there;
+    // catching it here first is what keeps a right-click on a row from also reaching
+    // the popup's background, where it would start a window drag.
+    if message == win::WM_CONTEXTMENU {
+        row_menu_at(lparam);
+        return 0;
+    }
+
     if message == win::WM_KEYDOWN {
         let key = wparam as i32;
         let control_down = unsafe { win::GetKeyState(win::VK_CONTROL as i32) } < 0;
@@ -1160,7 +1418,7 @@ extern "system" fn list_proc(
             return 0;
         }
 
-        if handle_key(key) {
+        if handle_key(key, false) {
             return 0;
         }
     }

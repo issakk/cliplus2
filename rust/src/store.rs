@@ -572,6 +572,66 @@ impl Store {
         ));
     }
 
+    // ------------------------------------------------------------------- deletion
+
+    /// Deletes the clips the user picked in the list, and reports how many were left
+    /// alone because another instance is still writing their month.
+    ///
+    /// This machine's own rows are always its own to delete. Another instance's are
+    /// deletable once their month is over, because a month that is over has no
+    /// writer: nothing ever writes a past bucket, so the file is only ever read and
+    /// a stray deletion there costs nothing — two machines deleting from one frozen
+    /// month can lose a deletion to the sync client's last-writer-wins, never a clip.
+    ///
+    /// A live month does have a writer, and it is not us. The whole layout rests on
+    /// one writer per file; a second one working from a snapshot that may be an hour
+    /// old would not undo a rival deletion, it would drop every clip that machine
+    /// captured since that snapshot was taken.
+    ///
+    /// Returns `(deleted, refused)`.
+    pub fn delete_selected(&self, stems: &[String]) -> (usize, usize) {
+        let month = settings::month_bucket(settings::now_ms());
+
+        let (doomed, refused) = {
+            let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            let mut doomed: Vec<ClipItem> = Vec::new();
+            let mut refused = 0;
+
+            for stem in stems {
+                match index.find(stem) {
+                    Some(item) if deletable(item, &self.settings.machine_id, &month) => {
+                        doomed.push(item.clone());
+                    }
+                    Some(_) => refused += 1,
+                    // Already gone: the file was reloaded since the popup was
+                    // drawn. Nothing to delete and nothing to complain about.
+                    None => {}
+                }
+            }
+
+            (doomed, refused)
+        };
+
+        if doomed.is_empty() {
+            return (0, refused);
+        }
+
+        delete_clips(&doomed);
+
+        {
+            let removed: HashSet<String> = doomed.iter().map(|item| item.stem.clone()).collect();
+            let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            index.forget_many(&removed);
+        }
+
+        log::info(&format!(
+            "deleted {} clip(s) by hand ({refused} refused)",
+            doomed.len()
+        ));
+
+        (doomed.len(), refused)
+    }
+
     // -------------------------------------------------------------------- watch
 
     pub fn on_path_changed(&self, path: &Path) {
@@ -809,6 +869,29 @@ fn delete_rows(db_path: &Path, stems: &[&str]) {
     }
 }
 
+/// Whether a row is ours to delete: this machine's own, or one sitting in a month
+/// that is over. Buckets are named `yyyy-MM`, so comparing two of them as strings is
+/// comparing them as dates — and a month that has not started yet belongs to that
+/// other machine just as much as the current one does.
+///
+/// A row whose database has no month folder to read is left alone rather than
+/// guessed at; the layout does not produce one.
+fn deletable(item: &ClipItem, local_machine: &str, current_month: &str) -> bool {
+    if item.machine == local_machine {
+        return true;
+    }
+
+    month_of(&item.db_path).is_some_and(|month| month.as_str() < current_month)
+}
+
+fn month_of(db_path: &Path) -> Option<String> {
+    db_path
+        .parent()?
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+}
+
 fn open_rw(path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
     let _ = conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS));
@@ -981,6 +1064,46 @@ mod tests {
         assert_eq!(left[0].stem, "stem-2");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting by hand is the second thing in the app that destroys history, and it
+    /// has to respect the line retention already respects — with one exception
+    /// retention does not have: another instance's *finished* months are dead files
+    /// nobody writes, so those are ours to clean up.
+    #[test]
+    fn only_a_finished_month_from_another_instance_is_deletable() {
+        let item = |machine: &str, path: &str| {
+            let mut row = record("stem-1", Some("hello"), None);
+            row.machine = machine.to_string();
+
+            ClipItem::from_record(
+                &row,
+                PathBuf::from(path),
+                "stem-1".to_string(),
+                false,
+                "local",
+                crate::settings::current_year(),
+            )
+        };
+
+        // Ours, whenever it is: we are the only writer of our own folders.
+        let mine = item("local", "C:/sync/local/2026-02/clips.db");
+        assert!(deletable(&mine, "local", "2026-02"));
+
+        // Another instance's month is over: dead on every machine, fair game.
+        let old = item("other", "C:/sync/other/2025-12/clips.db");
+        assert!(deletable(&old, "local", "2026-02"));
+
+        // Theirs is still open, and one that has not started yet is the same file a
+        // moment from now.
+        let open = item("other", "C:/sync/other/2026-02/clips.db");
+        assert!(!deletable(&open, "local", "2026-02"));
+        let next = item("other", "C:/sync/other/2026-03/clips.db");
+        assert!(!deletable(&next, "local", "2026-02"));
+
+        // No month folder to read: left alone rather than assumed deletable.
+        let flat = item("other", DB_NAME);
+        assert!(!deletable(&flat, "local", "2026-02"));
     }
 
     fn read_all(path: &Path) -> Vec<Row> {
