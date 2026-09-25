@@ -47,6 +47,10 @@ pub struct ClipSummary {
     pub preview: String,
     pub meta: String,
     pub pinned: bool,
+    /// Whether part of the payload lives in a `.bin`: the popup reads those in
+    /// the background rather than on the window thread, and this is how it
+    /// tells them apart from the instant inline ones.
+    pub has_blob: bool,
 }
 
 impl ClipItem {
@@ -105,6 +109,7 @@ impl ClipItem {
             preview: self.preview.clone(),
             meta: self.meta.clone(),
             pinned: self.pinned,
+            has_blob: self.has_blob,
         }
     }
 }
@@ -420,7 +425,16 @@ impl Index {
             .collect()
     }
 
-    /// Pinned rows first, then newest first. Two passes rather than a sort.
+    /// Pinned rows first, then newest first. One pass over the items rather than
+    /// a pinned pass followed by a rest pass: with a needle that matches little
+    /// or nothing the whole index is walked, and that walk happens on the popup's
+    /// window thread once per keystroke, so the constant factor is worth keeping
+    /// down.
+    ///
+    /// `rest` is capped at `limit` even though its final need (`limit` minus the
+    /// pinned count) is not known until the walk ends; the tail is cut below, and
+    /// the extra rows it may hold are exactly the ones a second pass would have
+    /// collected anyway, in the same order.
     ///
     /// `needle` is the search box, split into terms: every one of them has to match,
     /// and a term without a `field:` prefix reads the clip's own text.
@@ -431,31 +445,41 @@ impl Index {
         limit: usize,
     ) -> Vec<ClipSummary> {
         let terms = needle.map(parse_query).unwrap_or_default();
-        let mut out = Vec::with_capacity(limit.min(self.items.len()));
+        let mut pinned: Vec<ClipSummary> = Vec::new();
+        let mut rest: Vec<ClipSummary> = Vec::new();
 
-        for want_pinned in [true, false] {
-            for item in &self.items {
-                if self.hidden.contains(&item.stem) || item.pinned != want_pinned {
+        for item in &self.items {
+            // Tombstoned clips are not here for the user, whichever tab is open.
+            if self.hidden.contains(&item.stem) {
+                continue;
+            }
+
+            if let Some(want) = machine {
+                if item.machine != want {
                     continue;
                 }
+            }
 
-                if let Some(machine) = machine {
-                    if item.machine != machine {
-                        continue;
-                    }
-                }
+            // Empty terms match everything; skipping the call keeps the plain
+            // browse path free of a per-row round trip through the parser.
+            if !terms.is_empty() && !matches(item, &terms) {
+                continue;
+            }
 
-                if !matches(item, &terms) {
-                    continue;
+            if item.pinned {
+                pinned.push(item.summary());
+                // The pinned half is full and nothing unpinned can come before
+                // it: the answer is complete even though the walk is not.
+                if pinned.len() >= limit {
+                    return pinned;
                 }
-
-                out.push(item.summary());
-                if out.len() >= limit {
-                    return out;
-                }
+            } else if pinned.len() + rest.len() < limit {
+                rest.push(item.summary());
             }
         }
 
+        let mut out = pinned;
+        out.extend(rest.into_iter().take(limit.saturating_sub(out.len())));
         out
     }
 }

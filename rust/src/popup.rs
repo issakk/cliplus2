@@ -18,7 +18,7 @@
 //! big are remembered in `settings.json`, so the next open is the window the user
 //! last left behind.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -107,6 +107,16 @@ const HELP_TEXT: &str = "\
 
 不认识的词缀不算词缀——文本里写着 12:30 的照样搜得到。";
 
+/// Posted by a hydrating thread when the payload it was reading is ready. The
+/// result itself travels through `Popup::hydrated`; the message only wakes the
+/// window thread, which owns everything that happens next (write, hide, paste).
+/// `+ 2`, not `+ 1`: the tray's callback message has that, and staying
+/// distinct costs nothing even though the two go to different windows.
+const WM_APP_HYDRATED: u32 = win::WM_APP + 2;
+
+/// What a row shows in place of its preview while its payload is being read.
+const LOADING_HINT: &str = "正在加载完整内容 …";
+
 /// COLORREF is 0x00BBGGRR, not RGB.
 const COLOR_BG: u32 = 0x001E_1E1E;
 const COLOR_INPUT_BG: u32 = 0x002A_2A2A;
@@ -114,6 +124,28 @@ const COLOR_SELECTED: u32 = 0x0099_5A3C;
 const COLOR_TEXT: u32 = 0x00E6_E6E6;
 const COLOR_META: u32 = 0x008C_8C8C;
 const COLOR_PIN: u32 = 0x004A_A2D2;
+
+/// What a hydrating job was started for. Paste goes back into the window the
+/// popup took focus from; copy only fills the clipboard.
+#[derive(Clone, Copy, PartialEq)]
+enum HydrateAction {
+    Paste,
+    Copy,
+}
+
+/// A hydration job's result, carried from the worker thread to the window proc.
+struct Hydrated {
+    /// The job's generation. Anything that supersedes it — a newer paste or
+    /// copy, hiding the popup — bumps the counter, and a stale result is
+    /// dropped instead of acted on.
+    id: usize,
+    action: HydrateAction,
+    /// Stems the payload was built from, for the logs.
+    stems: Vec<String>,
+    /// `None` when nothing could be read; each action has its own way to
+    /// report that.
+    payload: Option<ClipPayload>,
+}
 
 struct Popup {
     hwnd: HWND,
@@ -139,6 +171,12 @@ struct Popup {
     /// the moment it loses the activation, and a box is the one thing allowed to take
     /// it — otherwise the box would take the popup down with it.
     modal_open: AtomicBool,
+    /// The current hydration generation, bumped by every new job and by every
+    /// close of the popup. See `Hydrated::id`.
+    generation: AtomicUsize,
+    /// Handshake from the hydrating thread to the window proc: the thread fills
+    /// it and posts `WM_APP_HYDRATED`, and the window side takes it from there.
+    hydrated: Mutex<Option<Hydrated>>,
     /// Scale factor x100, so a plain integer atomic can carry it.
     scale: AtomicIsize,
     font_main: AtomicIsize,
@@ -273,6 +311,8 @@ pub fn create(store: Arc<Store>) -> bool {
         target: AtomicIsize::new(0),
         visible: AtomicBool::new(false),
         modal_open: AtomicBool::new(false),
+        generation: AtomicUsize::new(0),
+        hydrated: Mutex::new(None),
         scale: AtomicIsize::new(100),
         font_main: AtomicIsize::new(0),
         font_meta: AtomicIsize::new(0),
@@ -421,6 +461,11 @@ pub fn hide() {
         win::ShowWindow(p.hwnd, win::SW_HIDE);
     }
     p.visible.store(false, Ordering::SeqCst);
+
+    // A hydration that has not finished yet was started for a popup the user can
+    // no longer see; Esc or a click elsewhere means it should never act. The
+    // generation check when its result arrives is what drops it.
+    p.generation.fetch_add(1, Ordering::SeqCst);
 }
 
 /// The `?` beside the search box: what the field prefixes are.
@@ -581,28 +626,24 @@ fn ensure_fonts(p: &'static Popup, scale: f64) {
     p.scale.store(key, Ordering::SeqCst);
 }
 
+/// Re-derives the tab strip and refills the list. Used where the set of
+/// instances may have changed — the popup opening, a tab switching — which is
+/// also where an O(index) machine walk is affordable.
 fn reload() {
     let Some(p) = popup() else {
         return;
     };
 
-    let filter = win::window_text(p.search);
+    let tabs = p.store.machines();
 
     // Derived from what is on disk, so a database that syncs in, or one that is
     // cleaned up, adds or removes a tab while the popup is open.
-    let tabs = p.store.machines();
-    let selected = {
+    {
         let mut current = p.tab.lock().unwrap_or_else(|e| e.into_inner());
         if !tabs.iter().any(|tab| tab.id == *current) {
             *current = None;
         }
-        current.clone()
-    };
-
-    // Bottom-up: the newest clip is the last row, the one next to the search box, so
-    // this is the reverse of the ranking order the index hands out.
-    let mut summaries = p.store.query(selected.as_deref(), &filter, MAX_RESULTS);
-    summaries.reverse();
+    }
 
     let strip_changed = {
         let mut drawn = p.tabs.lock().unwrap_or_else(|e| e.into_inner());
@@ -610,6 +651,37 @@ fn reload() {
         *drawn = tabs;
         changed
     };
+
+    fill_list();
+
+    if strip_changed {
+        unsafe {
+            win::InvalidateRect(p.hwnd, std::ptr::null(), 1);
+        }
+    }
+}
+
+/// Refills the list from the index. This is the per-keystroke path: search
+/// typing cannot change the set of instances, so the machine walk that reload
+/// also does stays out of it — with a large history it is the expensive half
+/// of a keystroke, and it runs on the window thread.
+fn fill_list() {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    let filter = win::window_text(p.search);
+    let selected = p.tab.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    // Bottom-up: the newest clip is the last row, the one next to the search box, so
+    // this is the reverse of the ranking order the index hands out.
+    let mut summaries = p.store.query(selected.as_deref(), &filter, MAX_RESULTS);
+    summaries.reverse();
+
+    // Stored before the list is refilled, so a row drawn from `p.items` is
+    // never out of step with the string the list box kept.
+    *p.items.lock().unwrap_or_else(|e| e.into_inner()) = summaries.clone();
+
     unsafe {
         win::SendMessageW(p.list, win::LB_RESETCONTENT, 0, 0);
 
@@ -631,14 +703,6 @@ fn reload() {
         }
 
         win::InvalidateRect(p.list, std::ptr::null(), 1);
-
-        if strip_changed {
-            win::InvalidateRect(p.hwnd, std::ptr::null(), 1);
-        }
-    }
-
-    {
-        *p.items.lock().unwrap_or_else(|e| e.into_inner()) = summaries;
     }
 
     // The list is only as tall as the rows it has, so the new count has to reach
@@ -701,24 +765,57 @@ fn commit() {
         return;
     };
 
+    let Some(index) = selected_index() else {
+        return;
+    };
+
     let Some(stem) = selected_stem() else {
         return;
     };
 
-    let target = p.target.load(Ordering::SeqCst);
+    // An inline payload is a memory read; the background detour would only add
+    // latency and a flicker of hint text. A blob can be a OneDrive placeholder
+    // whose read downloads over the network, and that must never happen on the
+    // window thread — the whole popup would sit frozen, not even able to hide.
+    let has_blob = {
+        let items = p.items.lock().unwrap_or_else(|e| e.into_inner());
+        items
+            .get(index)
+            .map(|summary| summary.has_blob)
+            .unwrap_or(false)
+    };
 
-    let Some(payload) = p.store.read_payload(&stem) else {
-        log::warn(&format!("nothing pasteable for {stem}"));
-        hide();
+    if !has_blob {
+        let Some(payload) = p.store.read_payload(&stem) else {
+            log::warn(&format!("nothing pasteable for {stem}"));
+            hide();
+            return;
+        };
+
+        paste_back(&payload);
+        return;
+    }
+
+    hydrate(HydrateAction::Paste, &[index], vec![stem]);
+}
+
+/// Writes `payload` to the clipboard and pastes it into the window the popup
+/// took focus from. Runs on the window thread: the keystroke has to land while
+/// the target is in front, and everything after the clipboard write is a few
+/// hundred milliseconds at the most.
+fn paste_back(payload: &ClipPayload) {
+    let Some(p) = popup() else {
         return;
     };
 
     hide();
 
-    if !clipboard::write(&payload) {
+    if !clipboard::write(payload) {
         log::warn("clipboard write failed; not injecting a keystroke");
         return;
     }
+
+    let target = p.target.load(Ordering::SeqCst);
 
     let started = Instant::now();
     if target != 0 {
@@ -746,6 +843,103 @@ fn commit() {
     ));
 }
 
+/// Starts reading `stems` on a worker thread and marks their rows with a
+/// loading hint while it runs. The result comes back as `WM_APP_HYDRATED`;
+/// Esc, a click elsewhere or a newer request all bump the generation, and a
+/// result that arrives stale is dropped without acting.
+fn hydrate(action: HydrateAction, rows: &[usize], stems: Vec<String>) {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    if stems.is_empty() {
+        return;
+    }
+
+    let id = p.generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+    {
+        let mut items = p.items.lock().unwrap_or_else(|e| e.into_inner());
+        for row in rows {
+            if let Some(summary) = items.get_mut(*row) {
+                summary.preview = LOADING_HINT.to_string();
+            }
+        }
+    }
+
+    unsafe {
+        win::InvalidateRect(p.list, std::ptr::null(), 1);
+    }
+
+    let store = Arc::clone(&p.store);
+    let hwnd = p.hwnd;
+    std::thread::spawn(move || {
+        let payload = match action {
+            HydrateAction::Paste => store.read_payload(&stems[0]),
+            HydrateAction::Copy => joined_payload(&store, &stems),
+        };
+
+        {
+            let mut slot = p.hydrated.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(Hydrated {
+                id,
+                action,
+                stems,
+                payload,
+            });
+        }
+
+        win::post_message(hwnd, WM_APP_HYDRATED, 0, 0);
+    });
+}
+
+/// The result a hydrating thread posted back. The popup may have moved on —
+/// hidden, re-filtered, another request started — and the generation check is
+/// what keeps a stale result from pasting into a window the user never aimed at.
+fn finish_hydrated() {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    let done = p.hydrated.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some(done) = done else {
+        return;
+    };
+
+    if p.generation.load(Ordering::SeqCst) != done.id {
+        log::info("a superseded hydration finished; dropped");
+        return;
+    }
+
+    match done.action {
+        HydrateAction::Paste => match done.payload {
+            Some(payload) => paste_back(&payload),
+            None => {
+                log::warn(&format!("nothing pasteable for {}", done.stems.join(", ")));
+                hide();
+            }
+        },
+        HydrateAction::Copy => match done.payload {
+            Some(payload) => {
+                if clipboard::write(&payload) {
+                    log::info(&format!(
+                        "copied {} clip(s) from the history list",
+                        done.stems.len()
+                    ));
+                    hide();
+                } else {
+                    log::warn("clipboard write failed; keeping the popup open");
+                    fill_list();
+                }
+            }
+            None => {
+                // Already logged inside the worker; refill so the loading hints go.
+                fill_list();
+            }
+        },
+    }
+}
+
 fn toggle_pin() {
     let Some(p) = popup() else {
         return;
@@ -767,8 +961,10 @@ fn toggle_pin() {
         return;
     }
 
-    // Pinning moves the row to the top, so follow the item rather than the index.
-    reload();
+    // Pinning moves the row to the top, so follow the item rather than the
+    // index. The strip cannot have changed — pinning is not capturing — so the
+    // list alone is refilled.
+    fill_list();
 
     let moved = {
         let items = p.items.lock().unwrap_or_else(|e| e.into_inner());
@@ -851,17 +1047,59 @@ fn copy_selected() {
         return;
     };
 
-    let items = selected_summaries();
+    // (index, summary) pairs: the index is what marks the right rows with the
+    // loading hint, which selected_summaries alone cannot say.
+    let selected: Vec<(usize, ClipSummary)> = {
+        let summaries = p.items.lock().unwrap_or_else(|e| e.into_inner());
+        selected_indices()
+            .into_iter()
+            .filter_map(|index| summaries.get(index).map(|summary| (index, summary.clone())))
+            .collect()
+    };
 
-    if items.is_empty() {
+    if selected.is_empty() {
         return;
     }
 
-    let mut payloads = Vec::with_capacity(items.len());
-    for item in &items {
-        match p.store.read_payload(&item.stem) {
+    let stems: Vec<String> = selected
+        .iter()
+        .map(|(_, summary)| summary.stem.clone())
+        .collect();
+
+    // Same split as `commit`: inline payloads copy right here, blob-bearing
+    // ones go through the worker so a placeholder read cannot freeze the popup.
+    if selected.iter().any(|(_, summary)| summary.has_blob) {
+        let rows: Vec<usize> = selected.iter().map(|(index, _)| *index).collect();
+        hydrate(HydrateAction::Copy, &rows, stems);
+        return;
+    }
+
+    let Some(payload) = joined_payload(&p.store, &stems) else {
+        return; // logged inside
+    };
+
+    if !clipboard::write(&payload) {
+        log::warn("clipboard write failed; keeping the popup open");
+        return;
+    }
+
+    log::info(&format!(
+        "copied {} clip(s) from the history list",
+        selected.len()
+    ));
+    hide();
+}
+
+/// Reads every stem, joins what came back and hands it over. Used on the
+/// window thread for inline-only selections and inside the hydrating thread
+/// for blob-bearing ones — the reads are the part that can block, which is
+/// why the thread exists at all.
+fn joined_payload(store: &Store, stems: &[String]) -> Option<ClipPayload> {
+    let mut payloads = Vec::with_capacity(stems.len());
+    for stem in stems {
+        match store.read_payload(stem) {
             Some(payload) => payloads.push(payload),
-            None => log::warn(&format!("nothing copyable for {}", item.stem)),
+            None => log::warn(&format!("nothing copyable for {stem}")),
         }
     }
 
@@ -874,18 +1112,11 @@ fn copy_selected() {
         log::warn(&format!("{images} image(s) left out of a multi-clip copy"));
     }
 
-    let Some(payload) = clip::join_payloads(payloads) else {
+    let joined = clip::join_payloads(payloads);
+    if joined.is_none() {
         log::warn("nothing copyable in that selection");
-        return;
-    };
-
-    if !clipboard::write(&payload) {
-        log::warn("clipboard write failed; keeping the popup open");
-        return;
     }
-
-    log::info(&format!("copied {} clip(s) from the history list", items.len()));
-    hide();
+    joined
 }
 
 /// The rows the user has selected, in list order. A multiple-selection list box
@@ -1312,7 +1543,7 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             if id == ID_HELP && notification == win::STN_CLICKED {
                 show_help();
             } else if notification == win::EN_CHANGE {
-                reload();
+                fill_list();
             } else if notification == win::LBN_DBLCLK {
                 commit();
             } else if notification == win::LBN_SELCHANGE {
@@ -1322,6 +1553,15 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                     p.anchor.store(index as isize, Ordering::SeqCst);
                 }
             }
+            0
+        }
+
+        // A hydrating thread finished reading its payload. Everything the
+        // result does — clipboard, hide, paste-back — belongs to the window
+        // thread, which is why it came back as a message instead of being
+        // done where the read landed.
+        win::WM_APP_HYDRATED => {
+            finish_hydrated();
             0
         }
 
@@ -1687,7 +1927,7 @@ fn set_tab(id: Option<String>) {
     };
 
     *p.tab.lock().unwrap_or_else(|e| e.into_inner()) = id;
-    reload();
+    fill_list();
 
     // The strip itself has to be repainted too: the set of tabs did not
     // change, only which one is lit.
