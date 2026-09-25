@@ -131,6 +131,12 @@ pub const TPM_RETURNCMD: u32 = 0x0100;
 
 /// MAKEINTRESOURCE(IDI_APPLICATION), the generic application icon.
 pub const IMI_APPLICATION: u16 = 32512;
+
+/// GetSystemMetrics indexes for the sizes the shell draws icons at. The tray
+/// and the small title-bar slot share `SM_CXSMICON`; the taskbar and Alt-Tab
+/// use `SM_CXICON`.
+pub const SM_CXICON: i32 = 11;
+pub const SM_CXSMICON: i32 = 49;
 pub const SW_SHOWNORMAL: i32 = 1;
 
 // --- registry ---
@@ -543,6 +549,7 @@ extern "system" {
         prcRect: *const RECT,
     ) -> i32;
     pub fn LoadIconW(hInstance: HINSTANCE, lpIconName: PCWSTR) -> HICON;
+    pub fn GetSystemMetrics(nIndex: i32) -> i32;
     pub fn GetModuleFileNameW(hModule: HINSTANCE, lpFilename: *mut u16, nSize: u32) -> u32;
     pub fn CreateIconFromResourceEx(
         presbits: *const u8,
@@ -946,6 +953,109 @@ pub fn enable_window(hwnd: HWND, enabled: bool) {
     }
 }
 
+// ------------------------------------------------------------------ app icon
+
+/// The icon file itself, compiled into the exe. The tray and both window
+/// classes read it from here, so the icon shows even when no resource was
+/// linked in (the build script's resource is what Explorer and the taskbar
+/// shortcuts display; this is what the running process displays).
+const APP_ICON: &[u8] = include_bytes!("../../assets/clipplus.ico");
+
+/// An HICON at `size` device pixels out of the embedded .ico.
+///
+/// The directory is scanned for the entry closest to the request and Windows
+/// resamples that one image; the file carries every size the shell asks for,
+/// so the nearest entry is normally an exact match and nothing is resampled
+/// at all. That beats handing the tray the largest entry and letting it be
+/// scaled down, which turned the 256-pixel image into mush at 16.
+///
+/// Any problem falls back to the stock application icon: a generic icon is
+/// far better than no icon, because the tray icon is the only way to quit.
+pub fn app_icon(size: u32) -> HICON {
+    unsafe fn fallback() -> HICON {
+        LoadIconW(0, IMI_APPLICATION as usize as *const u16)
+    }
+
+    // ICONDIR: reserved(2) type(2) count(2), then 16 bytes per entry — width,
+    // height, colours, reserved, planes, bits, byte length, data offset. A
+    // zero side in the directory means 256.
+    if APP_ICON.len() < 6 || u16::from_le_bytes([APP_ICON[2], APP_ICON[3]]) != 1 {
+        crate::log::warn("embedded icon is not an icon file; using the system one");
+        return unsafe { fallback() };
+    }
+
+    let count = u16::from_le_bytes([APP_ICON[4], APP_ICON[5]]) as usize;
+    let mut best: Option<(u32, usize, usize)> = None; // (distance, offset, bytes)
+
+    for index in 0..count {
+        let base = 6 + index * 16;
+        if APP_ICON.len() < base + 16 {
+            break;
+        }
+
+        let side = APP_ICON[base].max(1) as u32;
+        let bytes = u32::from_le_bytes([
+            APP_ICON[base + 8],
+            APP_ICON[base + 9],
+            APP_ICON[base + 10],
+            APP_ICON[base + 11],
+        ]) as usize;
+        let offset = u32::from_le_bytes([
+            APP_ICON[base + 12],
+            APP_ICON[base + 13],
+            APP_ICON[base + 14],
+            APP_ICON[base + 15],
+        ]) as usize;
+
+        if offset + bytes > APP_ICON.len() {
+            continue;
+        }
+
+        let distance = side.abs_diff(size);
+        if best.map(|(seen, _, _)| distance < seen).unwrap_or(true) {
+            best = Some((distance, offset, bytes));
+        }
+    }
+
+    let Some((_, offset, bytes)) = best else {
+        crate::log::warn("embedded icon has no usable image; using the system one");
+        return unsafe { fallback() };
+    };
+
+    let handle = unsafe {
+        CreateIconFromResourceEx(
+            APP_ICON[offset..].as_ptr(),
+            bytes as u32,
+            1,           // fIcon
+            0x0003_0000, // version 3.0
+            size as i32,
+            size as i32,
+            0,
+        )
+    };
+
+    if handle == 0 {
+        crate::log::warn(&format!(
+            "CreateIconFromResourceEx failed, err {}; using the system icon",
+            last_error()
+        ));
+        return unsafe { fallback() };
+    }
+
+    handle
+}
+
+/// The size the shell draws small icons at, in device pixels — the tray slot
+/// and the title bar both use it, and it already carries the monitor's DPI.
+pub fn small_icon_size() -> u32 {
+    unsafe { GetSystemMetrics(SM_CXSMICON) as u32 }
+}
+
+/// The large icon size: taskbar and Alt-Tab.
+fn large_icon_size() -> u32 {
+    unsafe { GetSystemMetrics(SM_CXICON) as u32 }
+}
+
 /// Starts moving a window that has no title bar, the way a caption drag would:
 /// called from a `WM_LBUTTONDOWN` that landed on the window's own background.
 /// Windows then runs its move loop, so snapping, multi-monitor handling and Esc
@@ -1114,6 +1224,11 @@ fn create_window_wide(
             cb_size: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfn_wnd_proc: Some(proc),
             h_instance: instance,
+            // Every top-level window of ours shows in the title bar and, for
+            // the settings and cleanup windows, the taskbar; without these
+            // the shell draws the generic application icon there.
+            h_icon: app_icon(large_icon_size()),
+            h_icon_sm: app_icon(small_icon_size()),
             hbr_background: background,
             lpsz_class_name: class_name.as_ptr(),
             ..Default::default()

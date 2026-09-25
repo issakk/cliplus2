@@ -56,7 +56,13 @@ const SUFFIX_ID_BASE: usize = 100;
 const DEFAULT_DAYS: u32 = 30;
 const DEFAULT_KEEP: u32 = 100;
 
-const WINDOW_STYLE: u32 = win::WS_CAPTION | win::WS_SYSMENU | win::WS_CLIPCHILDREN;
+/// No `WS_CLIPCHILDREN`, unlike the settings window: the group boxes are
+/// BUTTON-class controls that draw only their frame and caption, and never
+/// fill their own interior. With clipping on, the parent's background pass
+/// skips their rectangles too, so the inside of every group would stay
+/// whatever the surface was initialised to — the white blocks. Without it the
+/// parent's `COLOR_BTNFACE` erase shows through, exactly like a dialog.
+const WINDOW_STYLE: u32 = win::WS_CAPTION | win::WS_SYSMENU;
 
 const MARGIN: i32 = 16;
 const CONTENT_WIDTH: i32 = 560;

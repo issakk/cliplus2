@@ -22,6 +22,13 @@ notify = "8"
 # depend on a sqlite3.dll the user would have to have.
 rusqlite = { version = "0.40", features = ["bundled"] }
 
+# The icon resource needs the platform resource compiler; this crate shells out
+# to rc.exe, which ships with the MSVC toolchain the build already requires.
+# See build.rs — the running process does not read the resource, only the exe's
+# file icon in Explorer comes from it.
+[build-dependencies]
+winresource = "0.1"
+
 [profile.release]
 opt-level = 3
 lto = true
