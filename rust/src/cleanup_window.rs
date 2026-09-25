@@ -853,7 +853,7 @@ extern "system" fn window_proc(
 
             // The window was closed while the scan ran: the numbers are of no
             // use to anybody now, and the next `show` resets the buttons.
-            if win::IsWindowVisible(hwnd) == 0 {
+            if unsafe { win::IsWindowVisible(hwnd) } == 0 {
                 set_busy(false);
                 release_in_flight();
                 return 0;
@@ -866,7 +866,7 @@ extern "system" fn window_proc(
         WM_DUPES_SCANNED => {
             let scan = unsafe { Box::from_raw(lparam as *mut DupeScan) };
 
-            if win::IsWindowVisible(hwnd) == 0 {
+            if unsafe { win::IsWindowVisible(hwnd) } == 0 {
                 set_busy(false);
                 release_in_flight();
                 return 0;
