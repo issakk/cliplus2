@@ -60,13 +60,11 @@ CREATE TABLE IF NOT EXISTS clips (
     title   TEXT
 )";
 
-
 /// `OR IGNORE`: the stem is the primary key, so a capture that is already stored
 /// is a no-op instead of an error.
 const INSERT_ROW: &str = "
 INSERT OR IGNORE INTO clips (stem, at, machine, kind, hash, text, length, blob, app, title)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
-
 
 const SELECT_ROWS: &str = "
 SELECT stem, at, machine, kind, hash, text, length, blob, app, title FROM clips";
@@ -327,7 +325,10 @@ impl Store {
                 id.clone()
             };
 
-            tabs.push(MachineTab { id: Some(id), label });
+            tabs.push(MachineTab {
+                id: Some(id),
+                label,
+            });
         }
 
         tabs
@@ -457,9 +458,7 @@ impl Store {
         let now_year = crate::settings::current_year();
         for row in rows {
             let row = row.map_err(|err| err.to_string())?;
-            let pinned = folder
-                .join(format!("{}{PIN_SUFFIX}", row.stem))
-                .exists();
+            let pinned = folder.join(format!("{}{PIN_SUFFIX}", row.stem)).exists();
 
             let record = ClipRecord {
                 id: row.stem.clone(),
@@ -739,7 +738,10 @@ impl Store {
         delete_clips(&doomed);
         self.forget_deleted(&doomed);
 
-        log::info(&format!("reaped {} tombstoned clip(s) of our own", doomed.len()));
+        log::info(&format!(
+            "reaped {} tombstoned clip(s) of our own",
+            doomed.len()
+        ));
     }
 
     // -------------------------------------------------------------- cleanup tools
@@ -769,10 +771,7 @@ impl Store {
                     heavy
                 } else {
                     let cutoff = now - (days as i64) * 86_400_000;
-                    heavy
-                        .into_iter()
-                        .filter(|item| item.at < cutoff)
-                        .collect()
+                    heavy.into_iter().filter(|item| item.at < cutoff).collect()
                 }
             }
             BinScope::KeepNewest(keep) => heavy.into_iter().skip(keep as usize).collect(),
@@ -827,7 +826,10 @@ impl Store {
         delete_clips(&doomed);
         self.forget_deleted(&doomed);
 
-        log::info(&format!("bin cleanup removed {} heavy clip(s)", doomed.len()));
+        log::info(&format!(
+            "bin cleanup removed {} heavy clip(s)",
+            doomed.len()
+        ));
         doomed.len()
     }
 
@@ -1039,7 +1041,6 @@ impl Store {
     }
 }
 
-
 /// One row, straight out of the database.
 struct Row {
     stem: String,
@@ -1103,7 +1104,6 @@ fn insert_row(db_path: &Path, record: &ClipRecord) -> Result<(), String> {
         ],
     )
     .map_err(|err| format!("insert into {}: {err}", db_path.display()))?;
-
 
     Ok(())
 }
@@ -1355,7 +1355,10 @@ mod tests {
         assert!(!needs_blob(&text(4), &settings));
         assert!(needs_blob(&text(5), &settings));
         assert!(needs_blob(&ClipPayload::Image(vec![1]), &settings));
-        assert!(!needs_blob(&ClipPayload::Files(vec!["a".to_string()]), &settings));
+        assert!(!needs_blob(
+            &ClipPayload::Files(vec!["a".to_string()]),
+            &settings
+        ));
     }
 
     /// A clip now lives only in the database, so the two things that would
@@ -1446,7 +1449,6 @@ mod tests {
             .collect();
         rows
     }
-
 
     /// The source window is two columns on the row itself, so the round trip is
     /// where a mix-up would show: written when it is known, empty when it is not.
@@ -1584,12 +1586,23 @@ mod tests {
         let (store, dir) = cleanup_store("binscan");
 
         // Inline text: no blob, so no scope ever reaches it.
-        plant(&dir, "mach1", &clip_row("s1", now - 2 * DAY, "mach1", "text", "h1", None));
+        plant(
+            &dir,
+            "mach1",
+            &clip_row("s1", now - 2 * DAY, "mach1", "text", "h1", None),
+        );
         // An old heavy clip, pinned: the pin is the promise that keeps it.
         let pinned = plant(
             &dir,
             "mach1",
-            &clip_row("s3", now - 40 * DAY - 3_600_000, "mach1", "image", "h3", Some("s3.bin")),
+            &clip_row(
+                "s3",
+                now - 40 * DAY - 3_600_000,
+                "mach1",
+                "image",
+                "h3",
+                Some("s3.bin"),
+            ),
         );
         fs::write(pinned.with_file_name("s3.pin"), []).unwrap();
         let old_text = plant(
@@ -1600,10 +1613,21 @@ mod tests {
         let old_image = plant(
             &dir,
             "mach1",
-            &clip_row("s5", now - 40 * DAY - 2 * 3_600_000, "mach1", "image", "h5", Some("s5.bin")),
+            &clip_row(
+                "s5",
+                now - 40 * DAY - 2 * 3_600_000,
+                "mach1",
+                "image",
+                "h5",
+                Some("s5.bin"),
+            ),
         );
         // A fresh heavy clip: too young for the time scope, in the kept half of the count one.
-        plant(&dir, "mach1", &clip_row("s4", now - DAY, "mach1", "image", "h4", Some("s4.bin")));
+        plant(
+            &dir,
+            "mach1",
+            &clip_row("s4", now - DAY, "mach1", "image", "h4", Some("s4.bin")),
+        );
         // Another instance's live month: in range for "everything", but not ours
         // to write. The folder is named by hand so the test cannot flip over at
         // a month boundary the way an at-derived one would in the month's first
@@ -1615,7 +1639,14 @@ mod tests {
         fs::create_dir_all(&other_live).unwrap();
         insert_row(
             &other_live.join(DB_NAME),
-            &clip_row("o1", now - 2 * 3_600_000, "other", "image", "h6", Some("o1.bin")),
+            &clip_row(
+                "o1",
+                now - 2 * 3_600_000,
+                "other",
+                "image",
+                "h6",
+                Some("o1.bin"),
+            ),
         )
         .unwrap();
         fs::write(other_live.join("o1.bin"), b"blob-bytes").unwrap();
@@ -1655,7 +1686,20 @@ mod tests {
         let removed = store.run_bin_cleanup(by_time.doomed);
         assert_eq!(removed, 2);
 
-        assert_eq!(read_all(&old_text).len(), 0);
+        // The doomed rows are physically gone from their month databases —
+        // which the pinned s3 may share with them (three 40-day-old clips can
+        // land in one month or straddle two, so the row count is whatever it
+        // is); what must hold is that the doomed stems are out.
+        let left_of_text: Vec<String> = read_all(&old_text)
+            .into_iter()
+            .map(|row| row.stem)
+            .collect();
+        assert!(!left_of_text.contains(&"s2".to_string()));
+        let left_of_image: Vec<String> = read_all(&old_image)
+            .into_iter()
+            .map(|row| row.stem)
+            .collect();
+        assert!(!left_of_image.contains(&"s5".to_string()));
         assert!(!old_text.with_file_name("s2.bin").exists());
         assert!(!old_image.with_file_name("s5.bin").exists());
         // The pinned clip and everything out of scope are still listed; the
