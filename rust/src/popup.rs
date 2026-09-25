@@ -1560,7 +1560,7 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
         // result does — clipboard, hide, paste-back — belongs to the window
         // thread, which is why it came back as a message instead of being
         // done where the read landed.
-        win::WM_APP_HYDRATED => {
+        WM_APP_HYDRATED => {
             finish_hydrated();
             0
         }
