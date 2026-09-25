@@ -425,6 +425,22 @@ impl Index {
             .collect()
     }
 
+    /// Every clip that is not tombstoned, in index order (newest first), for the
+    /// cleanup scans. A snapshot rather than a borrow: the scans stat blob files
+    /// afterwards and must not hold the index lock across that disk I/O — the
+    /// capture path needs that lock on every copy.
+    ///
+    /// Tombstoned rows are excluded: they are on their way out already, and
+    /// counting them would promise a cleanup of rows the reaper is about to take
+    /// anyway.
+    pub fn visible_items(&self) -> Vec<ClipItem> {
+        self.items
+            .iter()
+            .filter(|item| !self.hidden.contains(&item.stem))
+            .cloned()
+            .collect()
+    }
+
     /// Pinned rows first, then newest first. One pass over the items rather than
     /// a pinned pass followed by a rest pass: with a needle that matches little
     /// or nothing the whole index is walked, and that walk happens on the popup's

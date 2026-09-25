@@ -48,6 +48,9 @@ const ID_SAVE: usize = 10;
 const ID_CANCEL: usize = 11;
 const ID_SETTINGS_SCALE: usize = 12;
 const ID_WRITE_BLOBS: usize = 13;
+/// Opens the cleanup window; the tools there are actions, not settings, so the
+/// button only shows the window and saves nothing.
+const ID_CLEANUP: usize = 14;
 
 /// The rows, top to bottom: the control id and the caption beside it.
 ///
@@ -238,6 +241,17 @@ pub fn create() -> bool {
         BUTTON_WIDTH,
         BUTTON_HEIGHT,
     );
+    win::create_child_id(
+        "BUTTON",
+        "清理…",
+        button_style,
+        hwnd,
+        ID_CLEANUP,
+        MARGIN + (BUTTON_WIDTH + BUTTON_GAP) * 2,
+        button_y,
+        BUTTON_WIDTH,
+        BUTTON_HEIGHT,
+    );
 
     // The hotkey field records combinations instead of accepting text, which
     // means it has to see the keystrokes before the EDIT turns them into
@@ -339,6 +353,13 @@ fn layout(hwnd: HWND, scale: f64) {
     place(
         ID_CANCEL,
         margin + button_width + win::scaled(BUTTON_GAP, scale),
+        button_y,
+        button_width,
+        button_height,
+    );
+    place(
+        ID_CLEANUP,
+        margin + (button_width + win::scaled(BUTTON_GAP, scale)) * 2,
         button_y,
         button_width,
         button_height,
@@ -708,9 +729,10 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
 
             // Keep the default push-button behaviour for Enter.
             if notification == win::BN_CLICKED || notification == 0 {
-                match id {
+                match id as usize {
                     ID_SAVE => save(),
                     ID_CANCEL => hide(),
+                    ID_CLEANUP => crate::cleanup_window::show(),
                     _ => {}
                 }
             }

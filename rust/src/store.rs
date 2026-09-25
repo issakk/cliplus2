@@ -88,6 +88,54 @@ pub struct MachineTab {
     pub label: String,
 }
 
+/// Which heavy clips the `.bin` cleanup targets. "Heavy" means the payload has a
+/// `.bin` sibling — every image and every text over the inline limit — which is
+/// where the disk space actually goes. Short text and file lists never have
+/// one, so a cleanup can never touch them.
+///
+/// Both scopes treat `0` as "everything".
+#[derive(Clone, Copy, Debug)]
+pub enum BinScope {
+    /// Heavy clips captured before the last N days.
+    OlderThanDays(u32),
+    /// The N newest heavy clips stay; everything older goes.
+    KeepNewest(u32),
+}
+
+/// What a `.bin` scan found. `doomed` holds only rows this machine may delete,
+/// newest first; the skipped ones are counted, not listed.
+pub struct BinScan {
+    pub doomed: Vec<ClipItem>,
+    /// In range, but sitting in another instance's live month. A bulk cleanup
+    /// does not reach into a folder another machine is writing, so these are
+    /// left for their owner.
+    pub skipped_live_month: usize,
+    pub images: usize,
+    pub overlong_texts: usize,
+    /// The `.bin` bytes still on disk that deleting `doomed` would free.
+    pub blob_bytes: u64,
+}
+
+/// What a duplicate scan found. Only the copies that would go are listed; the
+/// kept ones are counted.
+pub struct DupeScan {
+    /// Older copies of texts that exist more than once, newest first.
+    pub doomed: Vec<ClipItem>,
+    /// Distinct texts that had more than one copy.
+    pub groups: usize,
+    /// Groups in which a pinned copy exists — those groups keep their pin
+    /// beside the newest, so a cleanup can leave two copies of one text.
+    pub groups_with_pin: usize,
+}
+
+/// A `.bin` scan together with the words its scope was asked under, so the
+/// confirm dialog repeats what the user chose even if the radios moved while
+/// the background scan ran.
+pub struct BinPreview {
+    pub scan: BinScan,
+    pub scope_line: String,
+}
+
 pub struct Store {
     settings: Settings,
     index: Mutex<Index>,
@@ -571,12 +619,7 @@ impl Store {
         }
 
         delete_clips(&doomed);
-
-        {
-            let stems: HashSet<String> = doomed.iter().map(|item| item.stem.clone()).collect();
-            let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
-            index.forget_many(&stems);
-        }
+        self.forget_deleted(&doomed);
 
         log::info(&format!(
             "retention removed {} clip(s) older than {days} day(s)",
@@ -624,12 +667,24 @@ impl Store {
             (doomed, marked)
         };
 
+        let (deleted, hidden) = self.remove_clips(doomed, marked);
+
+        log::info(&format!(
+            "deleted {} clip(s) by hand, tombstoned {}",
+            deleted, hidden
+        ));
+
+        (deleted, hidden)
+    }
+
+    /// The second half of every deletion, once the rows are resolved: rows this
+    /// machine may write go out at once, the rest get a tombstone — which every
+    /// machine reads as gone and the owner carries out on its next rescan.
+    /// Reports `(deleted, marked)`.
+    fn remove_clips(&self, doomed: Vec<ClipItem>, marked: Vec<ClipItem>) -> (usize, usize) {
         if !doomed.is_empty() {
             delete_clips(&doomed);
-
-            let removed: HashSet<String> = doomed.iter().map(|item| item.stem.clone()).collect();
-            let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
-            index.forget_many(&removed);
+            self.forget_deleted(&doomed);
         }
 
         // Only the ones whose marker actually landed: a row left on this list with no
@@ -647,13 +702,18 @@ impl Store {
             index.hide_many(&hidden);
         }
 
-        log::info(&format!(
-            "deleted {} clip(s) by hand, tombstoned {}",
-            doomed.len(),
-            hidden.len()
-        ));
-
         (doomed.len(), hidden.len())
+    }
+
+    /// Drops a batch from the index after `delete_clips` took the rows out. The
+    /// hash set is maintained by `forget_many`, so the same content copied again
+    /// is stored again instead of vanishing into an "already stored" no-op.
+    fn forget_deleted(&self, items: &[ClipItem]) {
+        let stems: HashSet<String> = items.iter().map(|item| item.stem.clone()).collect();
+        self.index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .forget_many(&stems);
     }
 
     /// Carries out the tombstones another instance left in our folders.
@@ -677,14 +737,183 @@ impl Store {
         }
 
         delete_clips(&doomed);
-
-        {
-            let removed: HashSet<String> = doomed.iter().map(|item| item.stem.clone()).collect();
-            let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
-            index.forget_many(&removed);
-        }
+        self.forget_deleted(&doomed);
 
         log::info(&format!("reaped {} tombstoned clip(s) of our own", doomed.len()));
+    }
+
+    // -------------------------------------------------------------- cleanup tools
+
+    /// Counts up a `.bin` cleanup without deleting anything. Index order is
+    /// already newest first, so "keep the newest N" is a skip on the same walk
+    /// rather than a sort.
+    ///
+    /// The snapshot is taken under the lock and every stat afterwards runs
+    /// without it: this scans while the capture path keeps capturing.
+    pub fn scan_bin_cleanup(&self, scope: BinScope) -> BinScan {
+        let now = settings::now_ms();
+        let month = settings::month_bucket(now);
+
+        let heavy: Vec<ClipItem> = {
+            let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            index
+                .visible_items()
+                .into_iter()
+                .filter(|item| item.has_blob && !item.pinned)
+                .collect()
+        };
+
+        let in_range: Vec<ClipItem> = match scope {
+            BinScope::OlderThanDays(days) => {
+                if days == 0 {
+                    heavy
+                } else {
+                    let cutoff = now - (days as i64) * 86_400_000;
+                    heavy
+                        .into_iter()
+                        .filter(|item| item.at < cutoff)
+                        .collect()
+                }
+            }
+            BinScope::KeepNewest(keep) => heavy.into_iter().skip(keep as usize).collect(),
+        };
+
+        let mut doomed = Vec::new();
+        let mut skipped_live_month = 0;
+        for item in in_range {
+            if deletable(&item, &self.settings.machine_id, &month) {
+                doomed.push(item);
+            } else {
+                skipped_live_month += 1;
+            }
+        }
+
+        let mut images = 0;
+        let mut overlong_texts = 0;
+        let mut blob_bytes = 0;
+        for item in &doomed {
+            match item.kind {
+                ClipKind::Image => images += 1,
+                _ => overlong_texts += 1,
+            }
+            // The size of what is actually there; a blob the sync lost still
+            // counts as a cleanup (it takes the broken row with it) but frees
+            // nothing.
+            if let Ok(meta) = fs::metadata(&item.blob_path) {
+                blob_bytes += meta.len();
+            }
+        }
+
+        BinScan {
+            doomed,
+            skipped_live_month,
+            images,
+            overlong_texts,
+            blob_bytes,
+        }
+    }
+
+    /// Carries out a `.bin` scan. Whole clips go — row, blob, markers — not just
+    /// the file: an entry whose bytes are gone cannot paste anything (images) or
+    /// would paste a silent truncation (long text), and a history of entries
+    /// that look alive but are not is worse than a shorter honest one. Copying
+    /// the same content again afterwards stores it again, like any other
+    /// deleted clip.
+    pub fn run_bin_cleanup(&self, doomed: Vec<ClipItem>) -> usize {
+        if doomed.is_empty() {
+            return 0;
+        }
+
+        delete_clips(&doomed);
+        self.forget_deleted(&doomed);
+
+        log::info(&format!("bin cleanup removed {} heavy clip(s)", doomed.len()));
+        doomed.len()
+    }
+
+    /// Groups the visible text clips by content hash and lists every copy except
+    /// the one each group keeps: the newest, plus any pinned copy — a pin is a
+    /// promise that this clip survives cleanup, and it does not get broken here.
+    ///
+    /// Duplicates mostly come from two machines having captured the same content
+    /// before sync could tell either one; within one machine the capture path's
+    /// hash set makes them rare. Text only, as asked of it: images have no
+    /// inline preview worth keeping and file lists dedupe badly by exact path.
+    pub fn scan_duplicates(&self) -> DupeScan {
+        let visible = {
+            let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            index.visible_items()
+        };
+
+        // Index order is newest first, so the first copy seen is the one kept.
+        let mut groups: HashMap<String, Vec<ClipItem>> = HashMap::new();
+        for item in visible {
+            if item.kind == ClipKind::Text && !item.hash.is_empty() {
+                groups.entry(item.hash.clone()).or_default().push(item);
+            }
+        }
+
+        let mut scan = DupeScan {
+            doomed: Vec::new(),
+            groups: 0,
+            groups_with_pin: 0,
+        };
+
+        for members in groups.into_values() {
+            if members.len() < 2 {
+                continue;
+            }
+
+            scan.groups += 1;
+            let mut kept_newest = false;
+            let mut pinned = false;
+            for member in members {
+                if member.pinned {
+                    pinned = true;
+                    continue;
+                }
+                if kept_newest {
+                    scan.doomed.push(member);
+                } else {
+                    kept_newest = true;
+                }
+            }
+            if pinned {
+                scan.groups_with_pin += 1;
+            }
+        }
+
+        scan
+    }
+
+    /// Carries out a duplicate scan. The split is the one a hand-delete follows:
+    /// rows this machine may write go out at once, rows in another instance's
+    /// live month are tombstoned and that machine does the taking out. Reports
+    /// `(deleted, marked)`.
+    pub fn run_duplicate_cleanup(&self, doomed: Vec<ClipItem>) -> (usize, usize) {
+        if doomed.is_empty() {
+            return (0, 0);
+        }
+
+        let month = settings::month_bucket(settings::now_ms());
+        let mut direct = Vec::new();
+        let mut marked = Vec::new();
+        for item in doomed {
+            if deletable(&item, &self.settings.machine_id, &month) {
+                direct.push(item);
+            } else {
+                marked.push(item);
+            }
+        }
+
+        let (deleted, tombstoned) = self.remove_clips(direct, marked);
+
+        log::info(&format!(
+            "duplicate cleanup: {} row(s) deleted, {} tombstoned",
+            deleted, tombstoned
+        ));
+
+        (deleted, tombstoned)
     }
 
     // -------------------------------------------------------------------- watch
@@ -1280,6 +1509,228 @@ mod tests {
         assert!(!dir.join("stem-1.bin").exists());
         assert!(!dir.join("stem-1.pin").exists());
         assert!(!dir.join("stem-1.del").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A row built to order: the tests below need control over the timestamp,
+    /// the machine, the kind and the hash, which the `record` helper above
+    /// pins to fixed values.
+    fn clip_row(
+        stem: &str,
+        at: i64,
+        machine: &str,
+        kind: &str,
+        hash: &str,
+        blob: Option<&str>,
+    ) -> ClipRecord {
+        ClipRecord {
+            id: stem.to_string(),
+            at,
+            machine: machine.to_string(),
+            kind: kind.to_string(),
+            hash: hash.to_string(),
+            text: if kind == "image" {
+                None
+            } else {
+                Some(format!("clip {stem}"))
+            },
+            length: 5,
+            blob: blob.map(str::to_string),
+            app: String::new(),
+            title: String::new(),
+        }
+    }
+
+    /// A store over an empty sync root; rows are written into it afterwards the
+    /// way a real month folder looks, and a rescan brings them in.
+    fn cleanup_store(name: &str) -> (Store, PathBuf) {
+        let dir = scratch(name);
+        let mut settings = Settings::default();
+        settings.sync_root = dir.join("sync");
+        settings.machine_id = "mach1".to_string();
+
+        let store = Store::new(settings);
+        (store, dir)
+    }
+
+    /// Writes a row (and its `.bin`, if any) where the layout would put it:
+    /// `<root>/<machine>/<month>/clips.db`.
+    fn plant(store_dir: &Path, machine: &str, row: &ClipRecord) -> PathBuf {
+        let folder = store_dir
+            .join("sync")
+            .join(machine)
+            .join(settings::month_bucket(row.at));
+        fs::create_dir_all(&folder).unwrap();
+
+        if let Some(name) = &row.blob {
+            fs::write(folder.join(name), b"blob-bytes").unwrap();
+        }
+
+        let path = folder.join(DB_NAME);
+        insert_row(&path, row).unwrap();
+        path
+    }
+
+    const DAY: i64 = 24 * 60 * 60 * 1000;
+
+    /// The `.bin` scan has to find exactly the heavy clips in range, leave
+    /// short text alone, honour pins, size up what deleting would free, and
+    /// skip another instance's live month; the run then has to take the row
+    /// and the file both. The two scopes get one check each.
+    #[test]
+    fn bin_cleanup_scans_and_deletes_whole_heavy_clips() {
+        let now = settings::now_ms();
+        let (store, dir) = cleanup_store("binscan");
+
+        // Inline text: no blob, so no scope ever reaches it.
+        plant(&dir, "mach1", &clip_row("s1", now - 2 * DAY, "mach1", "text", "h1", None));
+        // An old heavy clip, pinned: the pin is the promise that keeps it.
+        let pinned = plant(
+            &dir,
+            "mach1",
+            &clip_row("s3", now - 40 * DAY - 3_600_000, "mach1", "image", "h3", Some("s3.bin")),
+        );
+        fs::write(pinned.with_file_name("s3.pin"), []).unwrap();
+        let old_text = plant(
+            &dir,
+            "mach1",
+            &clip_row("s2", now - 40 * DAY, "mach1", "text", "h2", Some("s2.bin")),
+        );
+        let old_image = plant(
+            &dir,
+            "mach1",
+            &clip_row("s5", now - 40 * DAY - 2 * 3_600_000, "mach1", "image", "h5", Some("s5.bin")),
+        );
+        // A fresh heavy clip: too young for the time scope, in the kept half of the count one.
+        plant(&dir, "mach1", &clip_row("s4", now - DAY, "mach1", "image", "h4", Some("s4.bin")));
+        // Another instance's live month: in range for "everything", but not ours
+        // to write. The folder is named by hand so the test cannot flip over at
+        // a month boundary the way an at-derived one would in the month's first
+        // hours.
+        let other_live = dir
+            .join("sync")
+            .join("other")
+            .join(settings::month_bucket(now));
+        fs::create_dir_all(&other_live).unwrap();
+        insert_row(
+            &other_live.join(DB_NAME),
+            &clip_row("o1", now - 2 * 3_600_000, "other", "image", "h6", Some("o1.bin")),
+        )
+        .unwrap();
+        fs::write(other_live.join("o1.bin"), b"blob-bytes").unwrap();
+
+        store.rescan();
+
+        let by_time = store.scan_bin_cleanup(BinScope::OlderThanDays(30));
+        assert_eq!(
+            by_time
+                .doomed
+                .iter()
+                .map(|item| item.stem.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s2", "s5"]
+        );
+        assert_eq!((by_time.images, by_time.overlong_texts), (1, 1));
+        assert_eq!(by_time.blob_bytes, 20); // two planted .bin files, 10 bytes each
+        assert_eq!(by_time.skipped_live_month, 0);
+
+        let by_count = store.scan_bin_cleanup(BinScope::KeepNewest(0));
+        // Everything, so the other instance's live month shows up as a skip.
+        assert_eq!(by_count.skipped_live_month, 1);
+        assert_eq!(by_count.doomed.len(), 3);
+
+        let keep_two = store.scan_bin_cleanup(BinScope::KeepNewest(2));
+        // Newest first across machines: o1 and s4 fill the two kept slots, so
+        // the older two go — even though o1 itself cannot be deleted from here.
+        assert_eq!(
+            keep_two
+                .doomed
+                .iter()
+                .map(|item| item.stem.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s2", "s5"]
+        );
+
+        let removed = store.run_bin_cleanup(by_time.doomed);
+        assert_eq!(removed, 2);
+
+        assert_eq!(read_all(&old_text).len(), 0);
+        assert!(!old_text.with_file_name("s2.bin").exists());
+        assert!(!old_image.with_file_name("s5.bin").exists());
+        // The pinned clip and everything out of scope are still listed; the
+        // pinned one comes first because that is how the list orders them.
+        let listed: Vec<String> = store
+            .query(None, "", 100)
+            .into_iter()
+            .map(|row| row.stem)
+            .collect();
+        assert_eq!(listed, vec!["s3", "o1", "s4", "s1"]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Duplicates keep the newest copy of each text, plus any pinned copy, and
+    /// a copy in another instance's live month goes out as a tombstone rather
+    /// than a deletion.
+    #[test]
+    fn duplicate_cleanup_keeps_the_newest_and_honours_pins() {
+        let now = settings::now_ms();
+        let (store, dir) = cleanup_store("dupscan");
+
+        // Folders are named by hand rather than derived from the timestamps, so
+        // the test does not flip over at a month boundary: every row sits in
+        // its machine's current month, and the timestamps only decide the order.
+        let this_month = settings::month_bucket(now);
+        let plant_text = |machine: &str, stem: &str, at: i64| {
+            let row = clip_row(stem, at, machine, "text", "DUP", None);
+            let folder = dir.join("sync").join(machine).join(&this_month);
+            fs::create_dir_all(&folder).unwrap();
+            let path = folder.join(DB_NAME);
+            insert_row(&path, &row).unwrap();
+            path
+        };
+
+        // Five copies of one text. Index order (newest first) decides the kept
+        // one: t4. t0 is second, so it goes — but it lives in another
+        // instance's current month, so only a tombstone may name it. t2 is
+        // pinned and stays beside the newest. t3 and t1 are plain older copies.
+        let own_db = plant_text("mach1", "t1", now - 3 * DAY);
+        let pinned = plant_text("other", "t2", now - 2 * DAY);
+        plant_text("mach1", "t3", now - DAY);
+        let live_other = plant_text("other", "t0", now - 2 * 3_600_000);
+        plant_text("other", "t4", now - 3_600_000);
+        fs::write(pinned.with_file_name("t2.pin"), []).unwrap();
+
+        store.rescan();
+
+        let scan = store.scan_duplicates();
+        assert_eq!(scan.groups, 1);
+        assert_eq!(scan.groups_with_pin, 1);
+        assert_eq!(
+            scan.doomed
+                .iter()
+                .map(|item| item.stem.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t0", "t3", "t1"]
+        );
+
+        let (deleted, tombstoned) = store.run_duplicate_cleanup(scan.doomed);
+        assert_eq!((deleted, tombstoned), (2, 1));
+
+        // The own rows are gone for real, the live-month row is marked only.
+        assert_eq!(read_all(&own_db).len(), 0);
+        assert_eq!(read_all(&live_other).len(), 3);
+        assert!(live_other.with_file_name("t0.del").exists());
+
+        // The list shows the kept copies only — the pinned one first, because
+        // that is how the list orders them — and the tombstoned one is hidden.
+        let listed: Vec<String> = store
+            .query(None, "", 100)
+            .into_iter()
+            .map(|row| row.stem)
+            .collect();
+        assert_eq!(listed, vec!["t2", "t4"]);
 
         let _ = fs::remove_dir_all(&dir);
     }

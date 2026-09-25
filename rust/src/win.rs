@@ -70,6 +70,13 @@ pub const WS_CLIPCHILDREN: u32 = 0x0200_0000;
 pub const BS_PUSHBUTTON: u32 = 0x0000_0000;
 pub const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
 pub const BS_AUTOCHECKBOX: u32 = 0x0000_0003;
+/// Auto radio button; a pair of them headed by `WS_GROUP` toggles as one group.
+pub const BS_AUTORADIOBUTTON: u32 = 0x0000_0009;
+/// Marks the first control of a radio group, so the arrow keys cycle the pair
+/// instead of walking into unrelated tab stops.
+pub const WS_GROUP: u32 = 0x0002_0000;
+/// A group box is a BUTTON that draws only its frame and caption.
+pub const BS_GROUPBOX: u32 = 0x0000_0007;
 pub const ES_NUMBER: u32 = 0x2000;
 
 pub const WM_CLOSE: u32 = 0x0010;
@@ -500,6 +507,7 @@ extern "system" {
 
     // --- popup support ---
     pub fn SendMessageW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
+    pub fn EnableWindow(hWnd: HWND, bEnable: i32) -> i32;
     pub fn ReleaseCapture() -> i32;
     pub fn SetFocus(hWnd: HWND) -> HWND;
     pub fn GetKeyState(nVirtKey: i32) -> i16;
@@ -928,6 +936,14 @@ pub fn post_quit_message(code: i32) {
 
 pub fn post_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
     unsafe { PostMessageW(hwnd, msg, wparam, lparam) != 0 }
+}
+
+/// Greys a control in and out. The previous state is rarely interesting; the
+/// callers re-enable unconditionally when their operation finishes.
+pub fn enable_window(hwnd: HWND, enabled: bool) {
+    unsafe {
+        EnableWindow(hwnd, i32::from(enabled));
+    }
 }
 
 /// Starts moving a window that has no title bar, the way a caption drag would:

@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod autostart;
+mod cleanup_window;
 mod clip;
 mod clipboard;
 mod index;
@@ -134,6 +135,10 @@ fn main() {
         log::error("settings window could not be created; the tray entry will do nothing");
     }
 
+    if !cleanup_window::create() {
+        log::error("cleanup window could not be created; the settings 清理 button will do nothing");
+    }
+
     if win::add_clipboard_listener(hwnd) {
         log::info("clipboard listener registered");
     } else {
@@ -179,6 +184,13 @@ fn capture_enabled(payload: &ClipPayload) -> bool {
 /// Snapshot of the live settings. Cloned, because callers outlive the lock.
 pub fn current_settings() -> Option<settings::Settings> {
     SETTINGS.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// The store handle for threads outside main — the cleanup window's background
+/// scans and runs. `None` only before startup has finished, in which case the
+/// caller has nothing to work on anyway.
+pub fn store() -> Option<std::sync::Arc<store::Store>> {
+    STORE.get().cloned()
 }
 
 pub fn set_settings(updated: settings::Settings) {
