@@ -97,8 +97,10 @@ pub const BN_CLICKED: u32 = 0;
 
 pub const INPUT_KEYBOARD: u32 = 1;
 pub const KEYEVENTF_KEYUP: u32 = 0x0002;
+pub const VK_SHIFT: u16 = 0x10;
 pub const VK_CONTROL: u16 = 0x11;
 pub const VK_V: u16 = 0x56;
+pub const VK_INSERT: u16 = 0x2D;
 
 pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
@@ -107,6 +109,16 @@ pub const ERROR_ALREADY_EXISTS: u32 = 183;
 /// Enough access to ask a process for its image name, and to do it to processes
 /// this one could not open any other way (an elevated editor, say).
 pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+/// Enough access to read a process token, which is how a window's elevation
+/// gets checked before a paste is sent at it.
+pub const TOKEN_QUERY: u32 = 0x0008;
+
+/// `TokenElevation` in `TOKEN_INFORMATION_CLASS` — the one query this needs.
+const TOKEN_INFO_ELEVATION: u32 = 20;
+
+/// `GetAncestor`'s root option: the top-level window a child belongs to.
+pub const GA_ROOT: u32 = 2;
 
 // --- tray icon ---
 pub const NIM_ADD: u32 = 0;
@@ -451,6 +463,32 @@ pub struct FILETIME {
     pub dw_high_date_time: u32,
 }
 
+/// Focus and active window reported by one GUI thread's input queue.
+///
+/// `GetGUIThreadInfo` reports the state of the *queue*, which is how launcher
+/// palettes (Listary, Quicker, …) hold the caret while the window behind them
+/// stays in front: the focus sits in their window without them ever being the
+/// foreground. A simulated keystroke follows this focus, not the foreground.
+#[repr(C)]
+pub struct GUITHREADINFO {
+    pub cb_size: u32,
+    pub flags: u32,
+    pub hwnd_active: HWND,
+    pub hwnd_focus: HWND,
+    pub hwnd_capture: HWND,
+    pub hwnd_menu_owner: HWND,
+    pub hwnd_move_size: HWND,
+    pub hwnd_caret: HWND,
+    pub rc_caret: RECT,
+}
+
+/// The `TokenElevation` answer: nonzero when the process runs elevated.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TOKEN_ELEVATION {
+    pub token_is_elevated: u32,
+}
+
 
 // ------------------------------------------------------------------ user32.dll
 
@@ -503,6 +541,14 @@ extern "system" {
     fn GetCursorPos(lpPoint: *mut POINT) -> i32;
     fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *mut u32) -> u32;
     fn AttachThreadInput(idAttach: u32, idAttachTo: u32, fAttach: i32) -> i32;
+    /// Focus of the input queue `idThread` belongs to — the window a keystroke
+    /// sent right now would land in, foreground window or not.
+    fn GetGUIThreadInfo(idThread: u32, info: *mut GUITHREADINFO) -> i32;
+    pub fn IsWindow(hWnd: HWND) -> i32;
+    pub fn GetParent(hWnd: HWND) -> HWND;
+    /// The top-level window `hWnd` is nested in; a root returns itself.
+    fn GetAncestor(hWnd: HWND, gaFlags: u32) -> HWND;
+    pub fn GetClassNameW(hWnd: HWND, lpClassName: *mut u16, nMaxCount: i32) -> i32;
 
     fn MonitorFromPoint(pt: POINT, dwFlags: u32) -> HANDLE;
     fn GetMonitorInfoW(hMonitor: HANDLE, lpmi: *mut MONITORINFO) -> i32;
@@ -588,6 +634,7 @@ extern "system" {
         lpdwSize: *mut u32,
     ) -> i32;
     pub fn CloseHandle(hObject: HANDLE) -> i32;
+    fn GetCurrentProcess() -> HANDLE;
 
     fn CreateMutexW(
         lpMutexAttributes: *const c_void,
@@ -601,6 +648,24 @@ extern "system" {
         lpTimeZoneInformation: *const c_void,
         lpUniversalTime: *const SYSTEMTIME,
         lpLocalTime: *mut SYSTEMTIME,
+    ) -> i32;
+}
+
+// ----------------------------------------------------------------- advapi32.dll
+
+#[link(name = "advapi32")]
+extern "system" {
+    pub fn OpenProcessToken(
+        ProcessHandle: HANDLE,
+        DesiredAccess: u32,
+        TokenHandle: *mut HANDLE,
+    ) -> i32;
+    pub fn GetTokenInformation(
+        TokenHandle: HANDLE,
+        TokenInformationClass: u32,
+        TokenInformation: *mut c_void,
+        TokenInformationLength: u32,
+        ReturnLength: *mut u32,
     ) -> i32;
 }
 
@@ -1573,6 +1638,159 @@ pub fn foreground_window() -> HWND {
     unsafe { GetForegroundWindow() }
 }
 
+/// The process that owns `hwnd`. Zero when the answer is unavailable, which is
+/// the same "unknown" every other window query here reports.
+pub fn process_id_of(hwnd: HWND) -> u32 {
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    pid
+}
+
+/// Whether `hwnd` belongs to this process — the popup, the settings window and
+/// the tray are all excluded from paste-target duty for the same reason: a
+/// paste aimed at ourselves is never what the hotkey meant.
+pub fn is_own_process_window(hwnd: HWND) -> bool {
+    hwnd != 0 && process_id_of(hwnd) == std::process::id()
+}
+
+/// The top-level window `hwnd` lives in. A window that owns input but is never
+/// shown in front (a launcher palette's search box, for one) is still reachable
+/// through it.
+pub fn root_window(hwnd: HWND) -> HWND {
+    if hwnd == 0 {
+        return 0;
+    }
+    unsafe { GetAncestor(hwnd, GA_ROOT) }
+}
+
+/// The window class `hwnd` was registered under, empty on failure. Read-only,
+/// and it works on other processes' windows.
+pub fn window_class_name(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 256];
+    let copied = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    if copied <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buffer[..copied as usize])
+}
+
+/// The window that owns the keyboard focus in the foreground thread's queue.
+///
+/// This — not the foreground window — is where a keystroke sent right now
+/// lands. Zero when nothing reports a focus; the callers fall back to the
+/// foreground in that case.
+pub fn keyboard_focus_owner() -> HWND {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground == 0 {
+        return 0;
+    }
+    let thread = unsafe { GetWindowThreadProcessId(foreground, std::ptr::null_mut()) };
+    if thread == 0 {
+        return 0;
+    }
+
+    let mut info = GUITHREADINFO {
+        cb_size: std::mem::size_of::<GUITHREADINFO>() as u32,
+        flags: 0,
+        hwnd_active: 0,
+        hwnd_focus: 0,
+        hwnd_capture: 0,
+        hwnd_menu_owner: 0,
+        hwnd_move_size: 0,
+        hwnd_caret: 0,
+        rc_caret: RECT::default(),
+    };
+    if unsafe { GetGUIThreadInfo(thread, &mut info) } == 0 {
+        return 0;
+    }
+    info.hwnd_focus
+}
+
+/// The foreign window that owns the keyboard focus right now, or zero.
+///
+/// Own-process windows never count, and neither does a focus that points at
+/// something that no longer exists. A window holding the focus is by that fact
+/// alone taking input, so no visibility check is applied — launcher palettes
+/// hold the caret in windows that are not shown the way ordinary windows are.
+pub fn foreign_input_owner() -> HWND {
+    let focus = keyboard_focus_owner();
+    if focus == 0 || !is_window(focus) || is_own_process_window(focus) {
+        return 0;
+    }
+    focus
+}
+
+fn is_window(hwnd: HWND) -> bool {
+    unsafe { IsWindow(hwnd) != 0 }
+}
+
+/// Whether the process that owns `hwnd` runs elevated.
+///
+/// `None` means unknown: protected processes refuse even the limited query,
+/// and the caller has to decide what an unknown is worth. Every handle is
+/// closed on the way out.
+pub fn process_is_elevated(hwnd: HWND) -> Option<bool> {
+    let pid = process_id_of(hwnd);
+    if pid == 0 {
+        return None;
+    }
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process == 0 {
+        return None;
+    }
+
+    let mut token: HANDLE = 0;
+    let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
+    unsafe { CloseHandle(process) };
+    if opened == 0 {
+        return None;
+    }
+
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0u32;
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_INFO_ELEVATION,
+            &mut elevation as *mut TOKEN_ELEVATION as *mut c_void,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    };
+    unsafe { CloseHandle(token) };
+
+    (ok != 0).then(|| elevation.token_is_elevated != 0)
+}
+
+/// Whether this process runs elevated, asked once and remembered: the answer
+/// cannot change while the process is alive.
+pub fn own_process_is_elevated() -> bool {
+    static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ELEVATED.get_or_init(|| {
+        let mut token: HANDLE = 0;
+        let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+        if opened == 0 {
+            return false;
+        }
+
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned = 0u32;
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TOKEN_INFO_ELEVATION,
+                &mut elevation as *mut TOKEN_ELEVATION as *mut c_void,
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned,
+            )
+        };
+        unsafe { CloseHandle(token) };
+
+        ok != 0 && elevation.token_is_elevated != 0
+    })
+}
+
 /// Hands the foreground and the keyboard to a window, and says whether it worked.
 ///
 /// `SetForegroundWindow` on its own is refused whenever Windows decides this process
@@ -1605,13 +1823,22 @@ pub fn focus_window(hwnd: HWND) -> bool {
     }
 }
 
-/// Synthesises Ctrl+V into whatever window currently has focus.
-pub fn send_ctrl_v() -> bool {
+/// Synthesises a paste chord into whatever window currently has focus.
+///
+/// Consoles predate Ctrl+V as a paste chord: the classic console host, Windows
+/// Terminal, PuTTY and mintty all understand Shift+Insert, and older console
+/// settings have Ctrl+V doing nothing at all. Everyone else gets Ctrl+V.
+pub fn send_paste_keystroke(shift_insert: bool) -> bool {
+    let (modifier, key) = if shift_insert {
+        (VK_SHIFT, VK_INSERT)
+    } else {
+        (VK_CONTROL, VK_V)
+    };
     let strokes = [
-        key_stroke(VK_CONTROL, false),
-        key_stroke(VK_V, false),
-        key_stroke(VK_V, true),
-        key_stroke(VK_CONTROL, true),
+        key_stroke(modifier, false),
+        key_stroke(key, false),
+        key_stroke(key, true),
+        key_stroke(modifier, true),
     ];
 
     let sent = unsafe {
