@@ -97,7 +97,6 @@ pub const BN_CLICKED: u32 = 0;
 
 pub const INPUT_KEYBOARD: u32 = 1;
 pub const KEYEVENTF_KEYUP: u32 = 0x0002;
-pub const VK_SHIFT: u16 = 0x10;
 pub const VK_CONTROL: u16 = 0x11;
 pub const VK_V: u16 = 0x56;
 pub const VK_INSERT: u16 = 0x2D;
@@ -1829,8 +1828,9 @@ pub fn focus_window(hwnd: HWND) -> bool {
 /// Terminal, PuTTY and mintty all understand Shift+Insert, and older console
 /// settings have Ctrl+V doing nothing at all. Everyone else gets Ctrl+V.
 pub fn send_paste_keystroke(shift_insert: bool) -> bool {
+    // `VK_SHIFT` is declared as i32 for `GetKeyState`; `SendInput` wants u16.
     let (modifier, key) = if shift_insert {
-        (VK_SHIFT, VK_INSERT)
+        (VK_SHIFT as u16, VK_INSERT)
     } else {
         (VK_CONTROL, VK_V)
     };
