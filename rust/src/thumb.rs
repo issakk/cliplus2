@@ -152,10 +152,11 @@ mod tests {
             let o = px * 4;
             (u32::from(out[o]) + u32::from(out[o + 1]) + u32::from(out[o + 2])) / 3
         };
-        assert_eq!(mean(0), 16); // (0 + 16 + 16 + 32) / 4
-        assert_eq!(mean(1), 64); // (48 + 64 + 64 + 80) / 4
-        assert_eq!(mean(2), 112); // (96 + 112 + 112 + 128) / 4
-        assert_eq!(mean(3), 160); // (144 + 160 + 160 + 176) / 4
+        // The value ramp is v = 16x + 16y, so the four 2×2 boxes average to:
+        assert_eq!(mean(0), 16); // {0, 16, 16, 32}
+        assert_eq!(mean(1), 48); // {32, 48, 48, 64}
+        assert_eq!(mean(2), 48); // {32, 48, 48, 64}
+        assert_eq!(mean(3), 80); // {64, 80, 80, 96}
         // Alpha stays opaque everywhere.
         assert!(out.chunks_exact(4).all(|px| px[3] == 255));
     }
