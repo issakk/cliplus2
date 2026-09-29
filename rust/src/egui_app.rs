@@ -370,8 +370,10 @@ struct App {
     thumb_pending: HashSet<String>,
 
     // blob 水合
-    hydrate_tx: mpsc::Sender<(usize, HydrateAction, Vec<String>, ClipPayload)>,
-    hydrate_rx: mpsc::Receiver<(usize, HydrateAction, Vec<String>, ClipPayload)>,
+    // blob 水合。第四项是 `None` 表示这一趟什么都没读出来(.bin 丢了、或
+    // 全是图片拼不出文本)——也要回话,不然提示一直挂着、动作悄悄不发生。
+    hydrate_tx: mpsc::Sender<(usize, HydrateAction, Vec<String>, Option<ClipPayload>)>,
+    hydrate_rx: mpsc::Receiver<(usize, HydrateAction, Vec<String>, Option<ClipPayload>)>,
     /// What a hydration is in flight for, shown as a loading hint.
     hydrating: Option<HydrateAction>,
     /// Bumped by every close and every new request; a hydrate result whose
@@ -389,8 +391,8 @@ impl App {
         events: mpsc::Receiver<PlatformEvent>,
         thumb_tx: mpsc::Sender<String>,
         thumb_rx: mpsc::Receiver<(String, usize, usize, Vec<u8>)>,
-        hydrate_tx: mpsc::Sender<(usize, HydrateAction, Vec<String>, ClipPayload)>,
-        hydrate_rx: mpsc::Receiver<(usize, HydrateAction, Vec<String>, ClipPayload)>,
+        hydrate_tx: mpsc::Sender<(usize, HydrateAction, Vec<String>, Option<ClipPayload>)>,
+        hydrate_rx: mpsc::Receiver<(usize, HydrateAction, Vec<String>, Option<ClipPayload>)>,
         edit_rx: mpsc::Receiver<Option<String>>,
     ) -> Self {
         Self {
@@ -466,11 +468,18 @@ impl App {
                 continue;
             }
             self.hydrating = None;
+            // 一条都没读出来时不静默:提示收掉、日志留痕,弹窗留在原地,
+            // 让用户自己决定下一步(旧路径在这里什么都不做)。
+            let Some(payload) = payload else {
+                log::warn(&format!(
+                    "hydrate read nothing for {} row(s); keeping the popup open",
+                    stems.len()
+                ));
+                continue;
+            };
             match action {
                 HydrateAction::Paste => {
-                    let target = self.target;
-                    self.hide(ctx);
-                    crate::paste::paste_back(target, &payload);
+                    self.paste_after_hide(ctx, payload);
                 }
                 HydrateAction::Copy => {
                     // 与 inline 路径同一收尾:写成功才收起弹窗。
@@ -521,6 +530,9 @@ impl App {
         self.target = crate::paste::capture_paste_target();
 
         self.search.clear();
+        // 上一次弹窗留下的删除确认不能跟过来:那批 stem 是上一轮选的,而确认
+        // 框里的 Enter 直接删除——用户按的却是"粘贴"。
+        self.confirm_delete = None;
         // The two menus are filters, reset with the box; the scope boxes and
         // the machine tab are preferences and stay.
         self.chips.kind = None;
@@ -592,6 +604,11 @@ impl App {
             .unwrap_or(cursor);
         let area = win::work_area_at(anchor);
         let scale = win::dpi_at(anchor) as f64 / 96.0;
+        // ponytail: 这里用的是**锚定屏**的缩放,而 egui 落地位置/尺寸命令时乘的
+        // 是窗口**当前**那块屏的 pixels_per_point(见 egui-winit 的
+        // `process_viewport_command`)。两块屏缩放不同时这个换算是偏的——本机
+        // 两块都是 150%,改了也没法验证;要动就先把混合 DPI 的机器摆上,
+        // 顺便确认跨屏时的 WM_DPICHANGED 重算有没有把尺寸那一路补回来。
 
         let width_px = win::scaled(size.0.max(MIN_SIZE.0), scale).min(area.right - area.left);
         let height_px = win::scaled(size.1.max(MIN_SIZE.1), scale).min(area.bottom - area.top);
@@ -689,6 +706,8 @@ impl App {
         // user can no longer see; it should never act.
         self.generation += 1;
         self.hydrating = None;
+        // 同上:确认框不跟着弹窗过夜。
+        self.confirm_delete = None;
         self.visible = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
 
@@ -699,7 +718,30 @@ impl App {
         let ppp = (scale as f32).max(0.25);
         self.apply_size(ctx, width_px, height_px, ppp);
 
-        log::info("egui popup hidden");
+        // 这一行是关掉那一刻窗口的真实尺寸(点)。"按着 shift 多选窗口自己变大"
+        // 要和"从来没变过"区分开:拿它和显示时的目标尺寸一比就知道是不是有人
+        // 在会话中途改了窗口大小(以及是哪条路径干的——缩放那两条各有日志)。
+        match ctx.input(|i| i.viewport().outer_rect) {
+            Some(outer) => log::info(&format!(
+                "egui popup hidden; window was {:.0}x{:.0} points",
+                outer.width(),
+                outer.height()
+            )),
+            None => log::info("egui popup hidden"),
+        }
+    }
+
+    /// 收起弹窗,并且只在**窗口真的藏起来之后**才注入 Ctrl+V。
+    ///
+    /// `hide()` 只是把 `Visible(false)` 排进队列,egui 在帧末才落地;而
+    /// `paste.rs` 等的正是"焦点离开我们"。在同一帧里同步调用的话,弹窗在整个
+    /// 等待期间都还可见(还压在最上面),等待循环看不到焦点换手,于是每次都
+    /// 白等满 300ms,最后靠 `set_foreground` 硬抢前台再把键打进去。换一条线程
+    /// 就不一样了:UI 线程能把这一帧跑完、隐藏落地,等待循环立刻就能退出来。
+    fn paste_after_hide(&mut self, ctx: &egui::Context, payload: ClipPayload) {
+        let target = self.target;
+        self.hide(ctx);
+        std::thread::spawn(move || crate::paste::paste_back(target, &payload));
     }
 
     fn quit(&mut self, ctx: &egui::Context) {
@@ -788,6 +830,26 @@ impl App {
         }
     }
 
+    /// 方向键/翻页把 caret 挪出可见区时,把列表跟着挪过去。
+    ///
+    /// 旧 listbox 的 `LB_SETCURSEL` 自带"把光标带进视野",egui 的 ScrollArea
+    /// 不会:少了这一步 caret 会一路走出屏幕,看着像卡住,而 Enter 粘的还是
+    /// 那行看不见的记录。
+    fn scroll_caret_into_view(&mut self) {
+        let Some(rect) = self.list_rect else {
+            return;
+        };
+        let top = self.caret as f32 * ROW_HEIGHT;
+        let bottom = top + ROW_HEIGHT;
+        if top < self.list_offset {
+            self.scroll_to_newest = false;
+            self.pending_offset = Some(top.max(0.0));
+        } else if bottom > self.list_offset + rect.height() {
+            self.scroll_to_newest = false;
+            self.pending_offset = Some((bottom - rect.height()).max(0.0));
+        }
+    }
+
     fn select_all(&mut self) {
         // The list is bottom-up: "everything" is the range 0..=last.
         self.selected = (0..self.items.len()).collect();
@@ -839,9 +901,8 @@ impl App {
                 store.read_payload(&stems[0])
             };
 
-            if let Some(payload) = result {
-                let _ = tx.send((generation, action, stems, payload));
-            }
+            // 成败都回话:第四项 `None` 就是"没读出来"。
+            let _ = tx.send((generation, action, stems, result));
         });
     }
 
@@ -867,9 +928,7 @@ impl App {
             return;
         };
 
-        let target = self.target;
-        self.hide(ctx);
-        crate::paste::paste_back(target, &payload);
+        self.paste_after_hide(ctx, payload);
     }
 
     /// Ctrl+C: copy without pasting. One row keeps its own type (images copy
@@ -1090,8 +1149,18 @@ impl App {
             return false;
         };
 
+        if !rect.contains(position) {
+            // 按住不放时 egui 也会报窗口外的坐标,而边缘判断只有上界没有下界:
+            // 窗外那半边会被算成左/上缩放带。
+            return false;
+        }
         ctx.set_cursor_icon(cursor_for(direction));
         if ctx.input(|i| i.pointer.primary_pressed()) {
+            // "多选时窗口自己变大"要靠这行定位:是不是这条路径拖的窗口。
+            log::info(&format!(
+                "resize grip engaged at {:.0},{:.0}",
+                position.x, position.y
+            ));
             ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
         }
         true
@@ -1148,6 +1217,7 @@ impl App {
         if page_down {
             self.move_selection(page, shift);
         }
+        self.scroll_caret_into_view();
         // Delete 在搜索框里是删字,只有焦点不在搜索框上才是删记录——旧弹窗的
         // 两个窗口过程也是这么分的。
         if delete && !self.search_focused {
@@ -1184,6 +1254,8 @@ impl App {
             egui::Sense::drag(),
         );
         if background.drag_started() {
+            // 同上:靠这行区分"窗口变大"到底是缩放还是拖动。
+            log::info("background drag: the popup moves with the pointer");
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
     }
@@ -1402,6 +1474,11 @@ impl eframe::App for App {
         let (mut confirm_entered, mut confirm_escaped) = (false, false);
         if confirming {
             ctx.input_mut(|i| {
+                // 确认框挂着的时候搜索框仍然有焦点:不把这两个事件摘掉,egui 的
+                // 文本框会把它们当普通文本操作——选中的搜索文字进了剪贴板,还会
+                // 给历史添一条没人要的记录。
+                i.events
+                    .retain(|e| !matches!(e, egui::Event::Copy | egui::Event::Cut));
                 confirm_escaped = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
                 confirm_entered = i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
             });
