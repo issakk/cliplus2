@@ -397,6 +397,8 @@ impl App {
             store,
             events,
             visible: false,
+            parked: false,
+            park_frames: 0,
             geometry_applied: false,
             target: 0,
             shown_at: Instant::now(),
