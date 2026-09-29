@@ -63,7 +63,7 @@ pub fn run(store: Arc<Store>) {
     }));
 
     let native = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::new()
+        viewport: egui::ViewportBuilder::default()
             .with_title("ClipPlus")
             // 预建窗口,启动即隐藏:热键按下时只剩"显示"这一步,秒开保留。
             .with_visible(false)
@@ -130,14 +130,16 @@ fn install_fonts(ctx: &egui::Context) {
 }
 
 /// 把 egui 默认主题往旧弹窗的配色上拉:同一套深色,输入框、选中色都对照旧常量。
+/// 弹窗永远是暗色,不跟随系统亮暗切换,所以两套主题样式一并改掉。
 fn apply_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    style.visuals.panel_fill = COLOR_BG;
-    style.visuals.window_fill = COLOR_BG;
-    // TextEdit 的底色是 extreme_bg。
-    style.visuals.extreme_bg_color = COLOR_INPUT_BG;
-    style.visuals.selection.bg_fill = COLOR_SELECTED;
-    ctx.set_style(style);
+    ctx.set_theme(egui::ThemePreference::Dark);
+    ctx.all_styles_mut(|style| {
+        style.visuals.panel_fill = COLOR_BG;
+        style.visuals.window_fill = COLOR_BG;
+        // TextEdit 的底色是 extreme_bg。
+        style.visuals.extreme_bg_color = COLOR_INPUT_BG;
+        style.visuals.selection.bg_fill = COLOR_SELECTED;
+    });
 }
 
 struct App {
@@ -353,9 +355,10 @@ impl eframe::App for App {
 
         self.handle_keys(&ctx);
 
-        egui::TopBottomPanel::bottom("search_bar")
+        // 0.36 的面板都长在传入的根 Ui 上,不再接 Context。
+        egui::Panel::bottom("search_bar")
             .frame(egui::Frame::default().fill(COLOR_BG).inner_margin(8.0))
-            .show(&ctx, |ui| {
+            .show(ui, |ui| {
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.search)
                         .hint_text("搜索内容 …")
@@ -373,7 +376,7 @@ impl eframe::App for App {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(COLOR_BG).inner_margin(8.0))
-            .show(&ctx, |ui| {
+            .show(ui, |ui| {
                 if self.items.is_empty() {
                     ui.label(
                         egui::RichText::new("还没有记录")
