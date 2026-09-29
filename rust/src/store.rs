@@ -2042,7 +2042,9 @@ mod tests {
         assert!(store.edit_text("f1", "x").is_err());
 
         // A text row of our own passes both checks; the empty-content refusal
-        // is edit_text's own, one layer below.
+        // is edit_text's own, one layer below. f1 and t1 share the month
+        // database — same timestamp bucket — so the check names the row rather
+        // than counting them.
         let ours = plant(
             &dir,
             "mach1",
@@ -2051,7 +2053,8 @@ mod tests {
         store.rescan();
         assert!(store.can_edit("t1"));
         assert!(store.edit_text("t1", "").is_err());
-        assert_eq!(read_all(&ours).len(), 1);
+        let untouched = read_all(&ours).into_iter().find(|row| row.stem == "t1");
+        assert_eq!(untouched.map(|row| row.text), Some(Some("clip t1".to_string())));
 
         let _ = fs::remove_dir_all(&dir);
     }
