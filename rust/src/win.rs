@@ -524,7 +524,6 @@ extern "system" {
     fn PostQuitMessage(nExitCode: i32);
     fn PostMessageW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> i32;
     fn PostThreadMessageW(idThread: u32, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> i32;
-    fn GetCurrentThreadId() -> u32;
     fn DestroyWindow(hWnd: HWND) -> i32;
     pub fn ShowWindow(hWnd: HWND, nCmdShow: i32) -> i32;
 
