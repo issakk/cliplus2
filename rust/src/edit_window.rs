@@ -292,8 +292,8 @@ fn cancel() {
     notify_finished(None);
 }
 
-/// 编辑结束的去处。旧弹窗直接回 `popup::edit_finished`;egui 弹窗在打开编辑器
-/// 时换成自己的回调(经通道回 App,App 不在本次帧里拿不到)。
+/// 编辑结束的去处。打开编辑器的 UI 在 `set_finish_callback` 里登记回调,
+/// 默认(没有 UI 登记)只记日志。
 static FINISH_CALLBACK: Mutex<Option<Box<dyn Fn(Option<String>) + Send>>> = Mutex::new(None);
 
 pub fn set_finish_callback(callback: Box<dyn Fn(Option<String>) + Send>) {
@@ -304,7 +304,14 @@ fn notify_finished(saved: Option<String>) {
     let callback = FINISH_CALLBACK.lock().unwrap_or_else(|e| e.into_inner());
     match callback.as_ref() {
         Some(callback) => callback(saved),
-        None => crate::popup::edit_finished(saved),
+        // egui 弹窗在 run_native 之前就登记好了;走到这里说明编辑窗在
+        // 没有 UI 的情况下被打开过,收尾无从谈起,只能记下来。
+        None => {
+            log::warn(&format!(
+                "edit window finished (saved = {}) but no owner was registered",
+                saved.is_some()
+            ));
+        }
     }
 }
 

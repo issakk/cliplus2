@@ -122,7 +122,6 @@ pub const GA_ROOT: u32 = 2;
 
 // --- tray icon ---
 pub const NIM_ADD: u32 = 0;
-pub const NIM_MODIFY: u32 = 1;
 pub const NIM_DELETE: u32 = 2;
 pub const NIF_MESSAGE: u32 = 0x0001;
 pub const NIF_ICON: u32 = 0x0002;
@@ -132,15 +131,10 @@ pub const WM_APP: u32 = 0x8000;
 pub const WM_NULL: u32 = 0x0000;
 pub const WM_LBUTTONUP: u32 = 0x0202;
 pub const WM_RBUTTONUP: u32 = 0x0205;
-pub const WM_MOUSEWHEEL: u32 = 0x020A;
-pub const WM_CONTEXTMENU: u32 = 0x007B;
 
 pub const MF_STRING: u32 = 0x0000;
 pub const MF_SEPARATOR: u32 = 0x0800;
 pub const MF_CHECKED: u32 = 0x0008;
-/// Grays a menu item out instead of hiding it: the row menu keeps 编辑 visible
-/// but dead on rows it cannot reach, so the menu reads the same everywhere.
-pub const MF_GRAYED: u32 = 0x0001;
 pub const TPM_RIGHTBUTTON: u32 = 0x0002;
 pub const TPM_RETURNCMD: u32 = 0x0100;
 
@@ -172,124 +166,51 @@ pub const ES_AUTOHSCROLL: u32 = 0x0080;
 /// box scrolls the caret out of view instead of following it past the last line.
 pub const ES_MULTILINE: u32 = 0x0004;
 pub const ES_AUTOVSCROLL: u32 = 0x0040;
-/// Single-line edits only, and the text is a banner rather than the window text.
-pub const EM_SETCUEBANNER: u32 = 0x1501;
 
-pub const SS_CENTER: u32 = 0x0000_0001;
-/// Centres a single line of text vertically as well, which is what makes the fixed
-/// `?` square next to the search box sit in the middle of its box rather than at the
-/// top of it.
-pub const SS_CENTERIMAGE: u32 = 0x0000_0200;
 /// The one style a `STATIC` needs to report its clicks instead of swallowing them.
-pub const SS_NOTIFY: u32 = 0x0000_0100;
-pub const LBS_NOTIFY: u32 = 0x0001;
-pub const LBS_OWNERDRAWFIXED: u32 = 0x0010;
-pub const LBS_HASSTRINGS: u32 = 0x0040;
-pub const LBS_NOINTEGRALHEIGHT: u32 = 0x0100;
-pub const LBS_EXTENDEDSEL: u32 = 0x0800;
-pub const LB_ADDSTRING: u32 = 0x0180;
-pub const LB_RESETCONTENT: u32 = 0x0184;
-pub const LB_SETSEL: u32 = 0x0185;
-pub const LB_SETCURSEL: u32 = 0x0186;
-pub const LB_GETCURSEL: u32 = 0x0188;
-pub const LB_GETSELCOUNT: u32 = 0x0190;
-pub const LB_GETSELITEMS: u32 = 0x0191;
-pub const LB_SELITEMRANGE: u32 = 0x0196;
 pub const LB_SETTOPINDEX: u32 = 0x0197;
-pub const LB_SETITEMHEIGHT: u32 = 0x01A0;
-pub const LB_ITEMFROMPOINT: u32 = 0x01A9;
 
 pub const WM_ACTIVATE: u32 = 0x0006;
-pub const WM_SETFOCUS: u32 = 0x0007;
 pub const WM_DRAWITEM: u32 = 0x002B;
 pub const WM_ERASEBKGND: u32 = 0x0014;
 pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_COMMAND: u32 = 0x0111;
-pub const WM_CTLCOLOREDIT: u32 = 0x0133;
-pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
-/// Sent for the `?` beside the search box as well: the parent paints every static's
-/// background, and the default is the light system face colour.
-pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
-pub const WM_PAINT: u32 = 0x000F;
 pub const WM_LBUTTONDOWN: u32 = 0x0201;
 pub const WM_SIZE: u32 = 0x0005;
 pub const WM_GETMINMAXINFO: u32 = 0x0024;
 pub const WM_NCCALCSIZE: u32 = 0x0083;
-pub const WM_NCHITTEST: u32 = 0x0084;
-/// Sent when a move or a resize the system ran is over — the moment the popup
-/// writes its layout back to disk.
-pub const WM_EXITSIZEMOVE: u32 = 0x0232;
 
 /// Hit-test code for "the title bar": the popup hands it to `DefWindowProc` so
 /// Windows runs the window move itself. Not a control id, it just happens to be 2.
-pub const HTCAPTION: usize = 2;
 /// What `begin_drag_move` sends, because the button came down on the window's own
 /// background rather than on a child control.
 
-/// The resize edges, as `WM_NCHITTEST` returns them. A frameless window has none
-/// for Windows to find, so the popup hands them back by hand.
-pub const HTCLIENT: usize = 1;
-pub const HTLEFT: usize = 10;
-pub const HTRIGHT: usize = 11;
-pub const HTTOP: usize = 12;
-pub const HTTOPLEFT: usize = 13;
-pub const HTTOPRIGHT: usize = 14;
-pub const HTBOTTOM: usize = 15;
-pub const HTBOTTOMLEFT: usize = 16;
-pub const HTBOTTOMRIGHT: usize = 17;
-pub const WM_NCLBUTTONDOWN: u32 = 0x00A1;
 pub const WM_SETFONT: u32 = 0x0030;
 pub const WM_CHAR: u32 = 0x0102;
 pub const WM_SYSKEYDOWN: u32 = 0x0104;
 pub const WM_SYSCHAR: u32 = 0x0106;
 
-pub const EN_CHANGE: u32 = 0x0300;
 pub const EN_SETFOCUS: u32 = 0x0100;
 pub const EN_KILLFOCUS: u32 = 0x0200;
-pub const LBN_DBLCLK: u32 = 2;
-pub const LBN_SELCHANGE: u32 = 1;
-/// A static with `SS_NOTIFY` clicked: the notification code is zero, which is why
-/// this one has a name of its own.
-pub const STN_CLICKED: u32 = 0;
 
 pub const SW_SHOW: i32 = 5;
 pub const SW_HIDE: i32 = 0;
 pub const SWP_NOACTIVATE: u32 = 0x0010;
 pub const SWP_NOZORDER: u32 = 0x0004;
 pub const SWP_SHOWWINDOW: u32 = 0x0040;
-pub const HWND_TOPMOST: HWND = -1;
 
 pub const VK_RETURN: i32 = 0x0D;
 pub const VK_ESCAPE: i32 = 0x1B;
-pub const VK_PRIOR: i32 = 0x21;
-pub const VK_NEXT: i32 = 0x22;
-pub const VK_UP: i32 = 0x26;
-pub const VK_DOWN: i32 = 0x28;
-pub const VK_P: i32 = 0x50;
-pub const VK_A: i32 = 0x41;
-pub const VK_C: i32 = 0x43;
-pub const VK_E: i32 = 0x45;
-pub const VK_DELETE: i32 = 0x2E;
-pub const VK_TAB: i32 = 0x09;
 pub const VK_SHIFT: i32 = 0x10;
 pub const VK_MENU: i32 = 0x12;
 pub const VK_LWIN: i32 = 0x5B;
 pub const VK_RWIN: i32 = 0x5C;
 
-pub const ODS_SELECTED: u32 = 0x0001;
 
-pub const DT_LEFT: u32 = 0x0000;
-pub const DT_VCENTER: u32 = 0x0004;
-pub const DT_SINGLELINE: u32 = 0x0020;
-pub const DT_NOPREFIX: u32 = 0x0800;
-pub const DT_END_ELLIPSIS: u32 = 0x8000;
-pub const DT_CENTER: u32 = 0x0001;
 
-pub const TRANSPARENT_BK: i32 = 1;
 
 // CreateFontW arguments.
 pub const FW_NORMAL: i32 = 400;
-pub const FW_SEMIBOLD: i32 = 600;
 pub const CHARSET_DEFAULT: u32 = 1;
 pub const QUALITY_CLEARTYPE: u32 = 5;
 
@@ -955,42 +876,6 @@ pub fn acquire_single_instance(name: &[u16]) -> bool {
     }
 }
 
-pub fn create_message_window(class_name: &[u16], title: &[u16], proc: WNDPROC) -> HWND {
-    unsafe {
-        let instance = GetModuleHandleW(std::ptr::null());
-        let class = WNDCLASSEXW {
-            cb_size: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfn_wnd_proc: Some(proc),
-            h_instance: instance,
-            lpsz_class_name: class_name.as_ptr(),
-            ..Default::default()
-        };
-
-        if RegisterClassExW(&class) == 0 {
-            crate::log::warn(&format!(
-                "RegisterClassExW failed, err {}",
-                GetLastError()
-            ));
-        }
-
-        // Never shown: no WS_VISIBLE, and WS_EX_TOOLWINDOW keeps it out of the
-        // taskbar and alt-tab. CreateWindowExW does not show anything by itself.
-        CreateWindowExW(
-            WS_EX_TOOLWINDOW,
-            class_name.as_ptr(),
-            title.as_ptr(),
-            WS_POPUP,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            instance,
-            std::ptr::null(),
-        )
-    }
-}
 
 pub fn run_message_loop() {
     let mut msg = MSG::default();
@@ -1142,18 +1027,6 @@ fn large_icon_size() -> u32 {
     unsafe { GetSystemMetrics(SM_CXICON) as u32 }
 }
 
-/// Starts moving a window that has no title bar, the way a caption drag would:
-/// called from a `WM_LBUTTONDOWN` that landed on the window's own background.
-/// Windows then runs its move loop, so snapping, multi-monitor handling and Esc
-/// to cancel come for free rather than being reimplemented here.
-pub fn begin_drag_move(hwnd: HWND) {
-    unsafe {
-        // Anything that captured the mouse has to let go first, or the move loop
-        // gets the buttons while the drag does not.
-        ReleaseCapture();
-        SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
-    }
-}
 
 /// Titles are a title bar, not a document, and this one ends up in a row and in a
 /// search: cut to something both can hold.
@@ -1556,16 +1429,6 @@ pub fn cursor_position() -> POINT {
     pt
 }
 
-/// The window's own top-left corner, in screen coordinates. `None` when the window
-/// is gone, which is not worth distinguishing from "could not be read".
-pub fn window_position(hwnd: HWND) -> Option<(i32, i32)> {
-    let mut rect = RECT::default();
-    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
-        return None;
-    }
-
-    Some((rect.left, rect.top))
-}
 
 /// The client area's size. For the popup that is the window's size too — it
 /// answers `WM_NCCALCSIZE` with 0 — and it is the box the rows live in.
@@ -1578,26 +1441,7 @@ pub fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
     Some((rect.right - rect.left, rect.bottom - rect.top))
 }
 
-/// Screen coordinates in, this window's client coordinates out.
-pub fn screen_to_client(hwnd: HWND, x: i32, y: i32) -> (i32, i32) {
-    let mut point = POINT { x, y };
-    unsafe {
-        ScreenToClient(hwnd, &mut point);
-    }
 
-    (point.x, point.y)
-}
-
-/// Client coordinates in, screen coordinates out — where a menu anchored to
-/// something drawn in the client has to open.
-pub fn client_to_screen(hwnd: HWND, x: i32, y: i32) -> (i32, i32) {
-    let mut point = POINT { x, y };
-    unsafe {
-        ClientToScreen(hwnd, &mut point);
-    }
-
-    (point.x, point.y)
-}
 
 /// Work area of the monitor nearest to a point, in device pixels.
 pub fn work_area_at(point: POINT) -> RECT {
@@ -1629,46 +1473,12 @@ pub fn work_area_at(point: POINT) -> RECT {
     }
 }
 
-/// Brings a window to the foreground even when the shell's foreground lock
-/// would refuse the request. Sharing the input queue with the thread that
-/// currently owns the foreground is the documented way past that lock.
-pub fn force_foreground(hwnd: HWND) -> bool {
-    unsafe {
-        if hwnd == 0 {
-            return false;
-        }
-
-        let foreground = GetForegroundWindow();
-        if foreground == hwnd {
-            return true;
-        }
-
-        let mut pid = 0u32;
-        let foreground_thread = GetWindowThreadProcessId(foreground, &mut pid);
-        let current_thread = GetCurrentThreadId();
-
-        let attached = foreground_thread != 0
-            && foreground_thread != current_thread
-            && AttachThreadInput(foreground_thread, current_thread, 1) != 0;
-
-        let ok = SetForegroundWindow(hwnd) != 0;
-
-        if attached {
-            AttachThreadInput(foreground_thread, current_thread, 0);
-        }
-
-        ok
-    }
-}
 
 pub fn set_foreground(hwnd: HWND) -> bool {
     unsafe { hwnd != 0 && SetForegroundWindow(hwnd) != 0 }
 }
 
-/// The window Windows considers foreground: the one that gets the keystrokes.
-pub fn foreground_window() -> HWND {
     unsafe { GetForegroundWindow() }
-}
 
 /// The process that owns `hwnd`. Zero when the answer is unavailable, which is
 /// the same "unknown" every other window query here reports.
@@ -1823,37 +1633,6 @@ pub fn own_process_is_elevated() -> bool {
     })
 }
 
-/// Hands the foreground and the keyboard to a window, and says whether it worked.
-///
-/// `SetForegroundWindow` on its own is refused whenever Windows decides this process
-/// did not earn the foreground, and for a window opened from a hotkey that happens
-/// often enough to matter: the window shows up but never receives a keystroke, and
-/// never gets the `WM_ACTIVATE` that would hide it again. Attaching the two input
-/// queues for the length of the call is the documented way around that.
-pub fn focus_window(hwnd: HWND) -> bool {
-    if hwnd == 0 {
-        return false;
-    }
-
-    if set_foreground(hwnd) {
-        return true;
-    }
-
-    let target = unsafe { GetWindowThreadProcessId(foreground_window(), std::ptr::null_mut()) };
-    let own = unsafe { GetCurrentThreadId() };
-
-    // Attaching to our own thread would be a no-op at best and a deadlock at worst.
-    if target == 0 || target == own {
-        return false;
-    }
-
-    unsafe {
-        AttachThreadInput(target, own, 1);
-        let taken = SetForegroundWindow(hwnd) != 0;
-        AttachThreadInput(target, own, 0);
-        taken
-    }
-}
 
 /// Synthesises a paste chord into whatever window currently has focus.
 ///
@@ -1953,22 +1732,6 @@ pub fn allow_dark_mode() {
     }
 }
 
-/// The per-window half, and the one that actually colours a scrollbar.
-pub fn dark_theme(hwnd: HWND) {
-    if let Some(entry) = uxtheme_export(ORD_ALLOW_DARK_MODE_FOR_WINDOW) {
-        // Declared as taking a bool; passing the integer is the same call on x64.
-        let allow: unsafe extern "system" fn(HWND, i32) -> i32 =
-            unsafe { std::mem::transmute(entry) };
-        unsafe {
-            allow(hwnd, 1);
-        }
-    }
-
-    let theme = wide(DARK_THEME);
-    unsafe {
-        SetWindowTheme(hwnd, theme.as_ptr(), std::ptr::null());
-    }
-}
 
 /// uxtheme's own copy, asked for one of the exports it keeps to ordinals. `None`
 /// means this Windows has nothing to offer, which is an answer rather than an error.

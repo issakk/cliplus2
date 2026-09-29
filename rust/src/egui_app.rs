@@ -24,7 +24,6 @@ use crate::clip::{ClipKind, ClipPayload};
 use crate::index::{ChipFilter, ClipSummary};
 use crate::log;
 use crate::platform::{self, PlatformEvent};
-use crate::popup::{placed, HEIGHT, MIN_HEIGHT, MIN_WIDTH, WIDTH};
 use crate::store::{MachineTab, Store};
 use crate::thumb;
 use crate::win;
@@ -33,16 +32,20 @@ use crate::win;
 /// refill stays a keystroke's work.
 const MAX_RESULTS: usize = 300;
 
-/// Row height in points. The legacy list uses 46 logical pixels at 96 DPI;
+/// Row height in points. The legacy list used 46 logical pixels at 96 DPI;
 /// egui points are the same thing at that scale.
 const ROW_HEIGHT: f32 = 46.0;
+
+/// The open-at size the popup has always had (8 rows plus the bottom bands),
+/// and the floor a drag enforces. Kept as plain numbers since the layout
+/// constants they were derived from died with the legacy popup.
+const DEFAULT_SIZE: (i32, i32) = (620, 458);
+const MIN_SIZE: (i32, i32) = (420, 228);
 
 /// 缩略图解码目标长边(设备像素):36 点的行内图按 2× 屏也够清晰。
 const THUMB_PX: usize = 96;
 /// 缓存条数:160 张 96px 纹理约 6 MB 显存,足够覆盖一屏可见行的来回滚动。
 const THUMB_CACHE_CAP: usize = 160;
-
-const DEFAULT_SIZE: (i32, i32) = (WIDTH, HEIGHT);
 
 const COLOR_BG: egui::Color32 = egui::Color32::from_rgb(0x1E, 0x1E, 0x1E);
 const COLOR_INPUT_BG: egui::Color32 = egui::Color32::from_rgb(0x2A, 0x2A, 0x2A);
@@ -92,7 +95,7 @@ pub fn run(store: Arc<Store>) {
             .with_always_on_top()
             .with_taskbar(false)
             .with_inner_size([DEFAULT_SIZE.0 as f32, DEFAULT_SIZE.1 as f32])
-            .with_min_inner_size([MIN_WIDTH as f32, MIN_HEIGHT as f32]),
+            .with_min_inner_size([MIN_SIZE.0 as f32, MIN_SIZE.1 as f32]),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -309,13 +312,19 @@ struct App {
     /// Bottom-up, exactly like the legacy list: the newest clip is the last
     /// row, the one next to the search box.
     items: Vec<ClipSummary>,
-    /// The caret row: what Enter pastes, what the highlight follows.
-    selected: usize,
-    /// Where a Shift extension started; only meaningful while `extending`.
+    /// 选中行集:点击、Shift 扩选、Ctrl 点选、Ctrl+A 攒出来的任意集合,
+    /// Delete 与多选复制按它算。
+    selected: HashSet<usize>,
+    /// 焦点行:Enter 粘贴、Ctrl+P 固定、菜单动作落在它上面的那一行。
+    caret: usize,
+    /// Shift 扩选的起点。
     anchor: usize,
-    extending: bool,
     focus_search: bool,
     scroll_to_newest: bool,
+    /// 搜索框当前是否持有焦点:持有的时候 Delete 是删字,不是删记录。
+    search_focused: bool,
+    /// 上一帧列表实际可见的行数,翻页键按它算。
+    visible_rows: usize,
 
     // 筛选与机器
     tab: Option<String>,
@@ -349,8 +358,8 @@ impl App {
         events: mpsc::Receiver<PlatformEvent>,
         thumb_tx: mpsc::Sender<String>,
         thumb_rx: mpsc::Receiver<(String, usize, usize, Vec<u8>)>,
-        hydrate_tx: mpsc::Sender<(usize, HydrateAction, String, ClipPayload)>,
-        hydrate_rx: mpsc::Receiver<(usize, HydrateAction, String, ClipPayload)>,
+        hydrate_tx: mpsc::Sender<(usize, HydrateAction, Vec<String>, ClipPayload)>,
+        hydrate_rx: mpsc::Receiver<(usize, HydrateAction, Vec<String>, ClipPayload)>,
         edit_rx: mpsc::Receiver<Option<String>>,
     ) -> Self {
         Self {
@@ -362,11 +371,13 @@ impl App {
             modal_open: false,
             search: String::new(),
             items: Vec::new(),
-            selected: 0,
+            selected: HashSet::new(),
+            caret: 0,
             anchor: 0,
-            extending: false,
             focus_search: false,
             scroll_to_newest: false,
+            search_focused: false,
+            visible_rows: 8,
             tab: None,
             tabs: Vec::new(),
             chips: Chips::default(),
@@ -410,7 +421,7 @@ impl App {
             }
         }
 
-        while let Ok((gen, action, stem, payload)) = self.hydrate_rx.try_recv() {
+        while let Ok((gen, action, stems, payload)) = self.hydrate_rx.try_recv() {
             if gen != self.generation {
                 continue;
             }
@@ -427,7 +438,9 @@ impl App {
                     }
                 }
                 HydrateAction::Edit => {
-                    self.open_editor(&stem, &payload);
+                    if let Some(stem) = stems.first() {
+                        self.open_editor(stem, &payload);
+                    }
                 }
             }
         }
@@ -438,9 +451,7 @@ impl App {
             if let Some(stem) = &saved {
                 self.refill();
                 if let Some(position) = self.items.iter().position(|item| &item.stem == stem) {
-                    self.selected = position;
-                    self.anchor = position;
-                    self.extending = false;
+                    self.point_at(position);
                 }
             }
             if self.visible {
@@ -486,8 +497,8 @@ impl App {
         let area = win::work_area_at(anchor);
         let scale = win::dpi_at(anchor) as f64 / 96.0;
 
-        let width_px = win::scaled(size.0.max(MIN_WIDTH), scale).min(area.right - area.left);
-        let height_px = win::scaled(size.1.max(MIN_HEIGHT), scale).min(area.bottom - area.top);
+        let width_px = win::scaled(size.0.max(MIN_SIZE.0), scale).min(area.right - area.left);
+        let height_px = win::scaled(size.1.max(MIN_SIZE.1), scale).min(area.bottom - area.top);
         let (left, top) = placed(remembered, &area, width_px, height_px);
 
         // egui 的定位/尺寸命令按逻辑点换算(内部乘 pixels_per_point),旧布局
@@ -571,50 +582,54 @@ impl App {
             .query(machine.as_deref(), &self.search, &chip_filter, MAX_RESULTS);
         items.reverse();
 
-        self.selected = items.len().saturating_sub(1);
-        self.anchor = self.selected;
-        self.extending = false;
+        let newest = items.len().saturating_sub(1);
         self.items = items;
+        self.point_at(newest);
         // The view follows the newest row on every refill, the way the legacy
         // list's LB_SETTOPINDEX did after each keystroke.
         self.scroll_to_newest = true;
     }
 
-    /// The rows a Delete covers: the Shift range, or the caret row alone.
-    fn selected_rows(&self) -> Vec<usize> {
-        if self.extending {
-            let lo = self.anchor.min(self.selected);
-            let hi = self.anchor.max(self.selected);
-            (lo..=hi).collect()
-        } else if self.items.is_empty() {
-            Vec::new()
-        } else {
-            vec![self.selected]
+    /// Selection and caret both land on one row — the state after a plain
+    /// click or any action that re-points the popup.
+    fn point_at(&mut self, index: usize) {
+        self.selected.clear();
+        if self.items.get(index).is_some() {
+            self.selected.insert(index);
         }
+        self.caret = index;
+        self.anchor = index;
+    }
+
+    /// The rows a Delete or a copy covers, in list order (oldest first). An
+    /// empty selection means there is nothing to act on.
+    fn selected_rows(&self) -> Vec<usize> {
+        let mut rows: Vec<usize> = self.selected.iter().copied().collect();
+        rows.sort_unstable();
+        rows
     }
 
     fn move_selection(&mut self, delta: isize, extend: bool) {
         if self.items.is_empty() {
             return;
         }
-        if !extend {
-            self.anchor = self.selected;
-            self.extending = false;
+        let next = (self.caret as isize + delta).clamp(0, self.items.len() as isize - 1) as usize;
+        self.caret = next;
+        if extend {
+            let lo = self.anchor.min(next);
+            let hi = self.anchor.max(next);
+            self.selected = (lo..=hi).collect();
         } else {
-            self.extending = true;
+            self.anchor = next;
+            self.selected = [next].into_iter().collect();
         }
-        let next = self.selected as isize + delta;
-        self.selected = next.clamp(0, self.items.len() as isize - 1) as usize;
     }
 
     fn select_all(&mut self) {
-        if self.items.is_empty() {
-            return;
-        }
         // The list is bottom-up: "everything" is the range 0..=last.
+        self.selected = (0..self.items.len()).collect();
+        self.caret = self.items.len().saturating_sub(1);
         self.anchor = 0;
-        self.selected = self.items.len() - 1;
-        self.extending = true;
     }
 
     fn cycle_tab(&mut self, dir: isize) {
@@ -631,10 +646,16 @@ impl App {
         self.refill();
     }
 
-    /// Starts reading a `.bin` payload on a worker thread. The result comes
+    /// Starts reading `.bin` payloads on a worker thread. The result comes
     /// back through `hydrate_rx`; Esc, a click elsewhere or a newer request
     /// all bump the generation, and a stale result is dropped when it lands.
-    fn begin_hydrate(&mut self, action: HydrateAction, stem: String) {
+    ///
+    /// A multi-row copy joins the texts in the worker — one job, one result,
+    /// no matter how many cloud placeholders the selection hides.
+    fn begin_hydrate(&mut self, action: HydrateAction, stems: Vec<String>) {
+        if stems.is_empty() {
+            return;
+        }
         self.generation += 1;
         self.hydrating = Some(action);
 
@@ -642,15 +663,28 @@ impl App {
         let tx = self.hydrate_tx.clone();
         let generation = self.generation;
         std::thread::spawn(move || {
-            if let Some(payload) = store.read_payload(&stem) {
-                let _ = tx.send((generation, action, stem, payload));
+            let result = if action == HydrateAction::Copy && stems.len() > 1 {
+                let mut parts = Vec::with_capacity(stems.len());
+                for stem in &stems {
+                    match store.read_payload(stem) {
+                        Some(payload) => parts.push(payload),
+                        None => log::warn(&format!("nothing copyable for {stem}")),
+                    }
+                }
+                crate::clip::join_payloads(parts)
+            } else {
+                store.read_payload(&stems[0])
+            };
+
+            if let Some(payload) = result {
+                let _ = tx.send((generation, action, stems, payload));
             }
         });
     }
 
-    /// Enter: paste into the window the popup took focus from.
+    /// Enter: paste the caret row into the window the popup took focus from.
     fn commit(&mut self, ctx: &egui::Context) {
-        let Some(item) = self.items.get(self.selected) else {
+        let Some(item) = self.items.get(self.caret) else {
             return;
         };
 
@@ -659,7 +693,7 @@ impl App {
         // is a memory read and goes straight through.
         if item.has_blob {
             let stem = item.stem.clone();
-            self.begin_hydrate(HydrateAction::Paste, stem);
+            self.begin_hydrate(HydrateAction::Paste, vec![stem]);
             return;
         }
 
@@ -675,26 +709,46 @@ impl App {
         crate::paste::paste_back(target, &payload);
     }
 
-    /// Ctrl+C: copy without pasting.
+    /// Ctrl+C: copy without pasting. One row keeps its own type (images copy
+    /// as images); several rows join into one text block, images left out —
+    /// the same rule `join_payloads` has always implemented. Blob-bearing
+    /// rows go through the hydrate worker either way.
     fn copy_selected(&mut self) {
-        let Some(item) = self.items.get(self.selected) else {
-            return;
-        };
-        let stem = item.stem.clone();
-        if item.has_blob {
-            self.begin_hydrate(HydrateAction::Copy, stem);
+        let rows = self.selected_rows();
+        if rows.is_empty() {
             return;
         }
-        if let Some(payload) = self.store.read_payload(&stem) {
-            if !crate::clipboard::write(&payload) {
-                log::warn("copy failed: clipboard write");
-            }
+
+        let summaries: Vec<ClipSummary> = rows
+            .into_iter()
+            .filter_map(|index| self.items.get(index).cloned())
+            .collect();
+        if summaries.is_empty() {
+            return;
+        }
+
+        let stems: Vec<String> = summaries.iter().map(|s| s.stem.clone()).collect();
+        if summaries.iter().any(|s| s.has_blob) {
+            self.begin_hydrate(HydrateAction::Copy, stems);
+            return;
+        }
+
+        let payloads: Vec<ClipPayload> = summaries
+            .iter()
+            .filter_map(|s| self.store.read_payload(&s.stem))
+            .collect();
+        let Some(payload) = crate::clip::join_payloads(payloads) else {
+            log::warn("nothing copyable in that selection");
+            return;
+        };
+        if !crate::clipboard::write(&payload) {
+            log::warn("copy failed: clipboard write");
         }
     }
 
     /// Ctrl+E / row menu 编辑:文本类条目开编辑窗;含 .bin 的先在后台读。
     fn edit_selected(&mut self) {
-        let Some(item) = self.items.get(self.selected) else {
+        let Some(item) = self.items.get(self.caret) else {
             return;
         };
         let stem = item.stem.clone();
@@ -704,7 +758,7 @@ impl App {
         }
 
         if item.has_blob {
-            self.begin_hydrate(HydrateAction::Edit, stem);
+            self.begin_hydrate(HydrateAction::Edit, vec![stem]);
             return;
         }
 
@@ -737,7 +791,7 @@ impl App {
     /// Ctrl+P: pin or unpin the caret row. Pinning moves the row to the top,
     /// so follow the item rather than the index.
     fn toggle_pin(&mut self) {
-        let Some(item) = self.items.get(self.selected) else {
+        let Some(item) = self.items.get(self.caret) else {
             return;
         };
         let (stem, pinned) = (item.stem.clone(), item.pinned);
@@ -748,14 +802,12 @@ impl App {
 
         self.refill();
         if let Some(position) = self.items.iter().position(|item| item.stem == stem) {
-            self.selected = position;
-            self.anchor = position;
-            self.extending = false;
+            self.point_at(position);
         }
     }
 
-    /// Delete: everything the Shift range (or the caret row) covers, with the
-    /// same warning the legacy popup shows — a delete syncs to every machine.
+    /// Delete: everything the selection covers, with the same warning the
+    /// legacy popup shows — a delete syncs to every machine.
     fn delete_selected(&mut self) {
         let stems: Vec<String> = self
             .selected_rows()
@@ -814,8 +866,9 @@ impl App {
         if enter {
             self.commit(ctx);
         }
-        // 一页 = 缺省 8 行可见再留一行重叠,与旧弹窗的 page_rows 同一约定;
-        // 精确行数随窗口拉伸,后续接真实可见行数。
+        // 一页 = 实际可见行数再留一行重叠(上一帧 show_rows 量出来的),与旧
+        // 弹窗的 page_rows 同一约定:跳走的那页永远带着来的那行。
+        let page = self.visible_rows.saturating_sub(1).max(1) as isize;
         if up {
             self.move_selection(-1, shift);
         }
@@ -823,12 +876,13 @@ impl App {
             self.move_selection(1, shift);
         }
         if page_up {
-            self.move_selection(-7, shift);
+            self.move_selection(-page, shift);
         }
         if page_down {
-            self.move_selection(7, shift);
+            self.move_selection(page, shift);
         }
-        if delete {
+        // Delete 在搜索框里是删字,只有焦点在列表上才是删记录。
+        if delete && !self.search_focused {
             self.delete_selected();
         }
         if ctrl_p {
@@ -878,13 +932,7 @@ impl App {
             )
         };
 
-        let selected = if self.extending {
-            let lo = self.anchor.min(self.selected);
-            let hi = self.anchor.max(self.selected);
-            index >= lo && index <= hi
-        } else {
-            index == self.selected
-        };
+        let selected = self.selected.contains(&index);
 
         let (rect, response) = ui
             .allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT), egui::Sense::click());
@@ -946,15 +994,26 @@ impl App {
             if pinned { COLOR_PIN } else { COLOR_META },
         );
 
-        let shift = ui.input(|i| i.modifiers.shift);
+        // 旧弹窗的列表键:普通点 = 单选,Shift 点 = 从锚点扩选,
+        // Ctrl 点 = 原地切换选中(扩展多选语义)。
+        let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.ctrl));
         if response.clicked() {
             if shift {
-                self.extending = true;
-            } else {
-                self.extending = false;
+                self.caret = index;
+                let lo = self.anchor.min(index);
+                let hi = self.anchor.max(index);
+                self.selected = (lo..=hi).collect();
+            } else if ctrl {
+                if self.selected.contains(&index) {
+                    self.selected.remove(&index);
+                } else {
+                    self.selected.insert(index);
+                }
+                self.caret = index;
                 self.anchor = index;
+            } else {
+                self.point_at(index);
             }
-            self.selected = index;
         }
 
         let mut action: Option<RowAction> = None;
@@ -965,7 +1024,12 @@ impl App {
             if ui.button("复制（Ctrl+C）").clicked() {
                 action = Some(RowAction::Copy);
             }
-            if ui.button("编辑（Ctrl+E）").clicked() {
+            // 与旧菜单同一条规则:只有文本、且归本机当月可写时才可编辑。
+            let can_edit = self.store.can_edit(&stem);
+            if ui
+                .add_enabled(can_edit, egui::Button::new("编辑（Ctrl+E）"))
+                .clicked()
+            {
                 action = Some(RowAction::Edit);
             }
             let pin_label = if pinned { "取消固定（Ctrl+P）" } else { "固定（Ctrl+P）" };
@@ -985,34 +1049,24 @@ impl App {
         });
         match action {
             Some(RowAction::Paste) => {
-                self.selected = index;
-                self.anchor = index;
-                self.extending = false;
+                self.point_at(index);
                 let ctx = ui.ctx().clone();
                 self.commit(&ctx);
             }
             Some(RowAction::Copy) => {
-                self.selected = index;
-                self.anchor = index;
-                self.extending = false;
+                self.point_at(index);
                 self.copy_selected();
             }
             Some(RowAction::Edit) => {
-                self.selected = index;
-                self.anchor = index;
-                self.extending = false;
+                self.point_at(index);
                 self.edit_selected();
             }
             Some(RowAction::Pin) => {
-                self.selected = index;
-                self.anchor = index;
-                self.extending = false;
+                self.point_at(index);
                 self.toggle_pin();
             }
             Some(RowAction::Delete) => {
-                self.selected = index;
-                self.anchor = index;
-                self.extending = false;
+                self.point_at(index);
                 self.delete_selected();
             }
             None => {}
@@ -1122,6 +1176,7 @@ impl eframe::App for App {
                         response.request_focus();
                         self.focus_search = false;
                     }
+                    self.search_focused = response.has_focus();
                     if response.changed() {
                         self.refill();
                     }
@@ -1189,10 +1244,91 @@ impl eframe::App for App {
                     self.scroll_to_newest = false;
                 }
                 rows.show_rows(ui, ROW_HEIGHT, self.items.len(), |ui, range| {
-                    for index in range {
+                    // 翻页键按上一帧实际可见行数算。
+                    self.visible_rows = range.len();
+                    for index in range.clone() {
                         self.draw_row(ui, index);
                     }
                 });
             });
+    }
+}
+
+/// Where the popup opens: the remembered position if it still fits the work
+/// area of the monitor it lands on, otherwise centred on that monitor — and
+/// clamped back on screen either way.
+fn placed(
+    remembered: Option<(i32, i32)>,
+    area: &win::RECT,
+    width: i32,
+    height: i32,
+) -> (i32, i32) {
+    let (left, top) = remembered.unwrap_or_else(|| {
+        let left = area.left + (area.right - area.left - width) / 2;
+        let top = area.top + (area.bottom - area.top - height) / 2;
+        (left, top)
+    });
+
+    // `max(area.left)`: a window wider than the work area cannot be clamped into it,
+    // and `clamp` panics when its bounds cross. The top-left corner is the fallback.
+    (
+        left.clamp(area.left, (area.right - width).max(area.left)),
+        top.clamp(area.top, (area.bottom - height).max(area.top)),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn work_area() -> win::RECT {
+        win::RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        }
+    }
+
+    /// Placement has two jobs — put it back where it was, and bring it back on
+    /// screen when that is no longer a place — and the second one only ever shows
+    /// up after a monitor changes, which is a bad moment to discover it is wrong.
+    #[test]
+    fn remembered_position_wins_unless_it_is_off_screen() {
+        // Nothing remembered: centred, so the first open does not depend on the mouse.
+        assert_eq!(placed(None, &work_area(), 600, 400), (660, 320));
+
+        // Remembered: exactly where it was left, including against the right edge.
+        assert_eq!(placed(Some((1300, 500)), &work_area(), 600, 400), (1300, 500));
+
+        // From a monitor that is gone now: pulled back into this one.
+        assert_eq!(placed(Some((2500, -300)), &work_area(), 600, 400), (1320, 0));
+
+        // Wider than the screen it has to fit on: the top-left corner is the best
+        // that can be done, and this is the case that panics without the `max`.
+        assert_eq!(placed(Some((-500, -500)), &work_area(), 2000, 1200), (0, 0));
+    }
+
+    /// The time button's presets become absolute bounds at refill time, so the
+    /// cutoff follows the clock: "近7天" picked yesterday means seven days from
+    /// now, and "今天" is local midnight however far the UTC offset sits.
+    #[test]
+    fn time_chips_answer_with_absolute_bounds() {
+        let now = crate::settings::now_ms();
+
+        assert_eq!(TimeChip::All.since_ms(now), None);
+
+        // Midnight is the instant minus the time of day, which is the whole trick.
+        let t = win::local_datetime(now);
+        let into_day = i64::from(t.hour) * 3_600_000
+            + i64::from(t.minute) * 60_000
+            + i64::from(t.second) * 1_000
+            + i64::from(t.milliseconds);
+        assert_eq!(TimeChip::Today.since_ms(now), Some(now - into_day));
+        // The bound is inclusive: a clip captured at exactly midnight is "today".
+        assert!(TimeChip::Today.since_ms(now).is_some_and(|since| since <= now));
+
+        assert_eq!(TimeChip::Seven.since_ms(now), Some(now - 7 * 86_400_000));
+        assert_eq!(TimeChip::Thirty.since_ms(now), Some(now - 30 * 86_400_000));
     }
 }

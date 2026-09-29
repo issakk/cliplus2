@@ -10,7 +10,6 @@ mod index;
 mod log;
 mod paste;
 mod platform;
-mod popup;
 mod tray;
 mod settings;
 mod settings_window;
@@ -84,73 +83,26 @@ fn main() {
     // every filesystem event, and `let _ =` would drop it right here.
     let _watcher = store.start_watcher();
 
-    // Before the first control is created: a window keeps the theme it was made
-    // with, so this has to come first to matter. Undocumented and best-effort,
-    // see `win::allow_dark_mode` — the popup's scrollbar is the visible part.
-    // (Legacy path only: the egui popup paints its own dark theme.)
-    let use_egui = std::env::var("CLIPPLUS_UI")
-        .map(|value| value.eq_ignore_ascii_case("egui"))
-        .unwrap_or(false);
-
-    if use_egui {
-        // The egui shell owns the popup, but the three secondary windows stay
-        // Win32: plain system-control dialogs, living on this same thread and
-        // pumped by winit's shared message loop. Building them before
-        // run_native, with DPI awareness set first so the dialogs scale.
-        win::set_per_monitor_dpi_aware();
-
-        if !settings_window::create() {
-            log::error("settings window could not be created; the tray entry will do nothing");
-        }
-        if !cleanup_window::create() {
-            log::error("cleanup window could not be created; the settings 清理 button will do nothing");
-        }
-        if !edit_window::create() {
-            log::error("edit window could not be created; the row menu 编辑 entry will do nothing");
-        }
-
-        egui_app::run(Arc::clone(&store));
-        log::info("=== ClipPlus stopping ===");
-        return;
-    }
-
+    // Dark-mode hack for the tray menu, which is still a Win32 `TrackPopupMenu`;
+    // the egui popup paints its own dark theme and needs none of it. A window
+    // keeps the theme it was made with, so this has to come before any window.
     win::allow_dark_mode();
-
-    // Built once at startup so the first hotkey press has no window-creation
-    // latency in front of it.
-    if !popup::create(Arc::clone(&store)) {
-        log::error("popup could not be created; the hotkey will do nothing");
-    }
-
     win::set_per_monitor_dpi_aware();
 
+    // The three secondary windows stay Win32 on purpose: plain system-control
+    // dialogs, living on this same thread and pumped by winit's shared message
+    // loop once the egui loop starts. DPI awareness is set above so they scale.
     if !settings_window::create() {
         log::error("settings window could not be created; the tray entry will do nothing");
     }
-
     if !cleanup_window::create() {
         log::error("cleanup window could not be created; the settings 清理 button will do nothing");
     }
-
     if !edit_window::create() {
         log::error("edit window could not be created; the row menu 编辑 entry will do nothing");
     }
 
-    // Hotkey, clipboard capture and the tray live on the platform thread: the
-    // main thread only runs the UI windows and pumps their messages. The sink
-    // turns platform events into window messages for the windows above, which
-    // keeps every window touched from the thread that created it.
-    platform::start(Box::new(|event| match event {
-        platform::PlatformEvent::Hotkey | platform::PlatformEvent::TrayToggle => {
-            popup::request_toggle();
-        }
-        platform::PlatformEvent::Quit => platform::request_quit(),
-    }));
-
-    log::info("entering message loop");
-    win::run_message_loop();
-
-    platform::shutdown();
+    egui_app::run(store);
     log::info("=== ClipPlus stopping ===");
 }
 

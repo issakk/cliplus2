@@ -22,10 +22,10 @@ notify = "8"
 # depend on a sqlite3.dll the user would have to have.
 rusqlite = { version = "0.40", features = ["bundled"] }
 
-# The egui shell (CLIPPLUS_UI=egui). glow is the smallest GPU backend; the
-# Microsoft YaHei font loads from the system at runtime rather than being
-# packed into the exe. This is the Phase-1 migration path to replacing the
-# hand-drawn Win32 popup; the legacy UI stays the default for now.
+# The egui shell. glow is the smallest GPU backend; the Microsoft YaHei font
+# loads from the system at runtime rather than being packed into the exe.
+# The popup is egui; the three secondary dialogs (settings/cleanup/edit)
+# remain Win32 on the same thread, pumped by winit's shared message loop.
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.36"
 
