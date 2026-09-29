@@ -339,8 +339,8 @@ struct App {
     thumb_pending: HashSet<String>,
 
     // blob 水合
-    hydrate_tx: mpsc::Sender<(usize, HydrateAction, String, ClipPayload)>,
-    hydrate_rx: mpsc::Receiver<(usize, HydrateAction, String, ClipPayload)>,
+    hydrate_tx: mpsc::Sender<(usize, HydrateAction, Vec<String>, ClipPayload)>,
+    hydrate_rx: mpsc::Receiver<(usize, HydrateAction, Vec<String>, ClipPayload)>,
     /// What a hydration is in flight for, shown as a loading hint.
     hydrating: Option<HydrateAction>,
     /// Bumped by every close and every new request; a hydrate result whose

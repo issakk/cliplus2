@@ -1478,7 +1478,6 @@ pub fn set_foreground(hwnd: HWND) -> bool {
     unsafe { hwnd != 0 && SetForegroundWindow(hwnd) != 0 }
 }
 
-    unsafe { GetForegroundWindow() }
 
 /// The process that owns `hwnd`. Zero when the answer is unavailable, which is
 /// the same "unknown" every other window query here reports.
