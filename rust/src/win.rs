@@ -137,6 +137,9 @@ pub const WM_CONTEXTMENU: u32 = 0x007B;
 pub const MF_STRING: u32 = 0x0000;
 pub const MF_SEPARATOR: u32 = 0x0800;
 pub const MF_CHECKED: u32 = 0x0008;
+/// Grays a menu item out instead of hiding it: the row menu keeps 编辑 visible
+/// but dead on rows it cannot reach, so the menu reads the same everywhere.
+pub const MF_GRAYED: u32 = 0x0001;
 pub const TPM_RIGHTBUTTON: u32 = 0x0002;
 pub const TPM_RETURNCMD: u32 = 0x0100;
 
@@ -164,6 +167,10 @@ pub const WS_CHILD: u32 = 0x4000_0000;
 pub const WS_VISIBLE: u32 = 0x1000_0000;
 pub const WS_VSCROLL: u32 = 0x0020_0000;
 pub const ES_AUTOHSCROLL: u32 = 0x0080;
+/// Multi-line edit: the editor window's text box. Without `ES_AUTOVSCROLL` the
+/// box scrolls the caret out of view instead of following it past the last line.
+pub const ES_MULTILINE: u32 = 0x0004;
+pub const ES_AUTOVSCROLL: u32 = 0x0040;
 /// Single-line edits only, and the text is a banner rather than the window text.
 pub const EM_SETCUEBANNER: u32 = 0x1501;
 
@@ -260,6 +267,7 @@ pub const VK_DOWN: i32 = 0x28;
 pub const VK_P: i32 = 0x50;
 pub const VK_A: i32 = 0x41;
 pub const VK_C: i32 = 0x43;
+pub const VK_E: i32 = 0x45;
 pub const VK_DELETE: i32 = 0x2E;
 pub const VK_TAB: i32 = 0x09;
 pub const VK_SHIFT: i32 = 0x10;

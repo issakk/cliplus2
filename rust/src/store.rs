@@ -925,6 +925,125 @@ impl Store {
         (deleted, tombstoned)
     }
 
+    // ------------------------------------------------------------------- editing
+
+    /// Whether the row menu may offer 编辑 for this clip: text only — an image
+    /// has nothing to type into, and a file list would mean rewriting paths —
+    /// and only where this machine may write, which is the same line the delete
+    /// path draws (`deletable`): our own rows, or any row in a month that is
+    /// over. Another instance's live month stays theirs.
+    pub fn can_edit(&self, stem: &str) -> bool {
+        let month = settings::month_bucket(settings::now_ms());
+        let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+        match index.find(stem) {
+            Some(item) => {
+                item.kind == ClipKind::Text
+                    && deletable(item, &self.settings.machine_id, &month)
+            }
+            None => false,
+        }
+    }
+
+    /// Replaces one text clip's content in place: same stem, same timestamp,
+    /// same row — the entry keeps its place in the list, and the `.pin` beside
+    /// it keeps working because the file names never change.
+    ///
+    /// The hash is recomputed over the new content. That set is the capture
+    /// path's "already stored" answer and has to stay truthful in both
+    /// directions: copying the edited text again must dedupe to this row, and
+    /// copying the original text again must be free to come back as a new clip.
+    ///
+    /// The inline/blob split is the capture's own (`plan_payload`): a short
+    /// edit goes fully inline and takes the old `.bin` away, a long one keeps
+    /// its first 512 characters searchable and rewrites the `.bin`. Sync picks
+    /// the database and the sibling up like any other capture.
+    ///
+    /// Deliberately on the caller's thread: the editor calls this on save, and
+    /// the list is supposed to show the new text the moment that save lands.
+    /// The write is bounded by `max_blob_bytes` — what the editor could hold —
+    /// and the database rewrite is one month's rows, the read `refresh_db`
+    /// already does once a minute on a background thread.
+    pub fn edit_text(&self, stem: &str, new_text: &str) -> Result<(), String> {
+        let month = settings::month_bucket(settings::now_ms());
+        let (db_path, old_hash, old_blob_path) = {
+            let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(item) = index.find(stem) else {
+                return Err("这条记录已经不在历史里了".to_string());
+            };
+            if item.kind != ClipKind::Text {
+                return Err("只能编辑文本记录".to_string());
+            }
+            if !deletable(item, &self.settings.machine_id, &month) {
+                return Err(
+                    "这条记录属于另一个实例的当前月份，那个库由那台机器独自写；\
+                     要改它请回到那台机器上改"
+                        .to_string(),
+                );
+            }
+            let old_blob = if item.has_blob {
+                item.blob_path.clone()
+            } else {
+                PathBuf::new()
+            };
+            (item.db_path.clone(), item.hash.clone(), old_blob)
+        };
+
+        if new_text.is_empty() {
+            return Err("内容是空的，存不下一条空记录；不想要这条就用删除".to_string());
+        }
+
+        let payload = ClipPayload::Text(new_text.to_string());
+        let body = payload.body();
+        if body.len() as u64 > self.settings.max_blob_bytes {
+            return Err(format!(
+                "内容有 {} 字节，超过单条上限 {} MB，存不下来",
+                body.len(),
+                self.settings.max_blob_bytes / (1024 * 1024)
+            ));
+        }
+
+        let hash = hash_of(ClipKind::Text, &body);
+        if hash == old_hash {
+            log::info("edit: text unchanged, nothing written");
+            return Ok(());
+        }
+
+        let (inline, blob_name) = plan_payload(&payload, stem, &self.settings);
+        // Read before the move into `update_row`: whether the row still names
+        // a blob decides the cleanup below.
+        let blob_kept = blob_name.is_some();
+
+        // The blob first, the row second — the capture path's order, and for
+        // the same reason: a crash between the two leaves the previous row
+        // with new bytes rather than a row pointing at bytes that never
+        // landed. A crash mid-edit can always tear the pair apart, two files
+        // cannot be committed as one; this order keeps the bytes ahead of the
+        // pointer, which is the invariant the rest of the folder runs on.
+        if let Some(name) = &blob_name {
+            let path = db_path.with_file_name(name);
+            fs::write(&path, &body).map_err(|err| format!("write {}: {err}", path.display()))?;
+        }
+
+        update_row(&db_path, stem, &hash, inline, blob_name, body.len() as i64)?;
+
+        // An edit that fits inline again leaves the old `.bin` behind: disk the
+        // row no longer points at. The row is already updated, so this is the
+        // same safe order a delete uses.
+        if !blob_kept && !old_blob_path.as_os_str().is_empty() {
+            remove_file(&old_blob_path);
+        }
+
+        // Re-read that one database into the index: the rows come back with the
+        // new hash and text, the hash set follows (`forget_db` keeps the hashes
+        // other clips still hold), and the fresh stamp is recorded so neither
+        // the watcher — which skips our own databases anyway — nor the rescan
+        // reads the month again for nothing.
+        self.refresh_db(&db_path, false);
+
+        log::info(&format!("edited {stem}, now {} byte(s)", body.len()));
+        Ok(())
+    }
+
     // -------------------------------------------------------------------- watch
 
     pub fn on_path_changed(&self, path: &Path) {
@@ -1111,6 +1230,45 @@ fn insert_row(db_path: &Path, record: &ClipRecord) -> Result<(), String> {
         ],
     )
     .map_err(|err| format!("insert into {}: {err}", db_path.display()))?;
+
+    Ok(())
+}
+
+/// Rewrites the content columns of one row: the hash, the inline text, the
+/// length and the blob name. The stem, timestamp, machine and source window
+/// are the clip's identity and stay — an edit changes what a clip says, not
+/// which clip it is.
+const UPDATE_ROW: &str = "
+UPDATE clips SET hash = ?1, text = ?2, length = ?3, blob = ?4 WHERE stem = ?5";
+
+fn update_row(
+    db_path: &Path,
+    stem: &str,
+    hash: &str,
+    inline: Option<String>,
+    blob: Option<String>,
+    length: i64,
+) -> Result<(), String> {
+    // Read-write without the create flag: `Connection::open` would happily
+    // make a fresh empty database here, and an edit that arrives after the
+    // row's month was deleted must not leave litter in a synced folder.
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| format!("open {}: {err}", db_path.display()))?;
+    let _ = conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS));
+
+    let changed = conn
+        .execute(
+            UPDATE_ROW,
+            params![hash, &inline, length, &blob, stem],
+        )
+        .map_err(|err| format!("update {}: {err}", db_path.display()))?;
+
+    if changed == 0 {
+        return Err(format!("{} 里已经没有 {stem} 这一行了", db_path.display()));
+    }
 
     Ok(())
 }
@@ -1782,6 +1940,147 @@ mod tests {
             .map(|row| row.stem)
             .collect();
         assert_eq!(listed, vec!["t2", "t4"]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An edit keeps the clip's identity — stem, timestamp, machine — and
+    /// rewrites everything the content decides: hash, inline text, length,
+    /// blob. The blob split follows the same limit a capture does, so an edit
+    /// across it takes the `.bin` with it in both directions.
+    #[test]
+    fn edit_rewrites_content_and_follows_the_blob_split() {
+        let now = settings::now_ms();
+        let (store, dir) = cleanup_store("edit-split");
+        let db = plant(
+            &dir,
+            "mach1",
+            &clip_row("e1", now - DAY, "mach1", "text", "OLD", None),
+        );
+        store.rescan();
+
+        assert!(store.can_edit("e1"));
+
+        // A short edit stays fully inline, exactly like a short capture.
+        store.edit_text("e1", "改过的短文本").unwrap();
+        let row = &read_all(&db)[0];
+        assert_eq!(row.text.as_deref(), Some("改过的短文本"));
+        assert_eq!(row.blob, None);
+        assert_eq!(row.length, "改过的短文本".len() as i64);
+        let short_hash = row.hash.clone();
+        assert_eq!(short_hash, hash_of(ClipKind::Text, "改过的短文本".as_bytes()));
+        assert_ne!(short_hash, "OLD");
+
+        // The capture path must now treat the edited text as stored: the hash
+        // set is what a re-copy consults before writing anything.
+        assert!(store
+            .index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .has_hash(&short_hash));
+
+        // An edit past the inline limit grows a `.bin` and keeps a 512-char
+        // prefix searchable inline, with the length of the whole body.
+        let long = "长".repeat(9000);
+        store.edit_text("e1", &long).unwrap();
+        let row = &read_all(&db)[0];
+        let body = long.as_bytes();
+        assert_eq!(row.hash, hash_of(ClipKind::Text, body));
+        assert_eq!(row.blob.as_deref(), Some("e1.bin"));
+        assert_eq!(row.length, body.len() as i64);
+        let retained: String = long.chars().take(RETAINED_CHARS).collect();
+        assert_eq!(row.text.as_deref(), Some(retained.as_str()));
+        let blob = db.with_file_name("e1.bin");
+        assert!(blob.exists());
+        assert_eq!(fs::read(&blob).unwrap(), body);
+
+        // And back: the short edit takes the `.bin` away again.
+        store.edit_text("e1", "又短了").unwrap();
+        let row = &read_all(&db)[0];
+        assert_eq!(row.blob, None);
+        assert!(!blob.exists());
+
+        // The row never moved: same stem, same timestamp, same machine.
+        assert_eq!(row.stem, "e1");
+        assert_eq!(row.at, now - DAY);
+        assert_eq!(row.machine, "mach1");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The refusals: another instance's live month stays theirs, a clip that
+    /// is not text has nothing to type into, and an empty edit is a delete's
+    /// job. `can_edit` is the menu's quick answer and has to agree with what
+    /// `edit_text` would do.
+    #[test]
+    fn edit_refuses_what_it_may_not_touch() {
+        let now = settings::now_ms();
+        let (store, dir) = cleanup_store("edit-refuse");
+
+        // Another instance's live month: not ours to write.
+        let this_month = settings::month_bucket(now);
+        let live = dir.join("sync").join("other").join(&this_month);
+        fs::create_dir_all(&live).unwrap();
+        insert_row(
+            &live.join(DB_NAME),
+            &clip_row("o1", now - 3_600_000, "other", "text", "h1", None),
+        )
+        .unwrap();
+        // A files row of our own: text-only is the whole idea of the feature.
+        plant(
+            &dir,
+            "mach1",
+            &clip_row("f1", now - DAY, "mach1", "files", "h2", None),
+        );
+
+        store.rescan();
+
+        assert!(!store.can_edit("o1"));
+        assert!(store.edit_text("o1", "x").is_err());
+
+        assert!(!store.can_edit("f1"));
+        assert!(store.edit_text("f1", "x").is_err());
+
+        // A text row of our own passes both checks; the empty-content refusal
+        // is edit_text's own, one layer below.
+        let ours = plant(
+            &dir,
+            "mach1",
+            &clip_row("t1", now - DAY, "mach1", "text", "h3", None),
+        );
+        store.rescan();
+        assert!(store.can_edit("t1"));
+        assert!(store.edit_text("t1", "").is_err());
+        assert_eq!(read_all(&ours).len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Saving without changing anything must not touch the row: the hash is
+    /// the cheap "is this the same bytes" answer, and a no-op save that
+    /// rewrote the database anyway would churn every sync client for nothing.
+    #[test]
+    fn an_unchanged_edit_writes_nothing() {
+        let now = settings::now_ms();
+        let (store, dir) = cleanup_store("edit-noop");
+        let db = plant(
+            &dir,
+            "mach1",
+            &clip_row("e1", now - DAY, "mach1", "text", "h1", None),
+        );
+        store.rescan();
+
+        // First save lands for real — the planted hash is a fake, so the
+        // first edit of the fixture always writes. It leaves the row holding
+        // the real hash of its text, which is what the second save compares
+        // against.
+        store.edit_text("e1", "clip e1").unwrap();
+        assert_eq!(read_all(&db)[0].hash, hash_of(ClipKind::Text, b"clip e1"));
+
+        let before = stamp_of(&db);
+        store.edit_text("e1", "clip e1").unwrap();
+        assert_eq!(stamp_of(&db), before, "the database file must be untouched");
+        assert_eq!(read_all(&db)[0].hash, hash_of(ClipKind::Text, b"clip e1"));
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -4,6 +4,7 @@ mod autostart;
 mod cleanup_window;
 mod clip;
 mod clipboard;
+mod edit_window;
 mod index;
 mod log;
 mod popup;
@@ -137,6 +138,10 @@ fn main() {
 
     if !cleanup_window::create() {
         log::error("cleanup window could not be created; the settings 清理 button will do nothing");
+    }
+
+    if !edit_window::create() {
+        log::error("edit window could not be created; the row menu 编辑 entry will do nothing");
     }
 
     if win::add_clipboard_listener(hwnd) {

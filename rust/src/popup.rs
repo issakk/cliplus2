@@ -217,6 +217,7 @@ const CMD_COPY: i32 = 2;
 const CMD_PIN: i32 = 3;
 const CMD_DELETE: i32 = 4;
 const CMD_SELECT_ALL: i32 = 5;
+const CMD_EDIT: i32 = 6;
 
 /// What the `?` says. The buttons are the main path and the prefixes the power
 /// user's; both are listed because this is the one place the whole search syntax
@@ -258,11 +259,13 @@ const COLOR_META: u32 = 0x008C_8C8C;
 const COLOR_PIN: u32 = 0x004A_A2D2;
 
 /// What a hydrating job was started for. Paste goes back into the window the
-/// popup took focus from; copy only fills the clipboard.
+/// popup took focus from; copy only fills the clipboard; edit opens the editor
+/// on the full text.
 #[derive(Clone, Copy, PartialEq)]
 enum HydrateAction {
     Paste,
     Copy,
+    Edit,
 }
 
 /// A hydration job's result, carried from the worker thread to the window proc.
@@ -1130,7 +1133,8 @@ fn hydrate(action: HydrateAction, rows: &[usize], stems: Vec<String>) {
     let hwnd = p.hwnd;
     std::thread::spawn(move || {
         let payload = match action {
-            HydrateAction::Paste => store.read_payload(&stems[0]),
+            // Both read the one clip whole; only the multi-clip copy joins.
+            HydrateAction::Paste | HydrateAction::Edit => store.read_payload(&stems[0]),
             HydrateAction::Copy => joined_payload(&store, &stems),
         };
 
@@ -1192,6 +1196,16 @@ fn finish_hydrated() {
                 fill_list();
             }
         },
+        HydrateAction::Edit => {
+            if let Some(payload) = done.payload {
+                open_editor(&done.stems[0], &payload);
+            } else {
+                log::warn(&format!("nothing editable for {}", done.stems.join(", ")));
+            }
+            // The row has been showing the loading hint since the job started;
+            // the real preview comes back with a refill either way.
+            fill_list();
+        }
     }
 }
 
@@ -1521,6 +1535,124 @@ fn row_at(p: &Popup, x: i32, y: i32) -> Option<usize> {
     items.get(index).map(|_| index)
 }
 
+/// Opens the editor on the caret row. The store's own answer decides: text
+/// only, and only where this machine may write — the same line the delete path
+/// draws. The menu grays the item out on everything else; this is the keyboard
+/// path's quiet version of the same rule.
+fn edit_selected() {
+    let Some(index) = selected_index() else {
+        return;
+    };
+
+    edit_row(index);
+}
+
+/// The one row the editor opens on: the caret row for the keyboard, the
+/// right-clicked row for the menu. Re-checked here even though the menu has
+/// already grayed itself — the list can have changed under the click.
+fn edit_row(index: usize) {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    let stem = {
+        let items = p.items.lock().unwrap_or_else(|e| e.into_inner());
+        match items.get(index) {
+            Some(summary) => summary.stem.clone(),
+            None => return,
+        }
+    };
+
+    if !p.store.can_edit(&stem) {
+        return;
+    }
+
+    // A `.bin` read may be a OneDrive placeholder that downloads over the
+    // network — the worker, never the window thread. Inline text is a memory
+    // read and opens straight away.
+    let has_blob = {
+        let items = p.items.lock().unwrap_or_else(|e| e.into_inner());
+        items
+            .get(index)
+            .map(|summary| summary.has_blob)
+            .unwrap_or(false)
+    };
+
+    if has_blob {
+        hydrate(HydrateAction::Edit, &[index], vec![stem]);
+        return;
+    }
+
+    let Some(payload) = p.store.read_payload(&stem) else {
+        log::warn(&format!("nothing editable for {stem}"));
+        return;
+    };
+
+    open_editor(&stem, &payload);
+}
+
+/// Hands one clip's text to the editor, holding the popup open underneath it
+/// the way a message box does. Reports whether the editor actually opened.
+fn open_editor(stem: &str, payload: &ClipPayload) -> bool {
+    let Some(p) = popup() else {
+        return false;
+    };
+
+    let ClipPayload::Text(text) = payload else {
+        log::warn("edit is text-only; refusing a non-text payload");
+        return false;
+    };
+
+    // The hold goes down again the moment the editor says it did not open —
+    // a hold with no editor behind it would pin the popup on screen forever.
+    p.modal_open.store(true, Ordering::SeqCst);
+    let opened = crate::edit_window::show(stem, text);
+    if !opened {
+        p.modal_open.store(false, Ordering::SeqCst);
+    }
+    opened
+}
+
+/// The editor is gone, saved or cancelled. Releases the popup's hold, shows
+/// the list as it now is — the row's preview changed, or vanished from a
+/// filter that no longer matches it — and puts the focus back where the
+/// keystrokes live.
+pub fn edit_finished(saved: Option<String>) {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    // Cleared only after the popup has the activation back: between the
+    // editor hiding and the focus landing, a `WM_ACTIVATE` with this still
+    // set is the one thing that keeps the popup up.
+    if !p.visible.load(Ordering::SeqCst) {
+        p.modal_open.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    // A cancel changed nothing, so the list and the caret stay as they were;
+    // a save refills — the row's preview changed, or vanished from a filter
+    // that no longer matches it — and follows the row to where it sits now.
+    if let Some(stem) = &saved {
+        let position = {
+            fill_list();
+
+            let items = p.items.lock().unwrap_or_else(|e| e.into_inner());
+            items.iter().position(|summary| summary.stem == *stem)
+        };
+        if let Some(position) = position {
+            select_row(position);
+        }
+    }
+
+    win::focus_window(p.hwnd);
+    unsafe {
+        win::SetFocus(p.search);
+    }
+
+    p.modal_open.store(false, Ordering::SeqCst);
+}
+
 /// The row menu, at the point the right-click happened.
 ///
 /// Right-clicking a row that is not already selected selects it first, the way every
@@ -1544,6 +1676,18 @@ fn context_menu(x: i32, y: i32) {
         items.get(index).is_some_and(|item| item.pinned)
     };
 
+    // The editor works on one text row this machine may write; everything
+    // else — images, file lists, another instance's live month — grays the
+    // item instead of hiding it, so the menu reads the same on every row.
+    // Judged on the right-clicked row, which is the row the entry acts on.
+    let editable = {
+        let items = p.items.lock().unwrap_or_else(|e| e.into_inner());
+        match items.get(index) {
+            Some(summary) => p.store.can_edit(&summary.stem),
+            None => false,
+        }
+    };
+
     unsafe {
         let menu = win::CreatePopupMenu();
         if menu == 0 {
@@ -1553,6 +1697,16 @@ fn context_menu(x: i32, y: i32) {
 
         append(menu, win::MF_STRING, CMD_PASTE, "粘贴\tEnter");
         append(menu, win::MF_STRING, CMD_COPY, "复制\tCtrl+C");
+        append(
+            menu,
+            if editable {
+                win::MF_STRING
+            } else {
+                win::MF_STRING | win::MF_GRAYED
+            },
+            CMD_EDIT,
+            "编辑\tCtrl+E",
+        );
         append(
             menu,
             win::MF_STRING,
@@ -1594,6 +1748,7 @@ fn context_menu(x: i32, y: i32) {
             CMD_PIN => toggle_pin(),
             CMD_DELETE => delete_selected_rows(),
             CMD_SELECT_ALL => select_all(),
+            CMD_EDIT => edit_row(index),
             _ => {} // 0: dismissed without a choice
         }
     }
@@ -1864,6 +2019,7 @@ fn handle_key(key: i32, typing: bool) -> bool {
         win::VK_DELETE if !typing => delete_selected_rows(),
         win::VK_P if control_down => toggle_pin(),
         win::VK_C if control_down => copy_selected(),
+        win::VK_E if control_down => edit_selected(),
         win::VK_TAB if control_down => {
             // Shift walks the strip backwards.
             let shift_down = unsafe { win::GetKeyState(win::VK_SHIFT) } < 0;
