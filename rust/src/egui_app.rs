@@ -172,6 +172,11 @@ fn install_fonts(ctx: &egui::Context) {
 /// 弹窗永远是暗色,不跟随系统亮暗切换,所以两套主题样式一并改掉。
 fn apply_style(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::Dark);
+    // 按住超过 0.8 秒 egui 就不再认这是点击(触屏长按的默认值)。鼠标上那等于
+    // "按慢一点就选不中",而且按住不动反而会被判成拖动——列表整块背景正是
+    // "拖着移动窗口",于是手势变成窗口跟着指针跑。桌面没有这条规矩,旧 Win32
+    // 弹窗也没有,关掉它。
+    ctx.options_mut(|options| options.input_options.max_click_duration = f64::INFINITY);
     ctx.all_styles_mut(|style| {
         style.visuals.panel_fill = COLOR_BG;
         style.visuals.window_fill = COLOR_BG;
@@ -338,6 +343,8 @@ struct App {
     caret: usize,
     /// Shift 扩选的起点。
     anchor: usize,
+    /// 鼠标正按着拖动时,按下那一行的下标(拖动扩选的起点)。None = 没在拖。
+    drag_from: Option<usize>,
     focus_search: bool,
     scroll_to_newest: bool,
     /// 搜索框当前是否持有焦点:持有的时候 Delete 是删字,不是删记录。
@@ -411,6 +418,7 @@ impl App {
             selected: HashSet::new(),
             caret: 0,
             anchor: 0,
+            drag_from: None,
             focus_search: false,
             scroll_to_newest: false,
             search_focused: false,
@@ -533,6 +541,8 @@ impl App {
         // 上一次弹窗留下的删除确认不能跟过来:那批 stem 是上一轮选的,而确认
         // 框里的 Enter 直接删除——用户按的却是"粘贴"。
         self.confirm_delete = None;
+        // 同上:拖动扩选的起点不跨弹窗——它说的是"指针正按着",下次打开没人按。
+        self.drag_from = None;
         // The two menus are filters, reset with the box; the scope boxes and
         // the machine tab are preferences and stay.
         self.chips.kind = None;
@@ -819,15 +829,32 @@ impl App {
             return;
         }
         let next = (self.caret as isize + delta).clamp(0, self.items.len() as isize - 1) as usize;
-        self.caret = next;
         if extend {
-            let lo = self.anchor.min(next);
-            let hi = self.anchor.max(next);
-            self.selected = (lo..=hi).collect();
+            self.extend_selection(next, false);
         } else {
-            self.anchor = next;
-            self.selected = [next].into_iter().collect();
+            self.point_at(next);
         }
+    }
+
+    /// 拖动扩选:锚点连到指针下的那一行。`additive` 是 Ctrl 按住时并入而不是
+    /// 替换(Explorer 的习惯;旧弹窗只有 Shift 点,没有拖)。
+    fn extend_selection(&mut self, index: usize, additive: bool) {
+        let (lo, hi) = (self.anchor.min(index), self.anchor.max(index));
+        if additive {
+            self.selected.extend(lo..=hi);
+        } else {
+            self.selected = (lo..=hi).collect();
+        }
+        self.caret = index;
+    }
+
+    /// 一行被"按下"时的选择语义:普通点 = 单选,Shift = 从锚点扩选,Ctrl = 原地
+    /// 切换。单击和"从这一行开始拖动"共用它——手势不同,语义一个样。
+    fn press_row(&mut self, index: usize, shift: bool, ctrl: bool) {
+        let (selected, anchor) = pressed_state(&self.selected, self.anchor, index, shift, ctrl);
+        self.selected = selected;
+        self.anchor = anchor;
+        self.caret = index;
     }
 
     /// 方向键/翻页把 caret 挪出可见区时,把列表跟着挪过去。
@@ -1279,8 +1306,10 @@ impl App {
 
         let selected = self.selected.contains(&index);
 
-        let (rect, response) = ui
-            .allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT), egui::Sense::click());
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), ROW_HEIGHT),
+            egui::Sense::click_and_drag(),
+        );
 
         let bg = if selected {
             COLOR_SELECTED
@@ -1339,26 +1368,26 @@ impl App {
             if pinned { COLOR_PIN } else { COLOR_META },
         );
 
-        // 旧弹窗的列表键:普通点 = 单选,Shift 点 = 从锚点扩选,
-        // Ctrl 点 = 原地切换选中(扩展多选语义)。
+        // 旧弹窗的列表键:普通点 = 单选,Shift 点 = 从锚点扩选,Ctrl 点 = 原地
+        // 切换选中。按住拖动走同一套"按下"语义,然后从锚点连到指针那一行——行
+        // 必须自己声明 drag 把手势吃掉:交给列表背景就是"拖着移动窗口",用户
+        // 看到的正是"多选的时候窗口自己动/变大"。
         let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.ctrl));
         if response.clicked() {
-            if shift {
-                self.caret = index;
-                let lo = self.anchor.min(index);
-                let hi = self.anchor.max(index);
-                self.selected = (lo..=hi).collect();
-            } else if ctrl {
-                if self.selected.contains(&index) {
-                    self.selected.remove(&index);
-                } else {
-                    self.selected.insert(index);
-                }
-                self.caret = index;
-                self.anchor = index;
-            } else {
-                self.point_at(index);
-            }
+            log::info(&format!("row {index} clicked (shift={shift}, ctrl={ctrl})"));
+            self.press_row(index, shift, ctrl);
+        } else if response.drag_started() {
+            log::info(&format!("drag-select from row {index}"));
+            self.drag_from = Some(index);
+            self.press_row(index, shift, ctrl);
+        } else if self.drag_from.is_some_and(|from| from != index)
+            && ui.input(|i| i.pointer.is_decidedly_dragging())
+            && response.contains_pointer()
+        {
+            self.extend_selection(index, ctrl);
+        }
+        if response.drag_stopped() {
+            self.drag_from = None;
         }
 
         let mut action: Option<RowAction> = None;
@@ -1675,6 +1704,29 @@ impl App {
     }
 }
 
+/// 按下列表里的一行之后的选择集与锚点。纯函数,单独测:普通点、Shift 扩选、
+/// Ctrl 切换这三条语义旧弹窗就有,"点了不选中"的毛病正是从这儿冒出来的。
+fn pressed_state(
+    selected: &HashSet<usize>,
+    anchor: usize,
+    index: usize,
+    shift: bool,
+    ctrl: bool,
+) -> (HashSet<usize>, usize) {
+    if shift {
+        let (lo, hi) = (anchor.min(index), anchor.max(index));
+        ((lo..=hi).collect(), anchor)
+    } else if ctrl {
+        let mut next = selected.clone();
+        if !next.remove(&index) {
+            next.insert(index);
+        }
+        (next, index)
+    } else {
+        ([index].into_iter().collect(), index)
+    }
+}
+
 /// 停车点:目标位置的左边 `PARK_OFFSET` 物理像素处,尺寸不变。没有任何显示器
 /// 会延伸到那个坐标上,所以窗口在那儿是"亮着但没人看得见"。
 fn park_position(left: i32, top: i32, ppp: f32) -> egui::Pos2 {
@@ -1743,6 +1795,30 @@ fn placed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 按下一行之后的三种语义(普通点 / Shift 扩选 / Ctrl 切换)。"点了不选中"
+    /// 就是这一段丢的,三条各钉一个。
+    #[test]
+    fn a_pressed_row_answers_with_the_selection_it_means() {
+        let none: HashSet<usize> = HashSet::new();
+
+        // 普通点:单选,锚点跟到这一行。
+        let (selected, anchor) = pressed_state(&none, 0, 7, false, false);
+        assert_eq!(selected, HashSet::from([7]));
+        assert_eq!(anchor, 7);
+
+        // Shift 点:从原来那个锚点连到这一行,锚点不动。
+        let (selected, anchor) = pressed_state(&HashSet::from([7]), 3, 5, true, false);
+        assert_eq!(selected, (3..=5).collect::<HashSet<usize>>());
+        assert_eq!(anchor, 3);
+
+        // Ctrl 点:在原来的集合里原地切换,锚点跟着走。
+        let (selected, anchor) = pressed_state(&HashSet::from([7]), 3, 5, false, true);
+        assert_eq!(selected, HashSet::from([5, 7]));
+        assert_eq!(anchor, 5);
+        let (selected, _) = pressed_state(&selected, 5, 5, false, true);
+        assert!(!selected.contains(&5));
+    }
 
     /// 缩放带是看不见的,这是它唯一的定义:算错一个方向就是某条边拖不动,
     /// 或者点进窗口边缘却开始缩放。
