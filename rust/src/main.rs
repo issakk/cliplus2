@@ -5,8 +5,10 @@ mod cleanup_window;
 mod clip;
 mod clipboard;
 mod edit_window;
+mod egui_app;
 mod index;
 mod log;
+mod paste;
 mod platform;
 mod popup;
 mod tray;
@@ -85,6 +87,17 @@ fn main() {
     // with, so this has to come first to matter. Undocumented and best-effort,
     // see `win::allow_dark_mode` — the popup's scrollbar is the visible part.
     win::allow_dark_mode();
+
+    // The egui shell rides the same store, hotkey, clipboard and tray; only the
+    // window layer differs. CLIPPLUS_UI=egui opts in while it matures.
+    let use_egui = std::env::var("CLIPPLUS_UI")
+        .map(|value| value.eq_ignore_ascii_case("egui"))
+        .unwrap_or(false);
+    if use_egui {
+        egui_app::run(Arc::clone(&store));
+        log::info("=== ClipPlus stopping ===");
+        return;
+    }
 
     // Built once at startup so the first hotkey press has no window-creation
     // latency in front of it.

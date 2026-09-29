@@ -22,6 +22,13 @@ notify = "8"
 # depend on a sqlite3.dll the user would have to have.
 rusqlite = { version = "0.40", features = ["bundled"] }
 
+# The egui shell (CLIPPLUS_UI=egui). glow is the smallest GPU backend; the
+# Microsoft YaHei font loads from the system at runtime rather than being
+# packed into the exe. This is the Phase-1 migration path to replacing the
+# hand-drawn Win32 popup; the legacy UI stays the default for now.
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.36"
+
 # The icon resource needs the platform resource compiler; this crate shells out
 # to rc.exe, which ships with the MSVC toolchain the build already requires.
 # See build.rs — the running process does not read the resource, only the exe's

@@ -373,8 +373,15 @@ fn layout(hwnd: HWND, scale: f64) {
 /// Thread-safe "open the settings window": posts to the window so `show` runs
 /// on the thread that created it. This is what the tray menu calls.
 pub fn request_show() {
-    if let Some(hwnd) = WINDOW.get().copied() {
-        win::post_message(hwnd, WM_APP_SHOW, 0, 0);
+    match WINDOW.get().copied() {
+        Some(hwnd) => {
+            win::post_message(hwnd, WM_APP_SHOW, 0, 0);
+        }
+        None => {
+            // The egui shell does not build this window yet (Phase 3); the
+            // tray entry saying nothing at all would look like a hang.
+            log::warn("settings window not built; the tray entry cannot show it");
+        }
     }
 }
 

@@ -20,7 +20,6 @@
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 use crate::clip::{self, ClipKind, ClipPayload};
 use crate::clipboard;
@@ -29,7 +28,7 @@ use crate::log;
 use crate::store::{MachineTab, Store};
 use crate::win::{self, scaled, HBRUSH, HWND, LPARAM, LRESULT, WPARAM};
 
-const WIDTH: i32 = 620;
+pub(crate) const WIDTH: i32 = 620;
 const PAD: i32 = 10;
 const SEARCH_HEIGHT: i32 = 30;
 const GAP: i32 = 8;
@@ -55,7 +54,7 @@ const TAB_FROM_BOTTOM: i32 = SEARCH_FROM_BOTTOM + 6 + TAB_HEIGHT;
 const BOTTOM_BANDS: i32 = TAB_FROM_BOTTOM + GAP;
 
 /// Chosen so the list still holds exactly eight whole rows: 10 + 46*8 + 80.
-const HEIGHT: i32 = PAD + ROW_HEIGHT * 8 + BOTTOM_BANDS;
+pub(crate) const HEIGHT: i32 = PAD + ROW_HEIGHT * 8 + BOTTOM_BANDS;
 const ROW_HEIGHT: i32 = 46;
 const LINE1_TOP: i32 = 4;
 const LINE1_HEIGHT: i32 = 22;
@@ -73,8 +72,8 @@ const GRIP_ARM: i32 = 8;
 
 /// Smallest the user can drag it down to: three rows of list, the tab strip and the
 /// search box.
-const MIN_WIDTH: i32 = 420;
-const MIN_HEIGHT: i32 = PAD + ROW_HEIGHT * 3 + BOTTOM_BANDS;
+pub(crate) const MIN_WIDTH: i32 = 420;
+pub(crate) const MIN_HEIGHT: i32 = PAD + ROW_HEIGHT * 3 + BOTTOM_BANDS;
 
 const MAX_RESULTS: usize = 300;
 const SUBCLASS_ID: usize = 1;
@@ -521,31 +520,9 @@ pub fn show() {
     };
 
     // Captured BEFORE this window takes focus, otherwise it is already too late.
-    let previous = unsafe { win::GetForegroundWindow() };
-    // Own windows never take a paste: a popup reopened over itself, or the
-    // settings window happening to be in front, would otherwise become the
-    // target of the next Enter.
-    let mut target = if previous != 0 && !win::is_own_process_window(previous) {
-        previous
-    } else {
-        0
-    };
-
-    // The keyboard focus of the foreground thread's queue is where a keystroke
-    // would land, and a launcher palette (Listary, Quicker, …) holds that focus
-    // without ever owning the foreground. When the two disagree, the window the
-    // user was typing in is the paste target, not the one behind it.
-    if target != 0 {
-        let focus = win::foreign_input_owner();
-        if focus != 0 {
-            let root = win::root_window(focus);
-            if root != 0 && root != target {
-                target = root;
-            }
-        }
-    }
-
-    p.target.store(target, Ordering::SeqCst);
+    // (The launcher-palette rule and the rest of the policy live with the paste
+    // machinery in `paste.rs`, which the egui popup shares.)
+    p.target.store(crate::paste::capture_paste_target(), Ordering::SeqCst);
 
     let empty = win::wide("");
     unsafe {
@@ -994,121 +971,17 @@ fn commit() {
     hydrate(HydrateAction::Paste, &[index], vec![stem]);
 }
 
-/// Writes `payload` to the clipboard and pastes it into the window the popup
-/// took focus from. Runs on the window thread: the keystroke has to land while
-/// the target is in front, and everything after the clipboard write is a few
-/// hundred milliseconds at the most.
+/// Hides the popup and pastes the payload into the window it took focus from.
+/// The timing and the elevation checks live in `paste.rs`, shared with the
+/// egui popup.
 fn paste_back(payload: &ClipPayload) {
     let Some(p) = popup() else {
         return;
     };
 
-    hide();
-
-    if !clipboard::write(payload) {
-        log::warn("clipboard write failed; not injecting a keystroke");
-        return;
-    }
-
     let target = p.target.load(Ordering::SeqCst);
-
-    // Give the input a moment to settle after the popup hides, and take
-    // whichever window ends up holding it. A foreign window that owns the
-    // keyboard focus receives the keystroke as-is, so it is left exactly where
-    // it is: re-activating the recorded target in front of a launcher palette
-    // that still holds the caret dismisses the palette and sends the paste into
-    // the window behind it. Only when nothing owns the input does the recorded
-    // target have to be brought back to the front by hand.
-    let started = Instant::now();
-    let deadline = started + Duration::from_millis(300);
-    let mut receiver = 0;
-    while Instant::now() < deadline {
-        let focus = win::foreign_input_owner();
-        if focus != 0 {
-            receiver = focus;
-            break;
-        }
-        if target != 0 && unsafe { win::GetForegroundWindow() } == target {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-
-    if receiver == 0 && target != 0 {
-        win::set_foreground(target);
-        while Instant::now() < deadline {
-            if unsafe { win::GetForegroundWindow() } == target {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        receiver = target;
-    }
-
-    // A floor: the foreground switch landing does not mean the target's focused
-    // control is ready to receive the keystroke yet.
-    std::thread::sleep(Duration::from_millis(10));
-
-    // UIPI lets a process inject input only into windows of its own elevation
-    // or lower: at an elevated target the strokes are dropped, or land wherever
-    // the system puts them instead. Say so rather than firing blanks.
-    if receiver != 0 {
-        let root = win::root_window(receiver);
-        if paste_blocked_by_uipi(win::own_process_is_elevated(), win::process_is_elevated(root)) {
-            log::warn(
-                "paste target runs as administrator while ClipPlus does not; \
-                 start ClipPlus as administrator to paste there",
-            );
-            return;
-        }
-    }
-
-    let shift_insert = receiver != 0 && is_console_window(receiver);
-    win::send_paste_keystroke(shift_insert);
-    log::info(&format!(
-        "paste-back took {} ms",
-        started.elapsed().as_millis()
-    ));
-}
-
-/// Whether `own_elevated` may inject a paste keystroke at `target_elevated`.
-///
-/// UIPI allows input only at equal or lower elevation, so a plain ClipPlus is
-/// blocked exactly by the elevated targets. An unreadable elevation — protected
-/// processes refuse even the limited query — counts as not blocked: refusing
-/// every paste at such a window would cost more than the rare silent drop.
-fn paste_blocked_by_uipi(own_elevated: bool, target_elevated: Option<bool>) -> bool {
-    !own_elevated && target_elevated == Some(true)
-}
-
-/// Window classes that are terminal hosts, which take Shift+Insert for a paste.
-///
-/// PuTTY's class carries a per-session suffix, so it is matched by prefix.
-fn is_console_class(class: &str) -> bool {
-    class == "ConsoleWindowClass"
-        || class == "CASCADIA_HOSTING_WINDOW_CLASS"
-        || class.starts_with("PuTTY")
-        || class == "mintty"
-}
-
-/// Whether the window a paste is about to land in is a terminal host.
-///
-/// The target can be the control that holds the focus inside a terminal rather
-/// than the terminal window itself, so the whole parent chain is inspected.
-/// Bounded, because window ownership is shallow in practice and a cycle here
-/// would hang every paste.
-fn is_console_window(hwnd: HWND) -> bool {
-    let mut current = hwnd;
-    for _ in 0..8 {
-        if current == 0 {
-            break;
-        }
-        if is_console_class(&win::window_class_name(current)) {
-            return true;
-        }
-        current = unsafe { win::GetParent(current) };
-    }
-    false
+    hide();
+    crate::paste::paste_back(target, payload);
 }
 
 /// Starts reading `stems` on a worker thread and marks their rows with a
@@ -2673,7 +2546,13 @@ fn remember_layout() {
 /// away: a remembered corner can be off-screen by now — that monitor is unplugged,
 /// the resolution changed — and a popup that opens somewhere unreachable is worse
 /// than one that moved.
-fn placed(remembered: Option<(i32, i32)>, area: &win::RECT, width: i32, height: i32) -> (i32, i32) {
+/// Shared with the egui popup: it positions itself with the same rule.
+pub(crate) fn placed(
+    remembered: Option<(i32, i32)>,
+    area: &win::RECT,
+    width: i32,
+    height: i32,
+) -> (i32, i32) {
     let (left, top) = remembered.unwrap_or_else(|| {
         let left = area.left + (area.right - area.left - width) / 2;
         let top = area.top + (area.bottom - area.top - height) / 2;
@@ -2811,40 +2690,8 @@ mod tests {
         assert_eq!(page_rows(1), 1);
     }
 
-    /// The terminal list is policy, and a wrong entry either takes Shift+Insert
-    /// away from a terminal or hands it to a window that never wanted it.
-    #[test]
-    fn terminal_classes_are_the_ones_that_predate_ctrl_v() {
-        assert!(is_console_class("ConsoleWindowClass"));
-        assert!(is_console_class("CASCADIA_HOSTING_WINDOW_CLASS"));
-        // PuTTY's class carries a per-session suffix.
-        assert!(is_console_class("PuTTY"));
-        assert!(is_console_class("PuTTY-Configuration"));
-        assert!(is_console_class("mintty"));
-
-        assert!(!is_console_class(""));
-        assert!(!is_console_class("Notepad"));
-        assert!(!is_console_class("Chrome_WidgetWin_1"));
-        // Prefix matching must not bleed into unrelated names.
-        assert!(!is_console_class("PuttyNote"));
-        assert!(!is_console_class("Minttyrus"));
-    }
-
-    /// UIPI allows input only at equal or lower elevation, and an unreadable
-    /// elevation must not turn into a refusal of every paste.
-    #[test]
-    fn uipi_blocks_only_an_elevated_target_seen_from_below() {
-        // The everyday case: a plain process pasting at a plain window.
-        assert!(!paste_blocked_by_uipi(false, Some(false)));
-        // The blocked one: the strokes would be dropped, or land elsewhere.
-        assert!(paste_blocked_by_uipi(false, Some(true)));
-        // UIPI never applies upward.
-        assert!(!paste_blocked_by_uipi(true, Some(true)));
-        assert!(!paste_blocked_by_uipi(true, Some(false)));
-        // Unknown — protected processes refuse even the limited query.
-        assert!(!paste_blocked_by_uipi(false, None));
-        assert!(!paste_blocked_by_uipi(true, None));
-    }
+    /// The terminal list and the UIPI rule moved to `paste.rs` together with
+    /// the code they pin down; their tests went with them.
 
     /// The time button's presets become absolute bounds at refill time, so the
     /// cutoff follows the clock: "近7天" picked yesterday means seven days from
