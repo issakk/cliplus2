@@ -36,6 +36,10 @@ const MAX_RESULTS: usize = 300;
 /// egui points are the same thing at that scale.
 const ROW_HEIGHT: f32 = 46.0;
 
+/// 窗口边缘这条看不见的带子属于缩放——旧弹窗的 `GRIP` 是同一个数,单位也是
+/// 96 DPI 下的逻辑像素(egui 的 point 就是这个口径)。
+const RESIZE_GRIP: f32 = 5.0;
+
 /// The open-at size the popup has always had (8 rows plus the bottom bands),
 /// and the floor a drag enforces. Kept as plain numbers since the layout
 /// constants they were derived from died with the legacy popup.
@@ -325,6 +329,18 @@ struct App {
     search_focused: bool,
     /// 上一帧列表实际可见的行数,翻页键按它算。
     visible_rows: usize,
+    /// 指针这一刻是不是压在窗口边缘的缩放带上:是的话面板空白不让抢成拖动。
+    grip_active: bool,
+    /// 列表当前的滚动偏移,滚轮的转发以上一帧的值为基准。
+    list_offset: f32,
+    /// 下一帧要强制设置的列表偏移(滚轮转发 / 删除后归位),设了就压过自然滚动。
+    pending_offset: Option<f32>,
+    /// 上一帧列表的屏幕矩形:判断滚轮落在列表上还是落在那两条按钮带上。
+    list_rect: Option<egui::Rect>,
+
+    /// 待确认的删除:要删的 stem。有值时弹窗里挂着删除确认框(egui 自己的
+    /// 深色模态,不再拉起系统 MessageBox)。
+    confirm_delete: Option<Vec<String>>,
 
     // 筛选与机器
     tab: Option<String>,
@@ -378,6 +394,11 @@ impl App {
             scroll_to_newest: false,
             search_focused: false,
             visible_rows: 8,
+            grip_active: false,
+            list_offset: 0.0,
+            pending_offset: None,
+            list_rect: None,
+            confirm_delete: None,
             tab: None,
             tabs: Vec::new(),
             chips: Chips::default(),
@@ -806,8 +827,9 @@ impl App {
         }
     }
 
-    /// Delete: everything the selection covers, with the same warning the
-    /// legacy popup shows — a delete syncs to every machine.
+    /// Delete: everything the selection covers. The confirm used to be a system
+    /// MessageBox at this point; now it is a pending state the frame draws as an
+    /// in-window egui modal, so the warning is dark like the rest of the popup.
     fn delete_selected(&mut self) {
         let stems: Vec<String> = self
             .selected_rows()
@@ -818,6 +840,20 @@ impl App {
             return;
         }
 
+        self.confirm_delete = Some(stems);
+    }
+
+    /// The delete confirmation, drawn over everything else in this window.
+    ///
+    /// Esc, the backdrop and 取消 throw it away; Enter and 删除 run it — the old
+    /// MessageBox made its first button the default, and that button was Yes.
+    /// Esc and Enter arrive as flags because the frame consumed them before the
+    /// search box could.
+    fn draw_delete_confirm(&mut self, ctx: &egui::Context, entered: bool, escaped: bool) {
+        let Some(stems) = self.confirm_delete.clone() else {
+            return;
+        };
+
         let count = stems.len();
         let question = format!(
             "删除选中的 {count} 条记录？\n\n\
@@ -825,19 +861,88 @@ impl App {
              别的机器当月那份只能先记个「已删」的空标记（一样马上看不见），由那台机器自己清。"
         );
 
-        self.modal_open = true;
-        let confirmed =
-            win::message_box("ClipPlus 删除", &question, win::MB_YESNO | win::MB_ICONWARNING)
-                == win::IDYES;
-        self.modal_open = false;
+        let mut confirmed = false;
+        let mut cancelled = false;
 
-        if !confirmed {
-            return;
+        let modal = egui::Modal::new(egui::Id::new("delete_confirm")).show(ctx, |ui| {
+            ui.set_max_width(380.0);
+            ui.label(egui::RichText::new(question).size(13.0).color(COLOR_TEXT));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("删除").clicked() {
+                    confirmed = true;
+                }
+                if ui.button("取消").clicked() {
+                    cancelled = true;
+                }
+            });
+        });
+
+        // 遮罩上的点击(点到框外)也是取消,和系统确认框一个意思。
+        if modal.should_close() || escaped {
+            cancelled = true;
+        }
+        if entered {
+            confirmed = true;
         }
 
-        let (deleted, marked) = self.store.delete_selected(&stems);
-        log::info(&format!("{deleted} clip(s) deleted by hand, {marked} tombstoned"));
-        self.refill();
+        if confirmed {
+            self.confirm_delete = None;
+            let caret = self.caret;
+            let (deleted, marked) = self.store.delete_selected(&stems);
+            log::info(&format!("{deleted} clip(s) deleted by hand, {marked} tombstoned"));
+
+            // 旧弹窗删完把光标留给顶替那一行的位置(而不是跳回最新),屏幕上
+            // 不跳走:重灌后把光标夹回范围内,并把它滚回视野中间。
+            self.refill();
+            let index = caret.min(self.items.len().saturating_sub(1));
+            self.point_at(index);
+            self.scroll_to_newest = false;
+            let half = self.list_rect.map_or(0.0, |rect| rect.height()) / 2.0;
+            self.pending_offset =
+                Some((index as f32 * ROW_HEIGHT - half + ROW_HEIGHT / 2.0).max(0.0));
+        } else if cancelled {
+            self.confirm_delete = None;
+        }
+    }
+
+    /// 滚轮落在搜索条/机器条上时列表也跟着翻——旧弹窗的约定,那两条不在
+    /// ScrollArea 里,滚轮不会被它消费,所以在这里把增量加到列表偏移上。
+    /// 口径照 ScrollArea 自己:`offset -= delta`,向下滚(delta < 0)偏移变大。
+    fn forward_wheel_to_list(&mut self, ctx: &egui::Context) {
+        let Some(pointer) = ctx.input(|i| i.pointer.hover_pos()) else {
+            return;
+        };
+        if self.list_rect.is_some_and(|rect| rect.contains(pointer)) {
+            return; // 列表自己的滚动,别算两遍
+        }
+
+        let delta = ctx.input(|i| i.smooth_scroll_delta.y);
+        if delta == 0.0 {
+            return;
+        }
+        self.pending_offset = Some((self.list_offset - delta).max(0.0));
+    }
+
+    /// 拖动边缘缩放。
+    ///
+    /// winit 的无边框窗口把客户区铺满整窗(WM_NCCALCSIZE),原生缩放边框因此
+    /// 不存在——旧弹窗当年靠自己答 WM_NCHITTEST 补的就是这一手,这里换成
+    /// 认边缘 + `BeginResize`。指针压在带上返回 true,面板的空白拖动让位。
+    fn handle_resize(&self, ctx: &egui::Context) -> bool {
+        let rect = ctx.viewport_rect();
+        let Some(position) = ctx.input(|i| i.pointer.hover_pos()) else {
+            return false;
+        };
+        let Some(direction) = resize_grip(position, rect) else {
+            return false;
+        };
+
+        ctx.set_cursor_icon(cursor_for(direction));
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+        }
+        true
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -904,7 +1009,12 @@ impl App {
 
     /// Background drag on the panels' empty space, the way the legacy popup's
     /// background `WM_LBUTTONDOWN` dragged the window.
-    fn start_drag_on_background(ui: &mut egui::Ui, ctx: &egui::Context, id: &str) {
+    fn start_drag_on_background(&self, ui: &mut egui::Ui, ctx: &egui::Context, id: &str) {
+        // 边缘那一圈留给缩放,不抢成拖动。
+        if self.grip_active {
+            return;
+        }
+
         let background = ui.interact(
             ui.max_rect(),
             egui::Id::new(id),
@@ -1098,14 +1208,29 @@ impl eframe::App for App {
             return;
         }
 
-        self.handle_keys(&ctx);
+        // 边缘缩放先行:指针压在缩放带上时,面板的空白拖动这次让位。
+        self.grip_active = self.handle_resize(&ctx);
+
+        // 删除确认挂着的时候只有确认框里的按键算数:Esc/Enter 在这里就吃掉,
+        // 免得焦点还在搜索框上时被文本框先接走;底下的列表一动不动。
+        let confirming = self.confirm_delete.is_some();
+        let (mut confirm_entered, mut confirm_escaped) = (false, false);
+        if confirming {
+            ctx.input_mut(|i| {
+                confirm_escaped = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+                confirm_entered = i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+            });
+        } else {
+            self.handle_keys(&ctx);
+            self.forward_wheel_to_list(&ctx);
+        }
 
         // 0.36 的面板都长在传入的根 Ui 上,不再接 Context。先加的贴底边:
         // 搜索条在最下,机器条在它上面。
         egui::Panel::bottom("search_bar")
             .frame(egui::Frame::default().fill(COLOR_BG).inner_margin(8.0))
             .show(ui, |ui| {
-                Self::start_drag_on_background(ui, &ctx, "drag_search");
+                self.start_drag_on_background(ui, &ctx, "drag_search");
 
                 ui.horizontal(|ui| {
                     if ui
@@ -1195,7 +1320,7 @@ impl eframe::App for App {
                     }),
             )
             .show(ui, |ui| {
-                Self::start_drag_on_background(ui, &ctx, "drag_tabs");
+                self.start_drag_on_background(ui, &ctx, "drag_tabs");
 
                 // Tabs live in the store as (id, label); clone the labels out
                 // so the mutable tab switch below never overlaps the borrow.
@@ -1218,7 +1343,21 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(COLOR_BG).inner_margin(8.0))
             .show(ui, |ui| {
-                Self::start_drag_on_background(ui, &ctx, "drag_list");
+                self.start_drag_on_background(ui, &ctx, "drag_list");
+
+                // 右上角两道短杠:旧的 Win32 弹窗用它提示"这儿能拉",位置照旧。
+                // 画在早退之前,列表空着时也在。
+                let rect = ui.max_rect();
+                for i in 0..2 {
+                    let y = rect.top() + 6.0 + f32::from(i) * 4.0;
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(rect.right() - 14.0, y),
+                            egui::pos2(rect.right() - 6.0, y),
+                        ],
+                        egui::Stroke::new(1.0, COLOR_META),
+                    );
+                }
 
                 if let Some(action) = self.hydrating {
                     let hint = match action {
@@ -1242,15 +1381,64 @@ impl eframe::App for App {
                     // Content height: the area clamps it to the bottom edge.
                     rows = rows.vertical_scroll_offset(self.items.len() as f32 * ROW_HEIGHT);
                     self.scroll_to_newest = false;
+                    self.pending_offset = None;
+                } else if let Some(offset) = self.pending_offset.take() {
+                    rows = rows.vertical_scroll_offset(offset);
                 }
-                rows.show_rows(ui, ROW_HEIGHT, self.items.len(), |ui, range| {
+
+                let output = rows.show_rows(ui, ROW_HEIGHT, self.items.len(), |ui, range| {
                     // 翻页键按上一帧实际可见行数算。
                     self.visible_rows = range.len();
                     for index in range.clone() {
                         self.draw_row(ui, index);
                     }
                 });
+
+                // 下一帧的滚轮转发要知道列表在哪、滚到哪了。
+                self.list_offset = output.state.offset.y;
+                self.list_rect = Some(output.inner_rect);
             });
+
+        // 确认框画在所有面板之上(egui 的模态自己带遮罩)。
+        if confirming {
+            self.draw_delete_confirm(&ctx, confirm_entered, confirm_escaped);
+        }
+    }
+}
+
+/// 指针是否压在窗口边缘的缩放带上,压着的话是哪个方向。纯函数,单独测:
+/// 算错一个方向就是"某条边拖不动"或者"点进去变成了缩放"。
+///
+/// 角落两侧同时命中,四个角在 match 里排在四条边前面。
+fn resize_grip(position: egui::Pos2, rect: egui::Rect) -> Option<egui::viewport::ResizeDirection> {
+    use egui::viewport::ResizeDirection as Dir;
+
+    let left = position.x - rect.left() < RESIZE_GRIP;
+    let right = rect.right() - position.x < RESIZE_GRIP;
+    let top = position.y - rect.top() < RESIZE_GRIP;
+    let bottom = rect.bottom() - position.y < RESIZE_GRIP;
+
+    match (left, right, top, bottom) {
+        (true, _, true, _) => Some(Dir::NorthWest),
+        (_, true, true, _) => Some(Dir::NorthEast),
+        (true, _, _, true) => Some(Dir::SouthWest),
+        (_, true, _, true) => Some(Dir::SouthEast),
+        (true, _, _, _) => Some(Dir::West),
+        (_, true, _, _) => Some(Dir::East),
+        (_, _, true, _) => Some(Dir::North),
+        (_, _, _, true) => Some(Dir::South),
+        _ => None,
+    }
+}
+
+fn cursor_for(direction: egui::viewport::ResizeDirection) -> egui::CursorIcon {
+    use egui::viewport::ResizeDirection as Dir;
+
+    match direction {
+        Dir::North | Dir::South => egui::CursorIcon::ResizeVertical,
+        Dir::East | Dir::West => egui::CursorIcon::ResizeHorizontal,
+        Dir::NorthWest | Dir::SouthEast => egui::CursorIcon::ResizeNwSe,
+        Dir::NorthEast | Dir::SouthWest => egui::CursorIcon::ResizeNeSw,
     }
 }
 
@@ -1280,6 +1468,32 @@ fn placed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 缩放带是看不见的,这是它唯一的定义:算错一个方向就是某条边拖不动,
+    /// 或者点进窗口边缘却开始缩放。
+    #[test]
+    fn the_border_answers_with_the_side_it_is_on() {
+        use egui::viewport::ResizeDirection as Dir;
+
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(600.0, 440.0));
+
+        // 四个角:两条边同时命中,靠 match 的先后分出方向。
+        assert_eq!(resize_grip(egui::pos2(102.0, 52.0), rect), Some(Dir::NorthWest));
+        assert_eq!(resize_grip(egui::pos2(697.0, 52.0), rect), Some(Dir::NorthEast));
+        assert_eq!(resize_grip(egui::pos2(102.0, 487.0), rect), Some(Dir::SouthWest));
+        assert_eq!(resize_grip(egui::pos2(697.0, 487.0), rect), Some(Dir::SouthEast));
+
+        // 四条边,以及带外紧挨着的那一像素。
+        assert_eq!(resize_grip(egui::pos2(100.0, 300.0), rect), Some(Dir::West));
+        assert_eq!(resize_grip(egui::pos2(699.0, 300.0), rect), Some(Dir::East));
+        assert_eq!(resize_grip(egui::pos2(400.0, 50.0), rect), Some(Dir::North));
+        assert_eq!(resize_grip(egui::pos2(400.0, 489.0), rect), Some(Dir::South));
+        assert_eq!(resize_grip(egui::pos2(105.0, 300.0), rect), None);
+        assert_eq!(resize_grip(egui::pos2(400.0, 55.0), rect), None);
+
+        // 窗口里头:那是列表和按钮带,点它不该缩放。
+        assert_eq!(resize_grip(egui::pos2(400.0, 300.0), rect), None);
+    }
 
     fn work_area() -> win::RECT {
         win::RECT {
