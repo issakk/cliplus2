@@ -40,6 +40,12 @@ const ROW_HEIGHT: f32 = 46.0;
 /// 96 DPI 下的逻辑像素(egui 的 point 就是这个口径)。
 const RESIZE_GRIP: f32 = 5.0;
 
+/// 露脸前先在屏幕外停多远(物理像素)。Windows 不给隐藏窗口发重绘消息,所以
+/// 表面里的内容只能"亮着"画;亮着又不能让用户看见,就先停在没有任何显示器
+/// 的地方画一帧——`-32000` 是 Windows 自己最小化窗口时用的那类坐标,任何
+/// 多屏桌面都到不了。
+const PARK_OFFSET: i32 = 30_000;
+
 /// The open-at size the popup has always had (8 rows plus the bottom bands),
 /// and the floor a drag enforces. Kept as plain numbers since the layout
 /// constants they were derived from died with the legacy popup.
@@ -304,6 +310,12 @@ struct App {
     /// Mirrors the real window visibility; `ViewportCommand::Visible` lands
     /// asynchronously, so the flag is what the rest of the logic reads.
     visible: bool,
+    /// 已经在屏幕外"亮着"、正在等第一帧画完:画完就挪到位并抢焦点。
+    /// 这一段用户什么都看不到(窗口在屏幕外),但窗口已经是可见状态,eframe
+    /// 会正常跑 ui() 并绘制——这是让表面里有内容的唯一办法。
+    parked: bool,
+    /// 离屏幕外那几帧还差几帧(见 `unpark`)。
+    park_frames: u32,
     /// 启动时趁窗口藏着摆过一次位置尺寸了(避免第一次热键现场改尺寸)。
     geometry_applied: bool,
     /// Window that had focus when the popup opened: the paste target.
@@ -514,23 +526,52 @@ impl App {
         self.refill();
         self.focus_search = true;
 
-        // 位置和尺寸通常已经在藏着的时候摆好了(启动一次、每次 hide 之后一次),
-        // 这里只是兜底;重点是"显示"和"改尺寸"绝不放在同一批命令里——窗口会先带着
-        // 没画过内容的表面亮一下,尺寸落地时表面又重建一次,那就是第一次打开看到
-        // 的空黑框。摆好的窗口显示出来只需要一帧就能画上内容。
-        let (left, top, width_px, height_px, scale) = self.apply_geometry(ctx);
+        // 先在屏幕外亮出来,让 eframe 把内容画进表面(隐藏窗口收不到重绘消息,
+        // 画不了);下一帧再挪到位并抢焦点——直接亮在目标位置的话,窗口会先带着
+        // 空表面出现在屏幕正中,那就是"和弹窗一样大的空黑框"。
+        let (left, top, width_px, height_px, scale) = self.target_geometry();
+        let ppp = (scale as f32).max(0.25);
+        self.apply_size(ctx, width_px, height_px, ppp);
+        self.move_window_to(ctx, park_position(left, top, ppp));
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        // 显示之后立刻要一帧:没有它,窗口要等下一个事件(移动鼠标、按键)才有内容。
         ctx.request_repaint();
 
         self.visible = true;
+        self.parked = true;
+        self.park_frames = 0;
         self.shown_at = Instant::now();
         log::info(&format!(
-            "egui popup shown at {left},{top} {width_px}x{height_px} scale {scale:.2} ({} rows)",
+            "egui popup parked off-screen for its first paint; target {left},{top} {width_px}x{height_px} scale {scale:.2} ({} rows)",
             self.items.len()
         ));
+    }
+
+    /// 停车的第二半:屏幕外那一帧已经画完(表面里有内容了),把窗口挪到它该在
+    /// 的位置并抢焦点——用户看到的是画好的窗口,不是一块没画过的表面。
+    ///
+    /// 等两帧不是保险起见凑数:第一帧才是把内容画进去的那一帧,这一帧的挪动
+    /// 必须排在它后面。
+    fn unpark(&mut self, ctx: &egui::Context) {
+        if !self.parked {
+            return;
+        }
+        self.park_frames += 1;
+        if self.park_frames < 2 {
+            ctx.request_repaint();
+            return;
+        }
+
+        self.parked = false;
+        let (left, top, _, _, scale) = self.target_geometry();
+        let ppp = (scale as f32).max(0.25);
+        self.move_window_to(ctx, egui::pos2(left as f32 / ppp, top as f32 / ppp));
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+
+        self.shown_at = Instant::now();
+        log::info(&format!("egui popup shown at {left},{top}"));
     }
 
     /// 按记住的位置/尺寸算出窗口该在哪、多大(没有记住就居中在鼠标所在的屏幕)。
@@ -556,41 +597,38 @@ impl App {
         (left, top, width_px, height_px, scale)
     }
 
-    /// 把窗口摆到它该在的位置和尺寸,只在和现状不一样时才发命令:同样的尺寸
-    /// 再发一次会让 GL 表面重建,白白闪一下。
+    /// 只在和现状不一样时才发尺寸命令:同样的尺寸再发一次也会让 GL 表面重建,
+    /// 白白闪一下。
     ///
-    /// egui 的定位/尺寸命令按逻辑点换算(内部乘 pixels_per_point),旧布局常量
-    /// 是物理像素:用锚定屏的 scale 折算。窗口当前所在屏与锚定屏 scale 不同时
-    /// 会有一次性的偏差,由 winit 的 DPI 事件纠正。
-    ///
-    /// 藏着的窗口上调用,用户看不见;这是"显示前先摆好"的执行点。
-    fn apply_geometry(&self, ctx: &egui::Context) -> (i32, i32, i32, i32, f64) {
-        let (left, top, width_px, height_px, scale) = self.target_geometry();
-        let ppp = (scale as f32).max(0.25);
-        let wanted_position = egui::pos2(left as f32 / ppp, top as f32 / ppp);
-        let wanted_size = egui::vec2(width_px as f32 / ppp, height_px as f32 / ppp);
-
-        let current_position = ctx.input(|i| i.viewport().outer_rect).map(|rect| rect.min);
-        let current_size = ctx.input(|i| i.viewport().inner_rect).map(|rect| rect.size());
-
-        if current_size.map_or(true, |size| (size - wanted_size).length() > 1.0) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted_size));
+    /// egui 的尺寸命令按逻辑点换算(内部乘 pixels_per_point),旧布局常量是物理
+    /// 像素:用锚定屏的 scale 折算。
+    fn apply_size(&self, ctx: &egui::Context, width_px: i32, height_px: i32, ppp: f32) {
+        let wanted = egui::vec2(width_px as f32 / ppp, height_px as f32 / ppp);
+        let current = ctx.input(|i| i.viewport().inner_rect).map(|rect| rect.size());
+        if current.map_or(true, |size| (size - wanted).length() > 1.0) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
         }
-        if current_position.map_or(true, |position| (position - wanted_position).length() > 1.0) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(wanted_position));
-        }
+    }
 
-        (left, top, width_px, height_px, scale)
+    /// 同上,位置一侧。挪动不会重建表面,所以这一步放在停车之后是安全的。
+    fn move_window_to(&self, ctx: &egui::Context, position: egui::Pos2) {
+        let current = ctx.input(|i| i.viewport().outer_rect).map(|rect| rect.min);
+        if current.map_or(true, |now| (now - position).length() > 1.0) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+        }
     }
 
     /// 启动时窗口还藏着:现在就把上次的位置和尺寸摆好,第一次热键按下时不必
-    /// 现场改尺寸(改尺寸正是那一帧黑框的来源)。
+    /// 现场改尺寸(改尺寸正是表面重建的来源)。
     fn prepare_startup_geometry(&mut self, ctx: &egui::Context) {
         if self.geometry_applied || self.visible {
             return;
         }
         self.geometry_applied = true;
-        self.apply_geometry(ctx);
+        let (left, top, width_px, height_px, scale) = self.target_geometry();
+        let ppp = (scale as f32).max(0.25);
+        self.apply_size(ctx, width_px, height_px, ppp);
+        self.move_window_to(ctx, egui::pos2(left as f32 / ppp, top as f32 / ppp));
     }
 
     /// 刚显示的头 150 毫秒多要几帧:第一帧的内容可能是在尺寸或 DPI 还没完全
@@ -606,17 +644,24 @@ impl App {
             return;
         }
 
-        // The same pair of fields the legacy popup saved: physical position,
-        // logical (96-DPI) size — egui reports both rect in points, and on
-        // Windows points * pixels_per_point is exactly physical.
-        let ppp = ctx.pixels_per_point();
-        if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
-            let position = (
-                (outer.min.x * ppp).round() as i32,
-                (outer.min.y * ppp).round() as i32,
-            );
-            let size = (outer.width().round() as i32, outer.height().round() as i32);
-            crate::remember_popup_layout(position, size);
+        // 还在屏幕外停车、用户根本没见过的窗口:位置是停车点,不是用户摆的,
+        // 什么都不能往设置里写。
+        let was_parked = self.parked;
+        self.parked = false;
+
+        if !was_parked {
+            // The same pair of fields the legacy popup saved: physical position,
+            // logical (96-DPI) size — egui reports both rect in points, and on
+            // Windows points * pixels_per_point is exactly physical.
+            let ppp = ctx.pixels_per_point();
+            if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
+                let position = (
+                    (outer.min.x * ppp).round() as i32,
+                    (outer.min.y * ppp).round() as i32,
+                );
+                let size = (outer.width().round() as i32, outer.height().round() as i32);
+                crate::remember_popup_layout(position, size);
+            }
         }
 
         // A hydration that has not finished yet was started for a popup the
@@ -626,10 +671,12 @@ impl App {
         self.visible = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
 
-        // 收起之后窗口还在,趁它藏着把下次要用的位置和尺寸摆好:下次热键按下
-        // 时不必现场改尺寸(改尺寸会让表面重建,显示出来先黑一下)。
-        // 命令按顺序执行,所以尺寸是在 Visible(false) 之后才改的。
-        self.apply_geometry(ctx);
+        // 收起之后窗口还在,趁它藏着把下次要用的尺寸摆好:停车那一帧就不必再
+        // 改尺寸(改尺寸会重建表面,把刚画好的内容丢掉)。位置不用管——下次
+        // 显示时窗口本来就要先停到屏幕外,停在哪儿都一样。
+        let (_, _, width_px, height_px, scale) = self.target_geometry();
+        let ppp = (scale as f32).max(0.25);
+        self.apply_size(ctx, width_px, height_px, ppp);
 
         log::info("egui popup hidden");
     }
@@ -637,6 +684,7 @@ impl App {
     fn quit(&mut self, ctx: &egui::Context) {
         log::info("quit requested; closing the egui loop");
         self.visible = false;
+        self.parked = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         platform::request_quit();
     }
@@ -1304,6 +1352,14 @@ impl eframe::App for App {
         }
         let ctx = ui.ctx().clone();
 
+        // 停在屏幕外等首帧的窗口还没有焦点,也没有人会去点它;这一趟只是把内容
+        // 画进表面,别的什么都不做。
+        if self.parked {
+            self.draw(&ctx, ui);
+            self.unpark(&ctx);
+            return;
+        }
+
         // 失焦即收起,对应旧弹窗的 WM_ACTIVATE;刚显示的头 300ms 不检查,
         // 焦点还在路上;弹窗自己拉起的删除确认框是唯一例外。
         if !self.modal_open
@@ -1331,12 +1387,24 @@ impl eframe::App for App {
             self.forward_wheel_to_list(&ctx);
         }
 
+        self.draw(&ctx, ui);
+
+        // 确认框画在所有面板之上(egui 的模态自己带遮罩)。
+        if confirming {
+            self.draw_delete_confirm(&ctx, confirm_entered, confirm_escaped);
+        }
+    }
+}
+
+impl App {
+    /// 画界面本体。停车那一帧走的就是这里:内容必须先画进表面,窗口才能露面。
+    fn draw(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         // 0.36 的面板都长在传入的根 Ui 上,不再接 Context。先加的贴底边:
         // 搜索条在最下,机器条在它上面。
         egui::Panel::bottom("search_bar")
             .frame(egui::Frame::default().fill(COLOR_BG).inner_margin(8.0))
             .show(ui, |ui| {
-                self.start_drag_on_background(ui, &ctx, "drag_search");
+                self.start_drag_on_background(ui, ctx, "drag_search");
 
                 ui.horizontal(|ui| {
                     if ui
@@ -1426,7 +1494,7 @@ impl eframe::App for App {
                     }),
             )
             .show(ui, |ui| {
-                self.start_drag_on_background(ui, &ctx, "drag_tabs");
+                self.start_drag_on_background(ui, ctx, "drag_tabs");
 
                 // Tabs live in the store as (id, label); clone the labels out
                 // so the mutable tab switch below never overlaps the borrow.
@@ -1449,7 +1517,7 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(COLOR_BG).inner_margin(8.0))
             .show(ui, |ui| {
-                self.start_drag_on_background(ui, &ctx, "drag_list");
+                self.start_drag_on_background(ui, ctx, "drag_list");
 
                 // 右上角两道短杠:旧的 Win32 弹窗用它提示"这儿能拉",位置照旧。
                 // 画在早退之前,列表空着时也在。
@@ -1504,12 +1572,13 @@ impl eframe::App for App {
                 self.list_offset = output.state.offset.y;
                 self.list_rect = Some(output.inner_rect);
             });
-
-        // 确认框画在所有面板之上(egui 的模态自己带遮罩)。
-        if confirming {
-            self.draw_delete_confirm(&ctx, confirm_entered, confirm_escaped);
-        }
     }
+}
+
+/// 停车点:目标位置的左边 `PARK_OFFSET` 物理像素处,尺寸不变。没有任何显示器
+/// 会延伸到那个坐标上,所以窗口在那儿是"亮着但没人看得见"。
+fn park_position(left: i32, top: i32, ppp: f32) -> egui::Pos2 {
+    egui::pos2((left - PARK_OFFSET) as f32 / ppp, top as f32 / ppp)
 }
 
 /// 指针是否压在窗口边缘的缩放带上,压着的话是哪个方向。纯函数,单独测:
