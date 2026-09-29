@@ -304,6 +304,8 @@ struct App {
     /// Mirrors the real window visibility; `ViewportCommand::Visible` lands
     /// asynchronously, so the flag is what the rest of the logic reads.
     visible: bool,
+    /// 启动时趁窗口藏着摆过一次位置尺寸了(避免第一次热键现场改尺寸)。
+    geometry_applied: bool,
     /// Window that had focus when the popup opened: the paste target.
     target: isize,
     /// When the popup was shown; focus-loss auto-hide waits out the first
@@ -383,6 +385,7 @@ impl App {
             store,
             events,
             visible: false,
+            geometry_applied: false,
             target: 0,
             shown_at: Instant::now(),
             modal_open: false,
@@ -490,6 +493,7 @@ impl App {
     }
 
     fn toggle(&mut self, ctx: &egui::Context) {
+        // 准备中(pending)也算"开着":那一瞬间再按热键应当是取消打开。
         if self.visible {
             self.hide(ctx);
         } else {
@@ -510,9 +514,28 @@ impl App {
         self.refill();
         self.focus_search = true;
 
-        // Same placement rule as the legacy popup: remembered position wins,
-        // otherwise the monitor under the cursor; everything clamped to the
-        // work area of that monitor.
+        // 位置和尺寸通常已经在藏着的时候摆好了(启动一次、每次 hide 之后一次),
+        // 这里只是兜底;重点是"显示"和"改尺寸"绝不放在同一批命令里——窗口会先带着
+        // 没画过内容的表面亮一下,尺寸落地时表面又重建一次,那就是第一次打开看到
+        // 的空黑框。摆好的窗口显示出来只需要一帧就能画上内容。
+        let (left, top, width_px, height_px, scale) = self.apply_geometry(ctx);
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        // 显示之后立刻要一帧:没有它,窗口要等下一个事件(移动鼠标、按键)才有内容。
+        ctx.request_repaint();
+
+        self.visible = true;
+        self.shown_at = Instant::now();
+        log::info(&format!(
+            "egui popup shown at {left},{top} {width_px}x{height_px} scale {scale:.2} ({} rows)",
+            self.items.len()
+        ));
+    }
+
+    /// 按记住的位置/尺寸算出窗口该在哪、多大(没有记住就居中在鼠标所在的屏幕)。
+    /// 返回物理位置/尺寸和这一屏的缩放。
+    fn target_geometry(&self) -> (i32, i32, i32, i32, f64) {
         let saved = crate::current_settings();
         let remembered = saved.as_ref().and_then(|s| s.popup_position);
         let size = saved
@@ -530,27 +553,52 @@ impl App {
         let height_px = win::scaled(size.1.max(MIN_SIZE.1), scale).min(area.bottom - area.top);
         let (left, top) = placed(remembered, &area, width_px, height_px);
 
-        // egui 的定位/尺寸命令按逻辑点换算(内部乘 pixels_per_point),旧布局
-        // 常量是物理像素:用锚定屏的 scale 折算。窗口当前所在屏与锚定屏 scale
-        // 不同时会有一次性的偏差,显示后自动被 winit 的 DPI 事件纠正。
-        let ppp = (scale as f32).max(0.25);
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-            left as f32 / ppp,
-            top as f32 / ppp,
-        )));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            width_px as f32 / ppp,
-            height_px as f32 / ppp,
-        )));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        (left, top, width_px, height_px, scale)
+    }
 
-        self.visible = true;
-        self.shown_at = Instant::now();
-        log::info(&format!(
-            "egui popup shown at {left},{top} {width_px}x{height_px} scale {scale:.2} ({} rows)",
-            self.items.len()
-        ));
+    /// 把窗口摆到它该在的位置和尺寸,只在和现状不一样时才发命令:同样的尺寸
+    /// 再发一次会让 GL 表面重建,白白闪一下。
+    ///
+    /// egui 的定位/尺寸命令按逻辑点换算(内部乘 pixels_per_point),旧布局常量
+    /// 是物理像素:用锚定屏的 scale 折算。窗口当前所在屏与锚定屏 scale 不同时
+    /// 会有一次性的偏差,由 winit 的 DPI 事件纠正。
+    ///
+    /// 藏着的窗口上调用,用户看不见;这是"显示前先摆好"的执行点。
+    fn apply_geometry(&self, ctx: &egui::Context) -> (i32, i32, i32, i32, f64) {
+        let (left, top, width_px, height_px, scale) = self.target_geometry();
+        let ppp = (scale as f32).max(0.25);
+        let wanted_position = egui::pos2(left as f32 / ppp, top as f32 / ppp);
+        let wanted_size = egui::vec2(width_px as f32 / ppp, height_px as f32 / ppp);
+
+        let current_position = ctx.input(|i| i.viewport().outer_rect).map(|rect| rect.min);
+        let current_size = ctx.input(|i| i.viewport().inner_rect).map(|rect| rect.size());
+
+        if current_size.map_or(true, |size| (size - wanted_size).length() > 1.0) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted_size));
+        }
+        if current_position.map_or(true, |position| (position - wanted_position).length() > 1.0) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(wanted_position));
+        }
+
+        (left, top, width_px, height_px, scale)
+    }
+
+    /// 启动时窗口还藏着:现在就把上次的位置和尺寸摆好,第一次热键按下时不必
+    /// 现场改尺寸(改尺寸正是那一帧黑框的来源)。
+    fn prepare_startup_geometry(&mut self, ctx: &egui::Context) {
+        if self.geometry_applied || self.visible {
+            return;
+        }
+        self.geometry_applied = true;
+        self.apply_geometry(ctx);
+    }
+
+    /// 刚显示的头 150 毫秒多要几帧:第一帧的内容可能是在尺寸或 DPI 还没完全
+    /// 落定时画的,让窗口自己收敛(十来个空帧,开销可以忽略)。
+    fn keep_repainting_just_after_show(&self, ctx: &egui::Context) {
+        if self.visible && self.shown_at.elapsed() < Duration::from_millis(150) {
+            ctx.request_repaint();
+        }
     }
 
     fn hide(&mut self, ctx: &egui::Context) {
@@ -577,6 +625,12 @@ impl App {
         self.hydrating = None;
         self.visible = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+
+        // 收起之后窗口还在,趁它藏着把下次要用的位置和尺寸摆好:下次热键按下
+        // 时不必现场改尺寸(改尺寸会让表面重建,显示出来先黑一下)。
+        // 命令按顺序执行,所以尺寸是在 Visible(false) 之后才改的。
+        self.apply_geometry(ctx);
+
         log::info("egui popup hidden");
     }
 
@@ -1239,9 +1293,12 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events(ctx);
         self.drain_workers(ctx);
+        self.prepare_startup_geometry(ctx);
+        self.keep_repainting_just_after_show(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 隐藏时 eframe 连这一趟都不跑(它只调 logic),这里是双保险。
         if !self.visible {
             return;
         }
