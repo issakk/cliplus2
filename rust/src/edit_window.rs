@@ -107,7 +107,7 @@ pub fn create() -> bool {
         0,
         width,
         height,
-        win::COLOR_BTNFACE_BRUSH,
+        win::dialog_brush(),
     );
 
     if hwnd == 0 {
@@ -177,6 +177,11 @@ pub fn create() -> bool {
     if unsafe { win::SetWindowSubclass(text, subclass, EDIT_SUBCLASS_ID, 0) } == 0 {
         log::warn("SetWindowSubclass failed for the editor; Ctrl+Enter and Esc will not work");
     }
+
+    // Dark look, same palette as the popup — see settings_window.
+    win::dark_title_bar(hwnd);
+    win::dark_theme(hwnd);
+    win::dark_theme_children(hwnd);
 
     log::info(&format!("edit window ready (hwnd {hwnd:#x})"));
     true
@@ -438,6 +443,17 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
 
             layout(scale);
             0
+        }
+
+        // Dark palette, shared with settings_window and the popup. The big
+        // multiline EDIT is the WM_CTLCOLOREDIT case.
+        win::WM_CTLCOLOREDIT | win::WM_CTLCOLORLISTBOX => {
+            win::set_dialog_text(wparam as win::HDC);
+            win::dialog_input_brush() as win::LRESULT
+        }
+        win::WM_CTLCOLORSTATIC => {
+            win::set_dialog_text(wparam as win::HDC);
+            win::dialog_brush() as win::LRESULT
         }
 
         _ => win::def_window_proc(hwnd, message, wparam, lparam),

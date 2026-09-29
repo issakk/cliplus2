@@ -142,7 +142,7 @@ pub fn create() -> bool {
         0,
         width,
         height,
-        win::COLOR_BTNFACE_BRUSH,
+        win::dialog_brush(),
     );
 
     if hwnd == 0 {
@@ -277,6 +277,13 @@ pub fn create() -> bool {
         log::error("settings window already created");
         return false;
     }
+
+    // Dark look, same palette as the popup: title bar via DWM, window and every
+    // child control via the uxtheme switch, control colours via the CTLCOLOR
+    // answers in the window proc. Best-effort on every axis.
+    win::dark_title_bar(hwnd);
+    win::dark_theme(hwnd);
+    win::dark_theme_children(hwnd);
 
     log::info(&format!("settings window ready (hwnd {hwnd:#x})"));
     true
@@ -756,6 +763,19 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                 }
             }
             0
+        }
+
+        // Dark palette: the controls announce themselves in wparam's DC, the
+        // answer is light text plus the matching background brush. Edits and
+        // the combo's dropdown get the input shade, labels and statics the
+        // plain one.
+        win::WM_CTLCOLOREDIT | win::WM_CTLCOLORLISTBOX => {
+            win::set_dialog_text(wparam as win::HDC);
+            win::dialog_input_brush() as win::LRESULT
+        }
+        win::WM_CTLCOLORSTATIC => {
+            win::set_dialog_text(wparam as win::HDC);
+            win::dialog_brush() as win::LRESULT
         }
 
         // Closing hides rather than destroys, so the window can be reopened

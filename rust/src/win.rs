@@ -175,6 +175,11 @@ pub const WM_DRAWITEM: u32 = 0x002B;
 pub const WM_ERASEBKGND: u32 = 0x0014;
 pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_COMMAND: u32 = 0x0111;
+/// The three CTLCOLOR messages: the parent gets to hand each control its text
+/// colour and background brush while it draws. The dark dialogs answer them.
+pub const WM_CTLCOLOREDIT: u32 = 0x0133;
+pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
+pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
 pub const WM_LBUTTONDOWN: u32 = 0x0201;
 pub const WM_SIZE: u32 = 0x0005;
 pub const WM_GETMINMAXINFO: u32 = 0x0024;
@@ -419,6 +424,15 @@ pub struct TOKEN_ELEVATION {
 }
 
 
+// ------------------------------------------------------------------ dwmapi.dll
+
+// Dark title bars. One call, and only one — the rest of the dark look comes
+// from uxtheme and the palette above.
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmSetWindowAttribute(hwnd: HWND, attribute: u32, value: *const c_void, size: u32) -> i32;
+}
+
 // ------------------------------------------------------------------ user32.dll
 
 #[link(name = "user32")]
@@ -440,6 +454,7 @@ extern "system" {
     ) -> HWND;
     fn DefWindowProcW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
     fn GetMessageW(lpMsg: *mut MSG, hWnd: HWND, wMsgFilterMin: u32, wMsgFilterMax: u32) -> i32;
+    fn EnumChildWindows(hWndParent: HWND, lpEnumFunc: Option<unsafe extern "system" fn(HWND, LPARAM) -> i32>, lParam: LPARAM) -> i32;
     fn TranslateMessage(lpMsg: *const MSG) -> i32;
     fn DispatchMessageW(lpMsg: *const MSG) -> i32;
     fn PostQuitMessage(nExitCode: i32);
@@ -1750,5 +1765,82 @@ fn uxtheme_export(ordinal: usize) -> Option<*mut c_void> {
         } else {
             Some(found)
         }
+    }
+}
+
+// ---------------------------------------------------------------- dark dialogs
+
+/// The settings/cleanup/edit dialogs share the popup's palette. Everything is a
+/// grey, so the COLORREF byte order (`0x00BBGGRR`) never shows.
+pub const DIALOG_BG: u32 = 0x001E_1E1E;
+pub const DIALOG_INPUT_BG: u32 = 0x002A_2A2A;
+pub const DIALOG_TEXT: u32 = 0x00E6_E6E6;
+
+/// Shared background brushes, created once. `WM_CTLCOLOR*` handlers return
+/// these, so they must outlive every message.
+pub fn dialog_brush() -> HBRUSH {
+    static BRUSH: OnceLock<HBRUSH> = OnceLock::new();
+    *BRUSH.get_or_init(|| unsafe { CreateSolidBrush(DIALOG_BG) })
+}
+
+pub fn dialog_input_brush() -> HBRUSH {
+    static BRUSH: OnceLock<HBRUSH> = OnceLock::new();
+    *BRUSH.get_or_init(|| unsafe { CreateSolidBrush(DIALOG_INPUT_BG) })
+}
+
+/// Light text on a transparent background — the half the CTLCOLOR answer does
+/// before returning the brush.
+pub fn set_dialog_text(dc: HDC) {
+    const TRANSPARENT: i32 = 1;
+    unsafe {
+        SetTextColor(dc, DIALOG_TEXT);
+        SetBkMode(dc, TRANSPARENT);
+    }
+}
+
+/// The per-window dark switch, restored from the legacy popup: a control keeps
+/// the light theme until told otherwise, and the explorer theme class is what
+/// darkens checkboxes, radios and combo dropdowns that draw themselves.
+pub fn dark_theme(hwnd: HWND) {
+    if let Some(entry) = uxtheme_export(ORD_ALLOW_DARK_MODE_FOR_WINDOW) {
+        // Declared as taking a bool; passing the integer is the same call on x64.
+        let allow: unsafe extern "system" fn(HWND, i32) -> i32 =
+            unsafe { std::mem::transmute(entry) };
+        unsafe {
+            allow(hwnd, 1);
+        }
+    }
+
+    let theme = wide(DARK_THEME);
+    unsafe {
+        SetWindowTheme(hwnd, theme.as_ptr(), std::ptr::null());
+    }
+}
+
+/// Every child control of `parent`, in one call. The dialogs have a dozen
+/// controls each and every one of them needs the dark switch.
+pub fn dark_theme_children(parent: HWND) {
+    extern "system" fn on_child(hwnd: HWND, _lparam: LPARAM) -> i32 {
+        dark_theme(hwnd);
+        1 // TRUE: keep walking
+    }
+    unsafe {
+        EnumChildWindows(parent, Some(on_child), 0);
+    }
+}
+
+/// Dark title bar. Windows 10 1903 and later understand attribute 20; older
+/// systems fail the call silently and keep the light one — same best-effort
+/// contract as the rest of the dark-mode hack.
+pub fn dark_title_bar(hwnd: HWND) {
+    const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+    let on: i32 = 1;
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &on as *const i32 as *const c_void,
+            4,
+        );
     }
 }

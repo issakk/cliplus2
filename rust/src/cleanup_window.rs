@@ -148,7 +148,7 @@ pub fn create() -> bool {
         0,
         width,
         height,
-        win::COLOR_BTNFACE_BRUSH,
+        win::dialog_brush(),
     );
 
     if hwnd == 0 {
@@ -335,6 +335,11 @@ pub fn create() -> bool {
         log::error("cleanup window already created");
         return false;
     }
+
+    // Dark look, same palette as the popup — see settings_window.
+    win::dark_title_bar(hwnd);
+    win::dark_theme(hwnd);
+    win::dark_theme_children(hwnd);
 
     put_text(ID_BINS_DAYS, &DEFAULT_DAYS.to_string());
     put_text(ID_BINS_KEEP, &DEFAULT_KEEP.to_string());
@@ -927,6 +932,16 @@ extern "system" fn window_proc(
 
             layout(hwnd, scale);
             0
+        }
+
+        // Dark palette, shared with settings_window and the popup.
+        win::WM_CTLCOLOREDIT | win::WM_CTLCOLORLISTBOX => {
+            win::set_dialog_text(wparam as win::HDC);
+            win::dialog_input_brush() as win::LRESULT
+        }
+        win::WM_CTLCOLORSTATIC => {
+            win::set_dialog_text(wparam as win::HDC);
+            win::dialog_brush() as win::LRESULT
         }
 
         _ => win::def_window_proc(hwnd, message, wparam, lparam),
