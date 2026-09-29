@@ -1,11 +1,8 @@
 //! The egui popup.
 //!
-//! Enabled with `CLIPPLUS_UI=egui`; the legacy Win32 popup stays the default
-//! until Phase 4. Phase 1 proved the three lifelines (IME, instant open,
-//! paste-back); Phase 2 brings the feature set to parity with the legacy
-//! popup — filter chips, machine tabs, the row context menu, image
-//! thumbnails, background hydration of `.bin` payloads, multi-selection and
-//! remembered layout.
+//! The one popup: egui draws it on the GPU (glow), the Win32 one is gone.
+//! Filter chips, machine tabs, the row context menu, image thumbnails,
+//! background hydration of `.bin` payloads, multi-selection, remembered layout.
 //!
 //! Threading: the platform thread sends `PlatformEvent`s over a channel; a
 //! worker thread decodes thumbnails; hydrate threads read `.bin` payloads.
@@ -99,6 +96,7 @@ pub fn run(store: Arc<Store>) {
         viewport: egui::ViewportBuilder::default()
             .with_title("ClipPlus")
             // 预建窗口,启动即隐藏:热键按下时只剩"显示"这一步,秒开保留。
+            // 这一行只是起点——eframe 会自己把它显出来,真正让它藏着的是 `enforce_hidden`。
             .with_visible(false)
             .with_decorations(false)
             .with_resizable(true)
@@ -318,6 +316,8 @@ struct App {
     park_frames: u32,
     /// 启动时趁窗口藏着摆过一次位置尺寸了(避免第一次热键现场改尺寸)。
     geometry_applied: bool,
+    /// 已经为"窗口本该藏着"记过一次日志(见 `enforce_hidden`)。
+    hide_logged: bool,
     /// Window that had focus when the popup opened: the paste target.
     target: isize,
     /// When the popup was shown; focus-loss auto-hide waits out the first
@@ -400,6 +400,7 @@ impl App {
             parked: false,
             park_frames: 0,
             geometry_applied: false,
+            hide_logged: false,
             target: 0,
             shown_at: Instant::now(),
             modal_open: false,
@@ -638,6 +639,24 @@ impl App {
     fn keep_repainting_just_after_show(&self, ctx: &egui::Context) {
         if self.visible && self.shown_at.elapsed() < Duration::from_millis(150) {
             ctx.request_repaint();
+        }
+    }
+
+    /// eframe 自己会把窗口显出来:它建窗口时先藏着,画出第一帧后再 `set_visible(true)`
+    /// (`epi_integration::post_rendering` —— 就是它"启动不闪白"的那个做法),
+    /// `with_visible(false)` 在它面前毫无作用。那一下显出来的是没画过任何东西的表面,
+    /// 于是启动后桌面上就杵着一个和弹窗一样大的空黑框,直到第一次按热键才被顶掉。
+    ///
+    /// 那一帧拦不住(命令都在同一帧末尾落地),所以每一帧都把它按回去:窗口本来就该
+    /// 藏着。重复的 `Visible(false)` 一路到底都是空转 —— winit 只在可见性真的变了才动窗口。
+    fn enforce_hidden(&mut self, ctx: &egui::Context) {
+        if self.visible {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        if !self.hide_logged {
+            self.hide_logged = true;
+            log::info("popup kept hidden: eframe shows the root window after its first frame");
         }
     }
 
@@ -1344,11 +1363,13 @@ impl eframe::App for App {
         self.drain_events(ctx);
         self.drain_workers(ctx);
         self.prepare_startup_geometry(ctx);
+        self.enforce_hidden(ctx);
         self.keep_repainting_just_after_show(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // 隐藏时 eframe 连这一趟都不跑(它只调 logic),这里是双保险。
+        // 藏着的时候 eframe 也可能照样跑这一趟:它只按 `ViewportInfo` 判断可见性,
+        // 而 winit 在 Windows 上从不填那个字段。这里是双保险,别当真它不跑。
         if !self.visible {
             return;
         }
