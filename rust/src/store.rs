@@ -311,14 +311,6 @@ impl Store {
         }
     }
 
-    /// The app menu's rows: distinct sources among the visible clips of the
-    /// instances shown, noisiest first. Built on click, never cached — the index
-    /// walk is one pass, and a menu is not a hot path.
-    pub fn apps(&self, machine: Option<&str>) -> Vec<(String, usize)> {
-        let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
-        index.apps(machine)
-    }
-
     /// The instance strip: everything, then this machine, then the others in the
     /// order they last captured something.
     pub fn machines(&self) -> Vec<MachineTab> {

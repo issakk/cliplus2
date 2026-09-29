@@ -85,46 +85,52 @@ const HELP_SIZE: i32 = 30;
 const HELP_GAP: i32 = 6;
 const ID_HELP: usize = 1;
 
-/// The three filter buttons on the input row, left of the search box: which kind,
-/// which application, how old. Painted like the tabs rather than made of controls,
-/// so they share the strip's brushes and none of them can take the keyboard away
-/// from the search box. Wide enough for the widest face they show — `类型:文件` and
-/// friends — and an over-long app name is the label's problem, not the layout's.
-const FILTER_WIDTH: i32 = 78;
+/// The four buttons on the input row, left of the search box. Two checkboxes —
+/// whether bare terms also look in the exe name and the window title — and two
+/// menus — which kind, how old. Painted like the tabs rather than made of
+/// controls, so they share the strip's brushes and none of them can take the
+/// keyboard away from the search box.
+const FILTER_BOX_WIDTH: i32 = 64;
+const FILTER_MENU_WIDTH: i32 = 78;
 const FILTER_GAP: i32 = 6;
 
 /// The filter menus' ids. The row menu owns 1..=5, so each menu gets its own range
-/// with `全部` first: kind at 100, app at 120 with one id per app after it, time
-/// at 140.
+/// with `全部` first: kind at 100, time at 140.
 const MENU_KIND: i32 = 100;
-const MENU_APP: i32 = 120;
 const MENU_TIME: i32 = 140;
 
-/// Which filter button a rect belongs to. The order is the order they are drawn
-/// in, left to right, and the menus come back in the same order in the help text.
+/// Which button a rect belongs to. The order is the order they are drawn in,
+/// left to right: the two scope boxes first, then the two filter menus.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Chip {
+    AppBox,
+    TitleBox,
     Kind,
-    App,
     Time,
 }
 
-const ALL_CHIPS: [Chip; 3] = [Chip::Kind, Chip::App, Chip::Time];
+const ALL_CHIPS: [Chip; 4] = [Chip::AppBox, Chip::TitleBox, Chip::Kind, Chip::Time];
 
 impl Chip {
-    /// The face the button shows: bare, with an arrow, while nothing is picked;
-    /// the current value once one is. The arrow is what says this is a menu, and
-    /// it only shows while the button holds nothing — a filled button says what
-    /// it holds instead.
+    /// Fixed width in logical pixels: wide enough for the widest face the button
+    /// shows, and an over-long label is the text's problem, not the layout's.
+    fn width(self) -> i32 {
+        match self {
+            Chip::AppBox | Chip::TitleBox => FILTER_BOX_WIDTH,
+            Chip::Kind | Chip::Time => FILTER_MENU_WIDTH,
+        }
+    }
+
+    /// The face the button shows. A box is a checkbox — `☑` holding, `☐` not —
+    /// and a menu is bare with an arrow while nothing is picked, the current
+    /// value once one is.
     fn label(self, chips: &Chips) -> String {
         match self {
+            Chip::AppBox => format!("{} 应用", check_mark(chips.in_app)),
+            Chip::TitleBox => format!("{} 标题", check_mark(chips.in_title)),
             Chip::Kind => match chips.kind {
                 None => "类型 ▾".to_string(),
                 Some(kind) => format!("类型:{}", kind.label()),
-            },
-            Chip::App => match &chips.app {
-                None => "应用 ▾".to_string(),
-                Some(app) => format!("应用:{app}"),
             },
             Chip::Time => match chips.time {
                 TimeChip::All => "时间 ▾".to_string(),
@@ -135,14 +141,24 @@ impl Chip {
         }
     }
 
-    /// Whether the button is holding a filter. The active face is the selected-row
-    /// colour, so a popup that shows fewer rows than expected explains itself.
+    /// Whether the button is holding something. The active face is the
+    /// selected-row colour, so a popup that shows fewer rows than expected —
+    /// or finds more than it used to — explains itself.
     fn active(self, chips: &Chips) -> bool {
         match self {
+            Chip::AppBox => chips.in_app,
+            Chip::TitleBox => chips.in_title,
             Chip::Kind => chips.kind.is_some(),
-            Chip::App => chips.app.is_some(),
             Chip::Time => chips.time != TimeChip::All,
         }
+    }
+}
+
+fn check_mark(on: bool) -> &'static str {
+    if on {
+        "☑"
+    } else {
+        "☐"
     }
 }
 
@@ -181,12 +197,16 @@ impl TimeChip {
     }
 }
 
-/// What the three buttons currently hold. `Default` is every button bare, which
-/// is also what the popup opens with — the buttons reset with the search box.
+/// What the four buttons currently hold. The two boxes are search *scope* —
+/// where bare terms look — so they persist across opens, like the tabs: ticking
+/// 应用 is a preference, not a query. The two menus are filters, and reset with
+/// the search box — a popup summoned to paste something is not asking to still
+/// be narrowing last session's results.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct Chips {
+    in_app: bool,
+    in_title: bool,
     kind: Option<ClipKind>,
-    app: Option<String>,
     time: TimeChip,
 }
 
@@ -204,10 +224,11 @@ const CMD_SELECT_ALL: i32 = 5;
 const HELP_TEXT: &str = "\
 默认只搜记录内容（前 512 字），空格分开的每个词都要命中，顺序和距离随便。
 
-搜索框左边三个按钮点开就能筛，可叠加：
-  类型 — 文本 / 图片 / 文件
-  应用 — 历史里出现过的来源程序（按条数排序）
-  时间 — 今天 / 近7天 / 近30天
+搜索框左边四个按钮：
+  ☑ 应用 / ☑ 标题   勾上后，输入的词也会去搜来源程序（exe 名）和复制那一刻的窗口标题；
+                    勾选会一直记着，不随弹窗关闭重置
+  类型 ▾            点开筛 文本 / 图片 / 文件
+  时间 ▾            点开筛 今天 / 近7天 / 近30天；类型和时间每次打开弹窗会清空
 
 要打字也可以用字段词缀，和按钮、和普通词都能混用：
   app:chrome        来源程序（只存 exe 名）
@@ -269,9 +290,8 @@ struct Popup {
     items: Mutex<Vec<ClipSummary>>,
     /// Which instance the list is showing. `None` is the "everything" tab.
     tab: Mutex<Option<String>>,
-    /// What the three filter buttons hold. Cleared on every open, with the
-    /// search box — a popup summoned to paste something is not asking to still
-    /// be filtering last session's query.
+    /// What the four buttons hold. Cleared on open are the two menus, with the
+    /// search box; the two scope boxes persist, like the tabs.
     chips: Mutex<Chips>,
     /// The strip as last drawn: hit tested by `tab_click`, and compared so that
     /// a repaint only happens when the set of instances actually changed.
@@ -518,7 +538,12 @@ pub fn show() {
     unsafe {
         win::SetWindowTextW(p.search, empty.as_ptr());
     }
-    *p.chips.lock().unwrap_or_else(|e| e.into_inner()) = Chips::default();
+    // The menus reset with the box; the scope boxes are preferences and stay.
+    {
+        let mut chips = p.chips.lock().unwrap_or_else(|e| e.into_inner());
+        chips.kind = None;
+        chips.time = TimeChip::All;
+    }
     reload();
 
     let cursor = win::cursor_position();
@@ -666,9 +691,12 @@ fn layout(p: &Popup, width: i32, height: i32, scale: f64) {
 
     let help_width = scaled(HELP_SIZE, scale);
     let search_top = height - scaled(SEARCH_FROM_BOTTOM, scale);
-    // Three buttons and the gap between the last of them and the box: what the
+    // Four buttons and the gap between the last of them and the box: what the
     // input row hands to the filters before the search box gets its share.
-    let filter_span = scaled(FILTER_WIDTH * 3 + FILTER_GAP * 3, scale);
+    let filter_span = scaled(
+        FILTER_BOX_WIDTH * 2 + FILTER_MENU_WIDTH * 2 + FILTER_GAP * 4,
+        scale,
+    );
 
     unsafe {
         win::SetWindowPos(
@@ -821,8 +849,9 @@ fn fill_list() {
     // The time preset becomes its bound here rather than in the index, so the
     // cutoff follows the clock on every refill and the index never reads it.
     let chip_filter = ChipFilter {
+        in_app: chips.in_app,
+        in_title: chips.in_title,
         kind: chips.kind,
-        app: chips.app.clone(),
         since_ms: chips.time.since_ms(crate::settings::now_ms()),
     };
 
@@ -2064,12 +2093,13 @@ fn paint(hwnd: HWND) {
             left += step;
         }
 
-        // The three filter buttons, in the tabs' two faces: input-coloured while
-        // bare, selected-coloured while holding a filter, so a list that came up
-        // shorter than expected explains itself. Not controls — a click on one is
-        // hit tested in the window proc against these same rects, and nothing here
-        // can take the keyboard from the search box. Drawn under the same selected
-        // font as the tabs, which is why this sits before the restore below.
+        // The four filter buttons, in the tabs' two faces: input-coloured while
+        // bare, selected-coloured while holding a choice, so a popup finding more
+        // or fewer rows than expected explains itself. Not controls — a click on
+        // one is hit tested in the window proc against these same rects, and
+        // nothing here can take the keyboard from the search box. Drawn under the
+        // same selected font as the tabs, which is why this sits before the
+        // restore below.
         let chips = p.chips.lock().unwrap_or_else(|e| e.into_inner()).clone();
         for (rect, chip) in filter_rects(hwnd) {
             let active = chip.active(&chips);
@@ -2181,47 +2211,35 @@ fn set_tab(id: Option<String>) {
     }
 }
 
-/// The three filter buttons' rects on the input row, in client coordinates.
-/// `paint` draws from these and `filter_click` hit-tests against them, so the
-/// two cannot disagree about where a button is — the same trick the tab strip
-/// uses.
-fn filter_rects(hwnd: HWND) -> [(win::RECT, Chip); 3] {
+/// The four buttons' rects on the input row, in client coordinates. `paint`
+/// draws from these and `filter_click` hit-tests against them, so the two cannot
+/// disagree about where a button is — the same trick the tab strip uses.
+fn filter_rects(hwnd: HWND) -> Vec<(win::RECT, Chip)> {
     let scale = current_scale();
     let left = scaled(PAD, scale);
     let top = bottom_band_top(hwnd, SEARCH_FROM_BOTTOM, scale);
-    let width = scaled(FILTER_WIDTH, scale);
     let height = scaled(SEARCH_HEIGHT, scale);
-    let step = width + scaled(FILTER_GAP, scale);
+    let gap = scaled(FILTER_GAP, scale);
 
-    let mut rects: [(win::RECT, Chip); 3] = [(
-        win::RECT {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        },
-        Chip::Kind,
-    ); 3];
-
-    for (index, chip) in ALL_CHIPS.into_iter().enumerate() {
-        let index = index as i32;
-        let button_left = left + index * step;
-        rects[index as usize] = (
-            win::RECT {
-                left: button_left,
+    ALL_CHIPS
+        .iter()
+        .scan(left, |left, &chip| {
+            let width = scaled(chip.width(), scale);
+            let rect = win::RECT {
+                left: *left,
                 top,
-                right: button_left + width,
+                right: *left + width,
                 bottom: top + height,
-            },
-            chip,
-        );
-    }
-
-    rects
+            };
+            *left += width + gap;
+            Some((rect, chip))
+        })
+        .collect()
 }
 
-/// A click on one of the three filter buttons opens its menu; `false` is the
-/// tab strip's and the drag's cue, the same contract `tab_click` works under.
+/// A click on one of the four buttons: the boxes flip and refill, the menus
+/// open. `false` is the tab strip's and the drag's cue, the same contract
+/// `tab_click` works under.
 fn filter_click(lparam: LPARAM) -> bool {
     let Some(p) = popup() else {
         return false;
@@ -2232,12 +2250,39 @@ fn filter_click(lparam: LPARAM) -> bool {
 
     for (rect, chip) in filter_rects(p.hwnd) {
         if x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom {
-            open_filter_menu(p, chip, rect);
+            match chip {
+                Chip::AppBox | Chip::TitleBox => toggle_filter_box(chip),
+                Chip::Kind | Chip::Time => open_filter_menu(p, chip, rect),
+            }
             return true;
         }
     }
 
     false
+}
+
+/// One of the two checkbox buttons: a click flips the scope it stands for and
+/// the list refills — no menu, a checkbox is its own whole UI.
+fn toggle_filter_box(chip: Chip) {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    {
+        let mut chips = p.chips.lock().unwrap_or_else(|e| e.into_inner());
+        match chip {
+            Chip::AppBox => chips.in_app = !chips.in_app,
+            Chip::TitleBox => chips.in_title = !chips.in_title,
+            // The menus never come here; `filter_click` sends them to their menu.
+            Chip::Kind | Chip::Time => {}
+        }
+    }
+
+    // The button face lives on the window, the rows on the list: both change.
+    unsafe {
+        win::InvalidateRect(p.hwnd, std::ptr::null(), 1);
+    }
+    fill_list();
 }
 
 /// `MF_CHECKED` when the condition holds, so an open menu shows the choice the
@@ -2251,17 +2296,23 @@ fn menu_flags(checked_on: bool) -> u32 {
     }
 }
 
-/// Opens the menu one of the three buttons offers, dropped from the button's
-/// bottom edge like any dropdown. Kind and time are fixed lists; the app menu
-/// is whatever the history has actually seen under the tab the list is showing,
-/// counted, so the choice can only ever be a filter that matches something.
+/// Opens the menu one of the two menu buttons offers, dropped from the button's
+/// bottom edge like any dropdown. Kind is a fixed list; time is the fixed presets,
+/// turned into a bound only when the list refills.
 ///
 /// The same foreground dance the row menu does: without the window as foreground
 /// the menu never notices a click away from it, and without the trailing `WM_NULL`
 /// that first click is swallowed by the menu coming down.
 fn open_filter_menu(p: &Popup, chip: Chip, rect: win::RECT) {
+    // The checkboxes have no menu — `filter_click` sends them to
+    // `toggle_filter_box`. Guarded here so a box can never reach the menu code
+    // below, even if a caller starts passing one by mistake.
+    match chip {
+        Chip::Kind | Chip::Time => {}
+        Chip::AppBox | Chip::TitleBox => return,
+    }
+
     let chips = p.chips.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let selected = p.tab.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     unsafe {
         let menu = win::CreatePopupMenu();
@@ -2282,18 +2333,6 @@ fn open_filter_menu(p: &Popup, chip: Chip, rect: win::RECT) {
                         menu_flags(chips.kind == Some(kind)),
                         MENU_KIND + 1 + offset as i32,
                         kind.label(),
-                    );
-                }
-            }
-            Chip::App => {
-                append(menu, menu_flags(chips.app.is_none()), MENU_APP, "全部");
-                for (offset, (app, count)) in p.store.apps(selected.as_deref()).into_iter().enumerate()
-                {
-                    append(
-                        menu,
-                        menu_flags(chips.app.as_deref() == Some(app.as_str())),
-                        MENU_APP + 1 + offset as i32,
-                        &format!("{app} ({count})"),
                     );
                 }
             }
@@ -2318,6 +2357,9 @@ fn open_filter_menu(p: &Popup, chip: Chip, rect: win::RECT) {
                     "近30天",
                 );
             }
+            // Unreachable — guarded at the top of this function — but the match
+            // has to be exhaustive over `Chip`.
+            Chip::AppBox | Chip::TitleBox => {}
         }
 
         win::set_foreground(p.hwnd);
@@ -2342,13 +2384,8 @@ fn open_filter_menu(p: &Popup, chip: Chip, rect: win::RECT) {
     }
 }
 
-/// Turns a menu id back into the chip it means, then repaints and refills. The
+/// Turns a menu id back into the filter it means, then repaints and refills. The
 /// id ranges are the ones `open_filter_menu` appended with.
-///
-/// The app choice goes back through `apps()` rather than being carried by the id:
-/// the list is rebuilt at click time, and between the menu opening and closing a
-/// capture can add a source — the rare wrong name that costs is cheaper than the
-/// cache that has to be invalidated.
 fn apply_filter_choice(id: i32) {
     let Some(p) = popup() else {
         return;
@@ -2364,16 +2401,6 @@ fn apply_filter_choice(id: i32) {
                 3 => TimeChip::Thirty,
                 _ => TimeChip::All,
             };
-        } else if id >= MENU_APP {
-            if id == MENU_APP {
-                chips.app = None;
-            } else {
-                let selected = p.tab.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                let apps = p.store.apps(selected.as_deref());
-                chips.app = apps
-                    .get((id - MENU_APP - 1) as usize)
-                    .map(|(name, _)| name.clone());
-            }
         } else if id >= MENU_KIND {
             chips.kind = match id - MENU_KIND {
                 1 => Some(ClipKind::Text),

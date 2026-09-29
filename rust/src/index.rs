@@ -414,37 +414,6 @@ impl Index {
         out
     }
 
-    /// Distinct non-empty app names among the visible clips, noisiest first:
-    /// the source menu is read top-down, and the application most of the history
-    /// came out of is the likeliest thing to filter by. Ties keep newest-first —
-    /// the walk already visits the items in that order, and the sort is stable.
-    ///
-    /// `machine` narrows the count to one instance's clips, so the menu only
-    /// offers filters that can actually match the tab the list is showing.
-    pub fn apps(&self, machine: Option<&str>) -> Vec<(String, usize)> {
-        let mut counts: Vec<(String, usize)> = Vec::new();
-
-        for item in &self.items {
-            if item.app.is_empty() || self.hidden.contains(&item.stem) {
-                continue;
-            }
-
-            if let Some(want) = machine {
-                if item.machine != want {
-                    continue;
-                }
-            }
-
-            match counts.iter_mut().find(|(name, _)| name == &item.app) {
-                Some((_, count)) => *count += 1,
-                None => counts.push((item.app.clone(), 1)),
-            }
-        }
-
-        counts.sort_by(|left, right| right.1.cmp(&left.1));
-        counts
-    }
-
     /// Clips eligible for retention: this machine's own, old enough, not pinned.
     pub fn stale_clips(&self, cutoff_ms: i64, local_machine: &str) -> Vec<ClipItem> {
         self.items
@@ -484,9 +453,10 @@ impl Index {
     /// collected anyway, in the same order.
     ///
     /// `needle` is the search box, split into terms: every one of them has to match,
-    /// and a term without a `field:` prefix reads the clip's own text. `chips` is
-    /// what the buttons beside the box hold; it constrains every row the same way
-    /// the machine tab does, pinned ones included — a filter is a filter.
+    /// and a term without a `field:` prefix reads the clip's own text — plus the
+    /// source fields the scope boxes add. `chips` also carries the two menu filters,
+    /// which constrain every row the same way the machine tab does, pinned ones
+    /// included — a filter is a filter.
     pub fn query(
         &self,
         machine: Option<&str>,
@@ -516,7 +486,7 @@ impl Index {
 
             // Empty terms match everything; skipping the call keeps the plain
             // browse path free of a per-row round trip through the parser.
-            if !terms.is_empty() && !matches(item, &terms) {
+            if !terms.is_empty() && !matches(item, &terms, chips) {
                 continue;
             }
 
@@ -549,26 +519,30 @@ enum Field {
     Kind,
 }
 
-/// The three filters the popup holds as buttons beside the search box, picked
-/// from menus rather than typed. They AND with whatever terms the box holds.
+/// What the buttons beside the search box hold, in two families. The two boxes
+/// are *scope*: checked, bare terms also look in the source fields, and a search
+/// only ever gets wider. The two menus are *filters*: a kind or a time bound the
+/// rows have to pass, and a row that fails stays hidden even if its text matched.
 ///
-/// `Default` is everything off, which is what every popup opens with. The app
-/// is an exact name — the menu only offers what the history has — and the time
+/// `Default` is everything off, which is what every popup opens with. The time
 /// is an absolute bound so this struct never reads the clock; the popup turns
 /// "今天/近7天" into that bound at query time.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct ChipFilter {
+    /// Bare terms also read the exe name the clip was copied from.
+    pub in_app: bool,
+    /// Bare terms also read the window title at capture time.
+    pub in_title: bool,
     pub kind: Option<ClipKind>,
-    pub app: Option<String>,
     pub since_ms: Option<i64>,
 }
 
 impl ChipFilter {
-    /// Whether one item passes all three. Off is the common state, and three
-    /// `None`s answer without touching the row.
+    /// Whether one item passes the two filters. Off is the common state, and two
+    /// `None`s answer without touching the row. The boxes do not appear here on
+    /// purpose: they are not a condition a row can fail, only more places to look.
     fn allows(&self, item: &ClipItem) -> bool {
         self.kind.is_none_or(|kind| item.kind == kind)
-            && self.app.as_deref().is_none_or(|app| item.app == app)
             && self.since_ms.is_none_or(|since| item.at >= since)
     }
 }
@@ -610,20 +584,28 @@ fn field_of(name: &str) -> Option<Field> {
 
 /// Every term has to match: `foo bar` is what says both, and `kind:image foo` is the
 /// images that say foo.
-fn matches(item: &ClipItem, terms: &[(Field, String)]) -> bool {
+fn matches(item: &ClipItem, terms: &[(Field, String)], chips: &ChipFilter) -> bool {
     terms
         .iter()
-        .all(|(field, value)| matches_term(item, *field, value))
+        .all(|(field, value)| matches_term(item, *field, value, chips))
 }
 
 /// One term against one item. Two fields answer to more than one spelling: the
 /// machine to what the row shows (`本机`) as well as to its id, and the kind to
 /// `图片` as well as to `image`.
-fn matches_term(item: &ClipItem, field: Field, needle: &str) -> bool {
+fn matches_term(item: &ClipItem, field: Field, needle: &str, chips: &ChipFilter) -> bool {
     let hits = |haystack: &str| contains_ignore_case(haystack, needle);
 
     match field {
-        Field::Text => hits(&item.text),
+        // A bare term reads the clip's text; the source fields join in when their
+        // boxes are checked, and together they are one OR — the term is found in
+        // any of the places the scope covers. Qualified terms (`app:` `title:`)
+        // do not come through here, so the boxes never narrow a search.
+        Field::Text => {
+            hits(&item.text)
+                || (chips.in_app && hits(&item.app))
+                || (chips.in_title && hits(&item.title))
+        }
         Field::When => hits(&item.when),
         Field::Machine => hits(&item.machine) || hits(&item.who),
         Field::App => hits(&item.app),
@@ -1007,20 +989,118 @@ mod tests {
             .is_empty());
     }
 
-    /// The three buttons beside the search box are chips filled in from menus, so
-    /// the index answers two questions for them: which rows survive a chip, and
-    /// what the app menu should offer. Both narrow to the tab the list is showing,
-    /// and the chips AND with whatever the box holds — a chip that cannot reach
-    /// the rows a term matched is a filter that only pretends to work.
+    /// The two checkboxes beside the search box are scope, not filters: checked,
+    /// a bare term also looks in the exe name and the window title. The row has to
+    /// pass only its text — a row matching through a widened source is found, and
+    /// a search can only get wider than it was. Qualified terms (`app:` `title:`)
+    /// never needed the boxes and do not change under them.
     #[test]
-    fn chips_narrow_the_list_and_apps_feeds_the_menu() {
+    fn checked_boxes_widen_where_bare_terms_look() {
+        let mut index = Index::default();
+        index.insert(sourced("a", "local", 3_000, "text", "hello", "chrome.exe", "Inbox"));
+        index.insert(sourced("b", "local", 2_000, "text", "world", "paint.exe", "untitled page"));
+        // An image has no text at all: with a box checked its source is the only
+        // place a bare term can find it.
+        index.insert(sourced("c", "local", 1_000, "image", "", "code.exe", "chrome.exe — editor"));
+
+        let stems = |needle: &str, chips: ChipFilter| -> Vec<String> {
+            let needle = needle.to_ascii_lowercase();
+            index
+                .query(None, Some(&needle), &chips, 10)
+                .into_iter()
+                .map(|summary| summary.stem)
+                .collect()
+        };
+
+        // Boxes off: `chrome` sits on two rows and must not be found — this is
+        // the behaviour everything before the boxes had.
+        assert_eq!(stems("chrome", ChipFilter::default()), Vec::<String>::new());
+
+        // 应用 checked: bare terms reach the exe name…
+        assert_eq!(
+            stems(
+                "chrome",
+                ChipFilter {
+                    in_app: true,
+                    ..Default::default()
+                }
+            ),
+            vec!["a"]
+        );
+        assert_eq!(
+            stems(
+                "paint",
+                ChipFilter {
+                    in_app: true,
+                    ..Default::default()
+                }
+            ),
+            vec!["b"]
+        );
+
+        // …标题 checked, instead: row a's title says Inbox, row c's says chrome —
+        // the same word, found in a different place.
+        assert_eq!(
+            stems(
+                "chrome",
+                ChipFilter {
+                    in_title: true,
+                    ..Default::default()
+                }
+            ),
+            vec!["c"]
+        );
+        assert_eq!(
+            stems(
+                "untitled",
+                ChipFilter {
+                    in_title: true,
+                    ..Default::default()
+                }
+            ),
+            vec!["b"]
+        );
+
+        // The two boxes are one OR over the places a term may live…
+        assert_eq!(
+            stems(
+                "chrome",
+                ChipFilter {
+                    in_app: true,
+                    in_title: true,
+                    ..Default::default()
+                }
+            ),
+            vec!["a", "c"]
+        );
+        // …and still an AND across terms: the second word has to hit somewhere too.
+        assert_eq!(
+            stems(
+                "chrome editor",
+                ChipFilter {
+                    in_app: true,
+                    in_title: true,
+                    ..Default::default()
+                }
+            ),
+            vec!["c"]
+        );
+
+        // The qualified spellings work exactly as before, boxes or no boxes.
+        assert_eq!(stems("app:chrome", ChipFilter::default()), vec!["a"]);
+        assert_eq!(stems("title:untitled", ChipFilter::default()), vec!["b"]);
+    }
+
+    /// The two menus are real filters, unlike the boxes: a kind or a time bound a
+    /// row can fail, chips combine as two conditions, and they AND with whatever
+    /// terms the box holds — a filter that cannot reach the rows a term matched
+    /// only pretends to work.
+    #[test]
+    fn menu_chips_narrow_the_list() {
         let mut index = Index::default();
         index.insert(sourced("a", "local", 3_000, "text", "hello", "chrome.exe", "Inbox"));
         index.insert(sourced("b", "local", 2_000, "image", "", "paint.exe", "untitled"));
         index.insert(sourced("c", "local", 1_000, "text", "world", "chrome.exe", "Docs"));
-        // A clip with no source recorded — older than the field, or a window this
-        // process could not read. It must never come back as an app to filter by.
-        index.insert(sourced("d", "other", 500, "text", "lazy", "", "Notes"));
 
         let stems = |chips: ChipFilter| -> Vec<String> {
             index
@@ -1036,13 +1116,6 @@ mod tests {
                 ..Default::default()
             }),
             vec!["b"]
-        );
-        assert_eq!(
-            stems(ChipFilter {
-                app: Some("chrome.exe".to_string()),
-                ..Default::default()
-            }),
-            vec!["a", "c"]
         );
         // Inclusive bound: the clip captured exactly at midnight is in.
         assert_eq!(
@@ -1062,7 +1135,7 @@ mod tests {
             Vec::<String>::new()
         );
 
-        // A chip also has to survive terms — and cut them down.
+        // A filter also has to survive terms — and cut them down.
         let typed = |chips: ChipFilter| -> Vec<String> {
             index
                 .query(None, Some("hello"), &chips, 10)
@@ -1082,25 +1155,6 @@ mod tests {
             ..Default::default()
         })
         .is_empty());
-
-        // The menu's rows, noisiest first; the sourceless clip stays out.
-        assert_eq!(
-            index.apps(None),
-            vec![
-                ("chrome.exe".to_string(), 2),
-                ("paint.exe".to_string(), 1)
-            ]
-        );
-
-        // Under one tab the menu only offers what that tab can show, and a
-        // tombstoned clip stops counting — its row is on its way out.
-        assert_eq!(index.apps(Some("other")), Vec::<(String, usize)>::new());
-        let hidden: HashSet<String> = ["b"].iter().map(|stem| stem.to_string()).collect();
-        index.hide_many(&hidden);
-        assert_eq!(
-            index.apps(None),
-            vec![("chrome.exe".to_string(), 2)]
-        );
     }
 
     /// `insert_many` is the load path — one merge for a whole month instead of one
