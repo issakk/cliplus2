@@ -294,6 +294,7 @@ enum RowAction {
     Edit,
     Pin,
     Delete,
+    SelectAll,
 }
 
 struct App {
@@ -454,8 +455,15 @@ impl App {
                     crate::paste::paste_back(target, &payload);
                 }
                 HydrateAction::Copy => {
-                    if !crate::clipboard::write(&payload) {
-                        log::warn("copy failed: clipboard write");
+                    // 与 inline 路径同一收尾:写成功才收起弹窗。
+                    if crate::clipboard::write(&payload) {
+                        log::info(&format!(
+                            "copied {} clip(s) from the history list",
+                            stems.len()
+                        ));
+                        self.hide(ctx);
+                    } else {
+                        log::warn("clipboard write failed; keeping the popup open");
                     }
                 }
                 HydrateAction::Edit => {
@@ -622,6 +630,17 @@ impl App {
         self.anchor = index;
     }
 
+    /// 右键菜单点在 `index` 行上之后的选择:和旧弹窗一样,点在已选中的行里
+    /// 保留整个多选(复制/删除是对整个选区的操作),点在外面才把选择挪过来。
+    /// 焦点行总是跟到点的这一行,粘贴/编辑/固定作用的就是它。
+    fn point_at_menu_row(&mut self, index: usize) {
+        if self.selected.contains(&index) {
+            self.caret = index;
+        } else {
+            self.point_at(index);
+        }
+    }
+
     /// The rows a Delete or a copy covers, in list order (oldest first). An
     /// empty selection means there is nothing to act on.
     fn selected_rows(&self) -> Vec<usize> {
@@ -734,7 +753,10 @@ impl App {
     /// as images); several rows join into one text block, images left out —
     /// the same rule `join_payloads` has always implemented. Blob-bearing
     /// rows go through the hydrate worker either way.
-    fn copy_selected(&mut self) {
+    ///
+    /// 复制成功就把弹窗收起来(旧弹窗两条路径都是 copy 完 hide);写剪贴板失败
+    /// 则留在原地,不然用户连重试的机会都没有。
+    fn copy_selected(&mut self, ctx: &egui::Context) {
         let rows = self.selected_rows();
         if rows.is_empty() {
             return;
@@ -763,8 +785,15 @@ impl App {
             return;
         };
         if !crate::clipboard::write(&payload) {
-            log::warn("copy failed: clipboard write");
+            log::warn("clipboard write failed; keeping the popup open");
+            return;
         }
+
+        log::info(&format!(
+            "copied {} clip(s) from the history list",
+            summaries.len()
+        ));
+        self.hide(ctx);
     }
 
     /// Ctrl+E / row menu 编辑:文本类条目开编辑窗;含 .bin 的先在后台读。
@@ -946,7 +975,18 @@ impl App {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        let (esc, enter, up, down, page_up, page_down, shift, delete, ctrl_p, ctrl_c, ctrl_e, ctrl_a, ctrl_tab) =
+        // Ctrl+C 认事件不认按键:egui-winit 在进队列之前就把这个组合键翻成
+        // `Event::Copy` 并且 return,`Key::C` 的按键事件根本不会产生——按
+        // `key_pressed(Key::C)` 找它永远找不到。顺手把事件从队列里摘掉,搜索
+        // 框就不会再把选中的搜索文字也复制一遍(旧弹窗把这个组合键从搜索框
+        // 手里抢走,做的是同一件事)。
+        let copy_command = ctx.input_mut(|i| {
+            let pressed = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+            i.events.retain(|e| !matches!(e, egui::Event::Copy));
+            pressed
+        });
+
+        let (esc, enter, up, down, page_up, page_down, shift, delete, ctrl_p, ctrl_e, ctrl_a, ctrl_tab) =
             ctx.input(|i| {
                 (
                     i.key_pressed(egui::Key::Escape),
@@ -956,9 +996,8 @@ impl App {
                     i.key_pressed(egui::Key::PageUp),
                     i.key_pressed(egui::Key::PageDown),
                     i.modifiers.shift,
-                    !i.modifiers.ctrl && i.key_pressed(egui::Key::Delete),
+                    i.key_pressed(egui::Key::Delete),
                     i.modifiers.ctrl && i.key_pressed(egui::Key::P),
-                    i.modifiers.ctrl && i.key_pressed(egui::Key::C),
                     i.modifiers.ctrl && i.key_pressed(egui::Key::E),
                     i.modifiers.ctrl && i.key_pressed(egui::Key::A),
                     i.modifiers.ctrl && i.key_pressed(egui::Key::Tab),
@@ -986,20 +1025,21 @@ impl App {
         if page_down {
             self.move_selection(page, shift);
         }
-        // Delete 在搜索框里是删字,只有焦点在列表上才是删记录。
+        // Delete 在搜索框里是删字,只有焦点不在搜索框上才是删记录——旧弹窗的
+        // 两个窗口过程也是这么分的。
         if delete && !self.search_focused {
             self.delete_selected();
         }
         if ctrl_p {
             self.toggle_pin();
         }
-        if ctrl_c {
-            self.copy_selected();
+        if copy_command {
+            self.copy_selected(ctx);
         }
         if ctrl_e {
             self.edit_selected();
         }
-        if ctrl_a {
+        if ctrl_a && !self.search_focused {
             self.select_all();
         }
         if ctrl_tab {
@@ -1146,8 +1186,13 @@ impl App {
             if ui.button(pin_label).clicked() {
                 action = Some(RowAction::Pin);
             }
+            ui.separator();
             if ui.button("删除（Delete）").clicked() {
                 action = Some(RowAction::Delete);
+            }
+            ui.separator();
+            if ui.button("全选（Ctrl+A）").clicked() {
+                action = Some(RowAction::SelectAll);
             }
             if has_blob {
                 ui.label(
@@ -1159,25 +1204,29 @@ impl App {
         });
         match action {
             Some(RowAction::Paste) => {
-                self.point_at(index);
+                self.point_at_menu_row(index);
                 let ctx = ui.ctx().clone();
                 self.commit(&ctx);
             }
             Some(RowAction::Copy) => {
-                self.point_at(index);
-                self.copy_selected();
+                self.point_at_menu_row(index);
+                let ctx = ui.ctx().clone();
+                self.copy_selected(&ctx);
             }
             Some(RowAction::Edit) => {
-                self.point_at(index);
+                self.point_at_menu_row(index);
                 self.edit_selected();
             }
             Some(RowAction::Pin) => {
-                self.point_at(index);
+                self.point_at_menu_row(index);
                 self.toggle_pin();
             }
             Some(RowAction::Delete) => {
-                self.point_at(index);
+                self.point_at_menu_row(index);
                 self.delete_selected();
+            }
+            Some(RowAction::SelectAll) => {
+                self.select_all();
             }
             None => {}
         }
