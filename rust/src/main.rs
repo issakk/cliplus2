@@ -87,18 +87,34 @@ fn main() {
     // Before the first control is created: a window keeps the theme it was made
     // with, so this has to come first to matter. Undocumented and best-effort,
     // see `win::allow_dark_mode` — the popup's scrollbar is the visible part.
-    win::allow_dark_mode();
-
-    // The egui shell rides the same store, hotkey, clipboard and tray; only the
-    // window layer differs. CLIPPLUS_UI=egui opts in while it matures.
+    // (Legacy path only: the egui popup paints its own dark theme.)
     let use_egui = std::env::var("CLIPPLUS_UI")
         .map(|value| value.eq_ignore_ascii_case("egui"))
         .unwrap_or(false);
+
     if use_egui {
+        // The egui shell owns the popup, but the three secondary windows stay
+        // Win32: plain system-control dialogs, living on this same thread and
+        // pumped by winit's shared message loop. Building them before
+        // run_native, with DPI awareness set first so the dialogs scale.
+        win::set_per_monitor_dpi_aware();
+
+        if !settings_window::create() {
+            log::error("settings window could not be created; the tray entry will do nothing");
+        }
+        if !cleanup_window::create() {
+            log::error("cleanup window could not be created; the settings 清理 button will do nothing");
+        }
+        if !edit_window::create() {
+            log::error("edit window could not be created; the row menu 编辑 entry will do nothing");
+        }
+
         egui_app::run(Arc::clone(&store));
         log::info("=== ClipPlus stopping ===");
         return;
     }
+
+    win::allow_dark_mode();
 
     // Built once at startup so the first hotkey press has no window-creation
     // latency in front of it.

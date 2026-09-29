@@ -273,7 +273,7 @@ fn save() {
         Ok(()) => {
             log::info(&format!("saved an edit to {stem}"));
             hide();
-            crate::popup::edit_finished(Some(stem));
+            notify_finished(Some(stem));
         }
         Err(reason) => {
             win::message_box(
@@ -289,7 +289,23 @@ fn save() {
 /// a cancel has to release the `modal_open` hold and hand the focus back.
 fn cancel() {
     hide();
-    crate::popup::edit_finished(None);
+    notify_finished(None);
+}
+
+/// 编辑结束的去处。旧弹窗直接回 `popup::edit_finished`;egui 弹窗在打开编辑器
+/// 时换成自己的回调(经通道回 App,App 不在本次帧里拿不到)。
+static FINISH_CALLBACK: Mutex<Option<Box<dyn Fn(Option<String>) + Send>>> = Mutex::new(None);
+
+pub fn set_finish_callback(callback: Box<dyn Fn(Option<String>) + Send>) {
+    *FINISH_CALLBACK.lock().unwrap_or_else(|e| e.into_inner()) = Some(callback);
+}
+
+fn notify_finished(saved: Option<String>) {
+    let callback = FINISH_CALLBACK.lock().unwrap_or_else(|e| e.into_inner());
+    match callback.as_ref() {
+        Some(callback) => callback(saved),
+        None => crate::popup::edit_finished(saved),
+    }
 }
 
 /// Places every control for the scale and hands them the matching font.

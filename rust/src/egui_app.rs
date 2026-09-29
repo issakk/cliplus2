@@ -57,6 +57,9 @@ const COLOR_PIN: egui::Color32 = egui::Color32::from_rgb(0x4A, 0xA2, 0xD2);
 /// after launch still gets its repaint.
 static UI_CTX: OnceLock<egui::Context> = OnceLock::new();
 
+/// 编辑窗口结束的去处:回调把结果送进这条通道,App 在 `logic` 里收。
+static EDIT_FINISHED_TX: OnceLock<mpsc::Sender<Option<String>>> = OnceLock::new();
+
 /// Where the egui shell runs from `main`. Returns when the app quits; the
 /// caller's only job afterwards is the final log line.
 pub fn run(store: Arc<Store>) {
@@ -72,6 +75,15 @@ pub fn run(store: Arc<Store>) {
 
     let (thumb_tx, thumb_rx) = spawn_thumb_worker(Arc::clone(&store));
     let (hydrate_tx, hydrate_rx) = mpsc::channel();
+    let (edit_tx, edit_rx) = mpsc::channel::<Option<String>>();
+
+    // 编辑窗口是两种弹窗共用的 Win32 实件:结束的回话经这条通道回 App。
+    crate::edit_window::set_finish_callback(Box::new(move |saved| {
+        let _ = edit_tx.send(saved);
+        if let Some(ctx) = UI_CTX.get() {
+            ctx.request_repaint();
+        }
+    }));
 
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -88,7 +100,15 @@ pub fn run(store: Arc<Store>) {
         ..Default::default()
     };
 
-    let app = App::new(store, event_rx, thumb_tx, thumb_rx, hydrate_tx, hydrate_rx);
+    let app = App::new(
+        store,
+        event_rx,
+        thumb_tx,
+        thumb_rx,
+        hydrate_tx,
+        hydrate_rx,
+        edit_rx,
+    );
     let result = eframe::run_native(
         "ClipPlus",
         native,
@@ -259,6 +279,7 @@ fn check_mark(on: bool) -> &'static str {
 enum HydrateAction {
     Paste,
     Copy,
+    Edit,
 }
 
 /// The row context menu's outcomes, collected inside the menu closure and run
@@ -266,6 +287,7 @@ enum HydrateAction {
 enum RowAction {
     Paste,
     Copy,
+    Edit,
     Pin,
     Delete,
 }
@@ -311,13 +333,16 @@ struct App {
     thumb_pending: HashSet<String>,
 
     // blob 水合
-    hydrate_tx: mpsc::Sender<(usize, HydrateAction, ClipPayload)>,
-    hydrate_rx: mpsc::Receiver<(usize, HydrateAction, ClipPayload)>,
+    hydrate_tx: mpsc::Sender<(usize, HydrateAction, String, ClipPayload)>,
+    hydrate_rx: mpsc::Receiver<(usize, HydrateAction, String, ClipPayload)>,
     /// What a hydration is in flight for, shown as a loading hint.
     hydrating: Option<HydrateAction>,
     /// Bumped by every close and every new request; a hydrate result whose
     /// generation no longer matches is dropped.
     generation: usize,
+
+    /// 编辑窗口的收尾(保存了哪个 stem,或 None = 取消)。
+    edit_rx: mpsc::Receiver<Option<String>>,
 }
 
 impl App {
@@ -327,8 +352,9 @@ impl App {
         events: mpsc::Receiver<PlatformEvent>,
         thumb_tx: mpsc::Sender<String>,
         thumb_rx: mpsc::Receiver<(String, usize, usize, Vec<u8>)>,
-        hydrate_tx: mpsc::Sender<(usize, HydrateAction, ClipPayload)>,
-        hydrate_rx: mpsc::Receiver<(usize, HydrateAction, ClipPayload)>,
+        hydrate_tx: mpsc::Sender<(usize, HydrateAction, String, ClipPayload)>,
+        hydrate_rx: mpsc::Receiver<(usize, HydrateAction, String, ClipPayload)>,
+        edit_rx: mpsc::Receiver<Option<String>>,
     ) -> Self {
         Self {
             store,
@@ -356,6 +382,7 @@ impl App {
             hydrate_rx,
             hydrating: None,
             generation: 0,
+            edit_rx,
         }
     }
 
@@ -386,7 +413,7 @@ impl App {
             }
         }
 
-        while let Ok((gen, action, payload)) = self.hydrate_rx.try_recv() {
+        while let Ok((gen, action, stem, payload)) = self.hydrate_rx.try_recv() {
             if gen != self.generation {
                 continue;
             }
@@ -402,6 +429,25 @@ impl App {
                         log::warn("copy failed: clipboard write");
                     }
                 }
+                HydrateAction::Edit => {
+                    self.open_editor(&stem, &payload);
+                }
+            }
+        }
+
+        // 编辑窗口收尾:取消 = 原样收回焦点;保存 = 重灌列表并跟到那一行。
+        while let Ok(saved) = self.edit_rx.try_recv() {
+            self.modal_open = false;
+            if let Some(stem) = &saved {
+                self.refill();
+                if let Some(position) = self.items.iter().position(|item| &item.stem == stem) {
+                    self.selected = position;
+                    self.anchor = position;
+                    self.extending = false;
+                }
+            }
+            if self.visible {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
     }
@@ -600,7 +646,7 @@ impl App {
         let generation = self.generation;
         std::thread::spawn(move || {
             if let Some(payload) = store.read_payload(&stem) {
-                let _ = tx.send((generation, action, payload));
+                let _ = tx.send((generation, action, stem, payload));
             }
         });
     }
@@ -646,6 +692,48 @@ impl App {
             if !crate::clipboard::write(&payload) {
                 log::warn("copy failed: clipboard write");
             }
+        }
+    }
+
+    /// Ctrl+E / row menu 编辑:文本类条目开编辑窗;含 .bin 的先在后台读。
+    fn edit_selected(&mut self) {
+        let Some(item) = self.items.get(self.selected) else {
+            return;
+        };
+        let stem = item.stem.clone();
+
+        if !self.store.can_edit(&stem) {
+            return;
+        }
+
+        if item.has_blob {
+            self.begin_hydrate(HydrateAction::Edit, stem);
+            return;
+        }
+
+        let Some(payload) = self.store.read_payload(&stem) else {
+            log::warn(&format!("nothing editable for {stem}"));
+            return;
+        };
+
+        self.open_editor(&stem, &payload);
+    }
+
+    /// Hands one clip's text to the Win32 editor, holding the popup up the way
+    /// a message box does. The editor is a shared window on this same thread;
+    /// its closing comes back through the edit channel.
+    fn open_editor(&mut self, stem: &str, payload: &ClipPayload) {
+        let ClipPayload::Text(text) = payload else {
+            log::warn("edit is text-only; refusing a non-text payload");
+            return;
+        };
+
+        self.modal_open = true;
+        let opened = crate::edit_window::show(stem, text);
+        if !opened {
+            // A hold with no editor behind it would pin the popup on screen
+            // forever.
+            self.modal_open = false;
         }
     }
 
@@ -704,7 +792,7 @@ impl App {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        let (esc, enter, up, down, page_up, page_down, shift, delete, ctrl_p, ctrl_c, ctrl_a, ctrl_tab) =
+        let (esc, enter, up, down, page_up, page_down, shift, delete, ctrl_p, ctrl_c, ctrl_e, ctrl_a, ctrl_tab) =
             ctx.input(|i| {
                 (
                     i.key_pressed(egui::Key::Escape),
@@ -717,6 +805,7 @@ impl App {
                     !i.modifiers.ctrl && i.key_pressed(egui::Key::Delete),
                     i.modifiers.ctrl && i.key_pressed(egui::Key::P),
                     i.modifiers.ctrl && i.key_pressed(egui::Key::C),
+                    i.modifiers.ctrl && i.key_pressed(egui::Key::E),
                     i.modifiers.ctrl && i.key_pressed(egui::Key::A),
                     i.modifiers.ctrl && i.key_pressed(egui::Key::Tab),
                 )
@@ -750,6 +839,9 @@ impl App {
         }
         if ctrl_c {
             self.copy_selected();
+        }
+        if ctrl_e {
+            self.edit_selected();
         }
         if ctrl_a {
             self.select_all();
@@ -876,6 +968,9 @@ impl App {
             if ui.button("复制（Ctrl+C）").clicked() {
                 action = Some(RowAction::Copy);
             }
+            if ui.button("编辑（Ctrl+E）").clicked() {
+                action = Some(RowAction::Edit);
+            }
             let pin_label = if pinned { "取消固定（Ctrl+P）" } else { "固定（Ctrl+P）" };
             if ui.button(pin_label).clicked() {
                 action = Some(RowAction::Pin);
@@ -904,6 +999,12 @@ impl App {
                 self.anchor = index;
                 self.extending = false;
                 self.copy_selected();
+            }
+            Some(RowAction::Edit) => {
+                self.selected = index;
+                self.anchor = index;
+                self.extending = false;
+                self.edit_selected();
             }
             Some(RowAction::Pin) => {
                 self.selected = index;
