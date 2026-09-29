@@ -14,6 +14,10 @@ use crate::log;
 use crate::settings::{self, Hotkey, Settings};
 use crate::win::{self, HWND, LPARAM, LRESULT, WPARAM};
 
+/// The tray lives on the platform thread, but showing this window belongs on
+/// the thread that created it — the request arrives as a message instead.
+const WM_APP_SHOW: u32 = win::WM_APP + 4;
+
 /// Client area in logical pixels; the frame is added around it at creation.
 ///
 /// Both halves are computed from the layout constants below rather than written
@@ -364,6 +368,14 @@ fn layout(hwnd: HWND, scale: f64) {
         button_width,
         button_height,
     );
+}
+
+/// Thread-safe "open the settings window": posts to the window so `show` runs
+/// on the thread that created it. This is what the tray menu calls.
+pub fn request_show() {
+    if let Some(hwnd) = WINDOW.get().copied() {
+        win::post_message(hwnd, WM_APP_SHOW, 0, 0);
+    }
 }
 
 pub fn show() {
@@ -743,6 +755,11 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
         // without rebuilding every control.
         win::WM_CLOSE => {
             hide();
+            0
+        }
+
+        WM_APP_SHOW => {
+            show();
             0
         }
 

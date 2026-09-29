@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 use crate::autostart;
 use crate::log;
-use crate::popup;
+use crate::platform::{self, PlatformEvent};
 use crate::settings::Settings;
 use crate::win::{self, HWND, LPARAM};
 
@@ -76,9 +76,12 @@ pub fn remove() {
 }
 
 /// Tray callback: `lparam` carries the mouse message that triggered it.
+///
+/// Runs on the platform thread. Both actions route through the platform sink
+/// rather than touching windows directly: the popup belongs to the main thread.
 pub fn handle_callback(lparam: LPARAM) {
     match (lparam as u32) & 0xFFFF {
-        win::WM_LBUTTONUP => popup::toggle(),
+        win::WM_LBUTTONUP => platform::emit(PlatformEvent::TrayToggle),
         win::WM_RBUTTONUP => show_menu(),
         _ => {}
     }
@@ -151,7 +154,7 @@ fn handle_command(command: i32) {
     // 0 means the menu was dismissed without a choice.
     match command {
         CMD_OPEN_FOLDER => open(SYNC_ROOT.get().map(String::as_str)),
-        CMD_SETTINGS => crate::settings_window::show(),
+        CMD_SETTINGS => crate::settings_window::request_show(),
         CMD_OPEN_SETTINGS_FILE => open(APP_DIR.get().map(String::as_str)),
         CMD_AUTOSTART => {
             let enable = !autostart::is_enabled();
@@ -164,16 +167,9 @@ fn handle_command(command: i32) {
                 log::error("autostart could not be changed");
             }
         }
-        CMD_QUIT => {
-            log::info("quit requested from the tray");
-            remove();
-            let hwnd = OWNER.load(Ordering::SeqCst);
-            if hwnd != 0 {
-                // Destroying the message window raises WM_DESTROY, which is what
-                // ends the message loop and runs the shutdown path.
-                win::destroy_window(hwnd);
-            }
-        }
+        // Routed through the sink so both UIs share one shutdown path; it ends
+        // on the platform thread as `WM_APP_QUIT` → `quit_now`.
+        CMD_QUIT => platform::emit(PlatformEvent::Quit),
         _ => {}
     }
 }

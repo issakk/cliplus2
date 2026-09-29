@@ -80,6 +80,7 @@ pub const BS_GROUPBOX: u32 = 0x0000_0007;
 pub const ES_NUMBER: u32 = 0x2000;
 
 pub const WM_CLOSE: u32 = 0x0010;
+pub const WM_QUIT: u32 = 0x0012;
 
 /// Passed as `hbrBackground`. When the value is in 1..=COLOR_ENDCOLORS the
 /// low byte names a system colour and the system supplies a stock brush, so
@@ -522,6 +523,8 @@ extern "system" {
     fn DispatchMessageW(lpMsg: *const MSG) -> i32;
     fn PostQuitMessage(nExitCode: i32);
     fn PostMessageW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> i32;
+    fn PostThreadMessageW(idThread: u32, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> i32;
+    fn GetCurrentThreadId() -> u32;
     fn DestroyWindow(hWnd: HWND) -> i32;
     pub fn ShowWindow(hWnd: HWND, nCmdShow: i32) -> i32;
 
@@ -1016,6 +1019,17 @@ pub fn post_quit_message(code: i32) {
 
 pub fn post_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
     unsafe { PostMessageW(hwnd, msg, wparam, lparam) != 0 }
+}
+
+/// Ends a thread's `GetMessageW` loop that has no window of its own to borrow:
+/// `WM_QUIT` goes straight to the thread. The target must already be pumping
+/// (or at least have created its queue), which is always true for the callers.
+pub fn post_thread_message(thread_id: u32, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
+    unsafe { PostThreadMessageW(thread_id, msg, wparam, lparam) != 0 }
+}
+
+pub fn current_thread_id() -> u32 {
+    unsafe { GetCurrentThreadId() }
 }
 
 /// Greys a control in and out. The previous state is rarely interesting; the

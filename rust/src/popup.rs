@@ -246,6 +246,7 @@ const HELP_TEXT: &str = "\
 /// `+ 2`, not `+ 1`: the tray's callback message has that, and staying
 /// distinct costs nothing even though the two go to different windows.
 const WM_APP_HYDRATED: u32 = win::WM_APP + 2;
+const WM_APP_TOGGLE: u32 = win::WM_APP + 3;
 
 /// What a row shows in place of its preview while its payload is being read.
 const LOADING_HINT: &str = "正在加载完整内容 …";
@@ -498,6 +499,15 @@ pub fn toggle() {
         hide();
     } else {
         show();
+    }
+}
+
+/// The hotkey and the tray icon fire on the platform thread, but window
+/// operations belong to the thread that created this one: turn the request
+/// into a message on the popup itself and let the main loop run `toggle`.
+pub fn request_toggle() {
+    if let Some(p) = popup() {
+        win::post_message(p.hwnd, WM_APP_TOGGLE, 0, 0);
     }
 }
 
@@ -1972,6 +1982,11 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
         // done where the read landed.
         WM_APP_HYDRATED => {
             finish_hydrated();
+            0
+        }
+
+        WM_APP_TOGGLE => {
+            toggle();
             0
         }
 
