@@ -1171,7 +1171,7 @@ impl eframe::App for App {
                 if let Some(action) = self.hydrating {
                     let hint = match action {
                         HydrateAction::Paste => "正在加载完整内容，稍后自动粘贴 …",
-                        HydrateAction::Copy => "正在加载完整内容 …",
+                        HydrateAction::Copy | HydrateAction::Edit => "正在加载完整内容 …",
                     };
                     ui.label(egui::RichText::new(hint).size(12.0).color(COLOR_META));
                 }
