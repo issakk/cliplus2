@@ -575,6 +575,7 @@ extern "system" {
     pub fn GetClientRect(hWnd: HWND, lpRect: *mut RECT) -> i32;
     pub fn GetWindowRect(hWnd: HWND, lpRect: *mut RECT) -> i32;
     fn ScreenToClient(hWnd: HWND, lpPoint: *mut POINT) -> i32;
+    fn ClientToScreen(hWnd: HWND, lpPoint: *mut POINT) -> i32;
     pub fn InvalidateRect(hWnd: HWND, lpRect: *const RECT, bErase: i32) -> i32;
     pub fn BeginPaint(hWnd: HWND, lpPaint: *mut PAINTSTRUCT) -> HDC;
     pub fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) -> i32;
@@ -1561,6 +1562,17 @@ pub fn screen_to_client(hwnd: HWND, x: i32, y: i32) -> (i32, i32) {
     let mut point = POINT { x, y };
     unsafe {
         ScreenToClient(hwnd, &mut point);
+    }
+
+    (point.x, point.y)
+}
+
+/// Client coordinates in, screen coordinates out — where a menu anchored to
+/// something drawn in the client has to open.
+pub fn client_to_screen(hwnd: HWND, x: i32, y: i32) -> (i32, i32) {
+    let mut point = POINT { x, y };
+    unsafe {
+        ClientToScreen(hwnd, &mut point);
     }
 
     (point.x, point.y)

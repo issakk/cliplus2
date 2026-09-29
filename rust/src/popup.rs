@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::clip::{self, ClipPayload};
+use crate::clip::{self, ClipKind, ClipPayload};
 use crate::clipboard;
-use crate::index::ClipSummary;
+use crate::index::{ChipFilter, ClipSummary};
 use crate::log;
 use crate::store::{MachineTab, Store};
 use crate::win::{self, scaled, HBRUSH, HWND, LPARAM, LRESULT, WPARAM};
@@ -85,6 +85,111 @@ const HELP_SIZE: i32 = 30;
 const HELP_GAP: i32 = 6;
 const ID_HELP: usize = 1;
 
+/// The three filter buttons on the input row, left of the search box: which kind,
+/// which application, how old. Painted like the tabs rather than made of controls,
+/// so they share the strip's brushes and none of them can take the keyboard away
+/// from the search box. Wide enough for the widest face they show — `类型:文件` and
+/// friends — and an over-long app name is the label's problem, not the layout's.
+const FILTER_WIDTH: i32 = 78;
+const FILTER_GAP: i32 = 6;
+
+/// The filter menus' ids. The row menu owns 1..=5, so each menu gets its own range
+/// with `全部` first: kind at 100, app at 120 with one id per app after it, time
+/// at 140.
+const MENU_KIND: i32 = 100;
+const MENU_APP: i32 = 120;
+const MENU_TIME: i32 = 140;
+
+/// Which filter button a rect belongs to. The order is the order they are drawn
+/// in, left to right, and the menus come back in the same order in the help text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Chip {
+    Kind,
+    App,
+    Time,
+}
+
+const ALL_CHIPS: [Chip; 3] = [Chip::Kind, Chip::App, Chip::Time];
+
+impl Chip {
+    /// The face the button shows: bare, with an arrow, while nothing is picked;
+    /// the current value once one is. The arrow is what says this is a menu, and
+    /// it only shows while the button holds nothing — a filled button says what
+    /// it holds instead.
+    fn label(self, chips: &Chips) -> String {
+        match self {
+            Chip::Kind => match chips.kind {
+                None => "类型 ▾".to_string(),
+                Some(kind) => format!("类型:{}", kind.label()),
+            },
+            Chip::App => match &chips.app {
+                None => "应用 ▾".to_string(),
+                Some(app) => format!("应用:{app}"),
+            },
+            Chip::Time => match chips.time {
+                TimeChip::All => "时间 ▾".to_string(),
+                TimeChip::Today => "时间:今天".to_string(),
+                TimeChip::Seven => "时间:近7天".to_string(),
+                TimeChip::Thirty => "时间:近30天".to_string(),
+            },
+        }
+    }
+
+    /// Whether the button is holding a filter. The active face is the selected-row
+    /// colour, so a popup that shows fewer rows than expected explains itself.
+    fn active(self, chips: &Chips) -> bool {
+        match self {
+            Chip::Kind => chips.kind.is_some(),
+            Chip::App => chips.app.is_some(),
+            Chip::Time => chips.time != TimeChip::All,
+        }
+    }
+}
+
+/// The time button's presets. Held as the preset rather than a timestamp, so the
+/// cutoff follows the clock: "近7天" picked yesterday means seven days from now,
+/// not from when it was picked.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum TimeChip {
+    #[default]
+    All,
+    Today,
+    Seven,
+    Thirty,
+}
+
+impl TimeChip {
+    /// The inclusive lower bound the preset means right now, in unix ms. "今天" is
+    /// local midnight, and it is found by subtracting the time of day — exact at
+    /// this instant, and indifferent to what the UTC offset or DST is doing.
+    fn since_ms(self, now: i64) -> Option<i64> {
+        const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+        match self {
+            TimeChip::All => None,
+            TimeChip::Today => {
+                let t = win::local_datetime(now);
+                let into_day = i64::from(t.hour) * 3_600_000
+                    + i64::from(t.minute) * 60_000
+                    + i64::from(t.second) * 1_000
+                    + i64::from(t.milliseconds);
+                Some(now - into_day)
+            }
+            TimeChip::Seven => Some(now - 7 * DAY_MS),
+            TimeChip::Thirty => Some(now - 30 * DAY_MS),
+        }
+    }
+}
+
+/// What the three buttons currently hold. `Default` is every button bare, which
+/// is also what the popup opens with — the buttons reset with the search box.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Chips {
+    kind: Option<ClipKind>,
+    app: Option<String>,
+    time: TimeChip,
+}
+
 /// What the row menu's items come back as. The menu is tracked with `TPM_RETURNCMD`
 /// and the id is read from its return value, so these never travel as a `WM_COMMAND`.
 const CMD_PASTE: i32 = 1;
@@ -93,19 +198,25 @@ const CMD_PIN: i32 = 3;
 const CMD_DELETE: i32 = 4;
 const CMD_SELECT_ALL: i32 = 5;
 
-/// What the `?` says. The prefix list is the whole of the search syntax, and it is
-/// the one place it can be read without leaving the popup.
+/// What the `?` says. The buttons are the main path and the prefixes the power
+/// user's; both are listed because this is the one place the whole search syntax
+/// can be read without leaving the popup.
 const HELP_TEXT: &str = "\
 默认只搜记录内容（前 512 字），空格分开的每个词都要命中，顺序和距离随便。
 
-按字段搜就加前缀，可以混着用：
+搜索框左边三个按钮点开就能筛，可叠加：
+  类型 — 文本 / 图片 / 文件
+  应用 — 历史里出现过的来源程序（按条数排序）
+  时间 — 今天 / 近7天 / 近30天
+
+要打字也可以用字段词缀，和按钮、和普通词都能混用：
   app:chrome        来源程序（只存 exe 名）
   title:报表        当时那个窗口的标题（存 120 字）
   time:02-14        行上显示的时间，也能写 time:2025-02
   machine:本机      机器：本机，或对方的机器 id
   kind:图片         类型：文本/图片/文件，也可写 text/image/files
 
-不认识的词缀不算词缀——文本里写着 12:30 的照样搜得到。";
+不认识的词缀不算词缀——文本里写着 12:30 的照样搜得到（全角冒号 ： 也认）。";
 
 /// Posted by a hydrating thread when the payload it was reading is ready. The
 /// result itself travels through `Popup::hydrated`; the message only wakes the
@@ -158,6 +269,10 @@ struct Popup {
     items: Mutex<Vec<ClipSummary>>,
     /// Which instance the list is showing. `None` is the "everything" tab.
     tab: Mutex<Option<String>>,
+    /// What the three filter buttons hold. Cleared on every open, with the
+    /// search box — a popup summoned to paste something is not asking to still
+    /// be filtering last session's query.
+    chips: Mutex<Chips>,
     /// The strip as last drawn: hit tested by `tab_click`, and compared so that
     /// a repaint only happens when the set of instances actually changed.
     tabs: Mutex<Vec<MachineTab>>,
@@ -287,10 +402,11 @@ pub fn create(store: Arc<Store>) -> bool {
     }
 
     // What the box can do besides plain text, said in the one place the user looks
-    // when it is empty. Only the field names: the README has the long version, and a
-    // banner that wraps is worse than none. `1` keeps it visible while focused, which
-    // the popup does as soon as it opens.
-    let cue = win::wide("搜索内容 · app: title: time: machine: kind:");
+    // when it is empty. The buttons sit right beside it and the `?` has the long
+    // version, so the banner only has to point at them — a banner that wraps is
+    // worse than none. `1` keeps it visible while focused, which the popup does
+    // as soon as it opens.
+    let cue = win::wide("搜索内容 · 左侧按钮可筛选");
     unsafe {
         win::SendMessageW(search, win::EM_SETCUEBANNER, 1, cue.as_ptr() as LPARAM);
     }
@@ -308,6 +424,7 @@ pub fn create(store: Arc<Store>) -> bool {
         store: Arc::clone(&store),
         items: Mutex::new(Vec::new()),
         tab: Mutex::new(None),
+        chips: Mutex::new(Chips::default()),
         tabs: Mutex::new(Vec::new()),
         anchor: AtomicIsize::new(0),
         target: AtomicIsize::new(0),
@@ -401,6 +518,7 @@ pub fn show() {
     unsafe {
         win::SetWindowTextW(p.search, empty.as_ptr());
     }
+    *p.chips.lock().unwrap_or_else(|e| e.into_inner()) = Chips::default();
     reload();
 
     let cursor = win::cursor_position();
@@ -548,16 +666,20 @@ fn layout(p: &Popup, width: i32, height: i32, scale: f64) {
 
     let help_width = scaled(HELP_SIZE, scale);
     let search_top = height - scaled(SEARCH_FROM_BOTTOM, scale);
+    // Three buttons and the gap between the last of them and the box: what the
+    // input row hands to the filters before the search box gets its share.
+    let filter_span = scaled(FILTER_WIDTH * 3 + FILTER_GAP * 3, scale);
 
     unsafe {
         win::SetWindowPos(
             p.search,
             0,
-            pad,
+            pad + filter_span,
             search_top,
             // The `?` takes its corner out of the box rather than sitting over it,
             // so a long query is never hidden behind the thing that explains it.
-            width - pad * 2 - help_width - scaled(HELP_GAP, scale),
+            // The filter buttons take a bite off the left edge the same way.
+            width - pad * 2 - help_width - scaled(HELP_GAP, scale) - filter_span,
             scaled(SEARCH_HEIGHT, scale),
             win::SWP_NOACTIVATE,
         );
@@ -694,10 +816,19 @@ fn fill_list() {
 
     let filter = win::window_text(p.search);
     let selected = p.tab.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let chips = p.chips.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    // The time preset becomes its bound here rather than in the index, so the
+    // cutoff follows the clock on every refill and the index never reads it.
+    let chip_filter = ChipFilter {
+        kind: chips.kind,
+        app: chips.app.clone(),
+        since_ms: chips.time.since_ms(crate::settings::now_ms()),
+    };
 
     // Bottom-up: the newest clip is the last row, the one next to the search box, so
     // this is the reverse of the ranking order the index hands out.
-    let mut summaries = p.store.query(selected.as_deref(), &filter, MAX_RESULTS);
+    let mut summaries = p.store.query(selected.as_deref(), &filter, &chip_filter, MAX_RESULTS);
     summaries.reverse();
 
     // Stored before the list is refilled, so a row drawn from `p.items` is
@@ -1607,13 +1738,13 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
         }
 
         win::WM_LBUTTONDOWN => {
-            // A tab click switches tabs; anywhere else on the popup's own
-            // background starts a window drag. The search box and the list are
-            // child controls, so a click that lands on them never gets here, and the
-            // outermost pixels are the resize edge rather than this — what is left
-            // to grab is the padding inside that, the tab strip, and the space over
-            // a list too short to fill it.
-            if !tab_click(lparam) {
+            // A filter button opens its menu, a tab click switches tabs; anywhere
+            // else on the popup's own background starts a window drag. The search
+            // box and the list are child controls, so a click that lands on them
+            // never gets here, and the outermost pixels are the resize edge rather
+            // than this — what is left to grab is the padding inside that, the tab
+            // strip, and the space over a list too short to fill it.
+            if !filter_click(lparam) && !tab_click(lparam) {
                 win::begin_drag_move(hwnd);
             }
             0
@@ -1933,6 +2064,25 @@ fn paint(hwnd: HWND) {
             left += step;
         }
 
+        // The three filter buttons, in the tabs' two faces: input-coloured while
+        // bare, selected-coloured while holding a filter, so a list that came up
+        // shorter than expected explains itself. Not controls — a click on one is
+        // hit tested in the window proc against these same rects, and nothing here
+        // can take the keyboard from the search box. Drawn under the same selected
+        // font as the tabs, which is why this sits before the restore below.
+        let chips = p.chips.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for (rect, chip) in filter_rects(hwnd) {
+            let active = chip.active(&chips);
+
+            let background = if active { p.brush_selected } else { p.brush_input };
+            win::FillRect(dc, &rect, background);
+            win::SetTextColor(dc, if active { COLOR_TEXT } else { COLOR_META });
+
+            let mut text_rect = rect;
+            let text = win::wide(&chip.label(&chips));
+            win::DrawTextW(dc, text.as_ptr(), -1, &mut text_rect, tab_text_flags());
+        }
+
         win::SelectObject(dc, previous);
 
         // Two bars in the top-right corner: nothing else says the window can be
@@ -2029,6 +2179,216 @@ fn set_tab(id: Option<String>) {
     unsafe {
         win::InvalidateRect(p.hwnd, std::ptr::null(), 1);
     }
+}
+
+/// The three filter buttons' rects on the input row, in client coordinates.
+/// `paint` draws from these and `filter_click` hit-tests against them, so the
+/// two cannot disagree about where a button is — the same trick the tab strip
+/// uses.
+fn filter_rects(hwnd: HWND) -> [(win::RECT, Chip); 3] {
+    let scale = current_scale();
+    let left = scaled(PAD, scale);
+    let top = bottom_band_top(hwnd, SEARCH_FROM_BOTTOM, scale);
+    let width = scaled(FILTER_WIDTH, scale);
+    let height = scaled(SEARCH_HEIGHT, scale);
+    let step = width + scaled(FILTER_GAP, scale);
+
+    let mut rects: [(win::RECT, Chip); 3] = [(
+        win::RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        },
+        Chip::Kind,
+    ); 3];
+
+    for (index, chip) in ALL_CHIPS.into_iter().enumerate() {
+        let index = index as i32;
+        let button_left = left + index * step;
+        rects[index as usize] = (
+            win::RECT {
+                left: button_left,
+                top,
+                right: button_left + width,
+                bottom: top + height,
+            },
+            chip,
+        );
+    }
+
+    rects
+}
+
+/// A click on one of the three filter buttons opens its menu; `false` is the
+/// tab strip's and the drag's cue, the same contract `tab_click` works under.
+fn filter_click(lparam: LPARAM) -> bool {
+    let Some(p) = popup() else {
+        return false;
+    };
+
+    let x = (lparam & 0xFFFF) as u16 as i16 as i32;
+    let y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+
+    for (rect, chip) in filter_rects(p.hwnd) {
+        if x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom {
+            open_filter_menu(p, chip, rect);
+            return true;
+        }
+    }
+
+    false
+}
+
+/// `MF_CHECKED` when the condition holds, so an open menu shows the choice the
+/// button is already holding. `MF_STRING` is zero, so `MF_CHECKED` alone is the
+/// two flags OR-ed.
+fn menu_flags(checked_on: bool) -> u32 {
+    if checked_on {
+        win::MF_CHECKED
+    } else {
+        win::MF_STRING
+    }
+}
+
+/// Opens the menu one of the three buttons offers, dropped from the button's
+/// bottom edge like any dropdown. Kind and time are fixed lists; the app menu
+/// is whatever the history has actually seen under the tab the list is showing,
+/// counted, so the choice can only ever be a filter that matches something.
+///
+/// The same foreground dance the row menu does: without the window as foreground
+/// the menu never notices a click away from it, and without the trailing `WM_NULL`
+/// that first click is swallowed by the menu coming down.
+fn open_filter_menu(p: &Popup, chip: Chip, rect: win::RECT) {
+    let chips = p.chips.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let selected = p.tab.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    unsafe {
+        let menu = win::CreatePopupMenu();
+        if menu == 0 {
+            log::warn("CreatePopupMenu failed");
+            return;
+        }
+
+        match chip {
+            Chip::Kind => {
+                append(menu, menu_flags(chips.kind.is_none()), MENU_KIND, "全部");
+                for (offset, kind) in [ClipKind::Text, ClipKind::Image, ClipKind::Files]
+                    .into_iter()
+                    .enumerate()
+                {
+                    append(
+                        menu,
+                        menu_flags(chips.kind == Some(kind)),
+                        MENU_KIND + 1 + offset as i32,
+                        kind.label(),
+                    );
+                }
+            }
+            Chip::App => {
+                append(menu, menu_flags(chips.app.is_none()), MENU_APP, "全部");
+                for (offset, (app, count)) in p.store.apps(selected.as_deref()).into_iter().enumerate()
+                {
+                    append(
+                        menu,
+                        menu_flags(chips.app.as_deref() == Some(app.as_str())),
+                        MENU_APP + 1 + offset as i32,
+                        &format!("{app} ({count})"),
+                    );
+                }
+            }
+            Chip::Time => {
+                append(menu, menu_flags(chips.time == TimeChip::All), MENU_TIME, "全部");
+                append(
+                    menu,
+                    menu_flags(chips.time == TimeChip::Today),
+                    MENU_TIME + 1,
+                    "今天",
+                );
+                append(
+                    menu,
+                    menu_flags(chips.time == TimeChip::Seven),
+                    MENU_TIME + 2,
+                    "近7天",
+                );
+                append(
+                    menu,
+                    menu_flags(chips.time == TimeChip::Thirty),
+                    MENU_TIME + 3,
+                    "近30天",
+                );
+            }
+        }
+
+        win::set_foreground(p.hwnd);
+
+        let (x, y) = win::client_to_screen(p.hwnd, rect.left, rect.bottom);
+        let chosen = win::TrackPopupMenu(
+            menu,
+            win::TPM_RIGHTBUTTON | win::TPM_RETURNCMD,
+            x,
+            y,
+            0,
+            p.hwnd,
+            std::ptr::null(),
+        );
+
+        win::DestroyMenu(menu);
+        win::post_message(p.hwnd, win::WM_NULL, 0, 0);
+
+        if chosen != 0 {
+            apply_filter_choice(chosen);
+        }
+    }
+}
+
+/// Turns a menu id back into the chip it means, then repaints and refills. The
+/// id ranges are the ones `open_filter_menu` appended with.
+///
+/// The app choice goes back through `apps()` rather than being carried by the id:
+/// the list is rebuilt at click time, and between the menu opening and closing a
+/// capture can add a source — the rare wrong name that costs is cheaper than the
+/// cache that has to be invalidated.
+fn apply_filter_choice(id: i32) {
+    let Some(p) = popup() else {
+        return;
+    };
+
+    {
+        let mut chips = p.chips.lock().unwrap_or_else(|e| e.into_inner());
+
+        if id >= MENU_TIME {
+            chips.time = match id - MENU_TIME {
+                1 => TimeChip::Today,
+                2 => TimeChip::Seven,
+                3 => TimeChip::Thirty,
+                _ => TimeChip::All,
+            };
+        } else if id >= MENU_APP {
+            if id == MENU_APP {
+                chips.app = None;
+            } else {
+                let selected = p.tab.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let apps = p.store.apps(selected.as_deref());
+                chips.app = apps
+                    .get((id - MENU_APP - 1) as usize)
+                    .map(|(name, _)| name.clone());
+            }
+        } else if id >= MENU_KIND {
+            chips.kind = match id - MENU_KIND {
+                1 => Some(ClipKind::Text),
+                2 => Some(ClipKind::Image),
+                3 => Some(ClipKind::Files),
+                _ => None,
+            };
+        }
+    }
+
+    // The button faces live on the window, the rows on the list: both change.
+    unsafe {
+        win::InvalidateRect(p.hwnd, std::ptr::null(), 1);
+    }
+    fill_list();
 }
 
 fn cycle_tab(delta: i32) {
@@ -2256,5 +2616,28 @@ mod tests {
         // Unknown — protected processes refuse even the limited query.
         assert!(!paste_blocked_by_uipi(false, None));
         assert!(!paste_blocked_by_uipi(true, None));
+    }
+
+    /// The time button's presets become absolute bounds at refill time, so the
+    /// cutoff follows the clock: "近7天" picked yesterday means seven days from
+    /// now, and "今天" is local midnight however far the UTC offset sits.
+    #[test]
+    fn time_chips_answer_with_absolute_bounds() {
+        let now = crate::settings::now_ms();
+
+        assert_eq!(TimeChip::All.since_ms(now), None);
+
+        // Midnight is the instant minus the time of day, which is the whole trick.
+        let t = win::local_datetime(now);
+        let into_day = i64::from(t.hour) * 3_600_000
+            + i64::from(t.minute) * 60_000
+            + i64::from(t.second) * 1_000
+            + i64::from(t.milliseconds);
+        assert_eq!(TimeChip::Today.since_ms(now), Some(now - into_day));
+        // The bound is inclusive: a clip captured at exactly midnight is "today".
+        assert!(TimeChip::Today.since_ms(now).is_some_and(|since| since <= now));
+
+        assert_eq!(TimeChip::Seven.since_ms(now), Some(now - 7 * 86_400_000));
+        assert_eq!(TimeChip::Thirty.since_ms(now), Some(now - 30 * 86_400_000));
     }
 }

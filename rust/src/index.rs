@@ -414,6 +414,37 @@ impl Index {
         out
     }
 
+    /// Distinct non-empty app names among the visible clips, noisiest first:
+    /// the source menu is read top-down, and the application most of the history
+    /// came out of is the likeliest thing to filter by. Ties keep newest-first —
+    /// the walk already visits the items in that order, and the sort is stable.
+    ///
+    /// `machine` narrows the count to one instance's clips, so the menu only
+    /// offers filters that can actually match the tab the list is showing.
+    pub fn apps(&self, machine: Option<&str>) -> Vec<(String, usize)> {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+
+        for item in &self.items {
+            if item.app.is_empty() || self.hidden.contains(&item.stem) {
+                continue;
+            }
+
+            if let Some(want) = machine {
+                if item.machine != want {
+                    continue;
+                }
+            }
+
+            match counts.iter_mut().find(|(name, _)| name == &item.app) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((item.app.clone(), 1)),
+            }
+        }
+
+        counts.sort_by(|left, right| right.1.cmp(&left.1));
+        counts
+    }
+
     /// Clips eligible for retention: this machine's own, old enough, not pinned.
     pub fn stale_clips(&self, cutoff_ms: i64, local_machine: &str) -> Vec<ClipItem> {
         self.items
@@ -453,11 +484,14 @@ impl Index {
     /// collected anyway, in the same order.
     ///
     /// `needle` is the search box, split into terms: every one of them has to match,
-    /// and a term without a `field:` prefix reads the clip's own text.
+    /// and a term without a `field:` prefix reads the clip's own text. `chips` is
+    /// what the buttons beside the box hold; it constrains every row the same way
+    /// the machine tab does, pinned ones included — a filter is a filter.
     pub fn query(
         &self,
         machine: Option<&str>,
         needle: Option<&str>,
+        chips: &ChipFilter,
         limit: usize,
     ) -> Vec<ClipSummary> {
         let terms = needle.map(parse_query).unwrap_or_default();
@@ -474,6 +508,10 @@ impl Index {
                 if item.machine != want {
                     continue;
                 }
+            }
+
+            if !chips.allows(item) {
+                continue;
             }
 
             // Empty terms match everything; skipping the call keeps the plain
@@ -511,20 +549,50 @@ enum Field {
     Kind,
 }
 
+/// The three filters the popup holds as buttons beside the search box, picked
+/// from menus rather than typed. They AND with whatever terms the box holds.
+///
+/// `Default` is everything off, which is what every popup opens with. The app
+/// is an exact name — the menu only offers what the history has — and the time
+/// is an absolute bound so this struct never reads the clock; the popup turns
+/// "今天/近7天" into that bound at query time.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct ChipFilter {
+    pub kind: Option<ClipKind>,
+    pub app: Option<String>,
+    pub since_ms: Option<i64>,
+}
+
+impl ChipFilter {
+    /// Whether one item passes all three. Off is the common state, and three
+    /// `None`s answer without touching the row.
+    fn allows(&self, item: &ClipItem) -> bool {
+        self.kind.is_none_or(|kind| item.kind == kind)
+            && self.app.as_deref().is_none_or(|app| item.app == app)
+            && self.since_ms.is_none_or(|since| item.at >= since)
+    }
+}
+
 /// Splits the search box into terms: whitespace-separated, each one either a bare
 /// word or `field:value`.
 ///
 /// A prefix that is not one of the known names is left in the term, so a clip that
 /// says `12:30` or `http://…` is still found by what it says rather than being read
-/// as a field nobody has. The values are already lowercased by the caller, which is
-/// what the case-insensitive compare below wants.
+/// as a field nobody has. A Chinese IME turns the colon full-width — `app：chrome`
+/// — and a term that then read as plain text would find nothing where a field was
+/// meant, so both spellings name a field. The values are already lowercased by the
+/// caller, which is what the case-insensitive compare below wants.
 fn parse_query(raw: &str) -> Vec<(Field, String)> {
     raw.split_whitespace()
-        .map(|token| match token.split_once(':').and_then(|(name, value)| {
-            field_of(name).map(|field| (field, value.to_string()))
-        }) {
-            Some(term) => term,
-            None => (Field::Text, token.to_string()),
+        .map(|token| {
+            match token
+                .split_once(':')
+                .or_else(|| token.split_once('：'))
+                .and_then(|(name, value)| field_of(name).map(|field| (field, value.to_string())))
+            {
+                Some(term) => term,
+                None => (Field::Text, token.to_string()),
+            }
         })
         .collect()
 }
@@ -769,12 +837,21 @@ mod tests {
     }
 
     /// The same, but with everything the row's second line is built from filled in:
-    /// the fields the qualified search terms read.
-    fn sourced(stem: &str, at: i64, kind: &str, text: &str, app: &str, title: &str) -> ClipItem {
+    /// the fields the qualified search terms read. `machine` is who captured it;
+    /// the chips feed off it when the app menu has to match the tab that is open.
+    fn sourced(
+        stem: &str,
+        machine: &str,
+        at: i64,
+        kind: &str,
+        text: &str,
+        app: &str,
+        title: &str,
+    ) -> ClipItem {
         let record = ClipRecord {
             id: stem.to_string(),
             at,
-            machine: "local".to_string(),
+            machine: machine.to_string(),
             kind: kind.to_string(),
             hash: format!("hash-{stem}"),
             text: Some(text.to_string()),
@@ -803,15 +880,23 @@ mod tests {
         let mut index = Index::default();
         // Distinct timestamps, newest first: the list is in time order, so this is the
         // order the rows come back in.
-        index.insert(sourced("a", 3_000, "text", "hello world", "chrome.exe", "Inbox"));
-        index.insert(sourced("b", 2_000, "image", "", "paint.exe", "chrome.exe — untitled"));
-        index.insert(sourced("c", 1_000, "text", "meeting at 12:30", "teams.exe", "Calendar"));
+        index.insert(sourced("a", "local", 3_000, "text", "hello world", "chrome.exe", "Inbox"));
+        index.insert(sourced(
+            "b",
+            "local",
+            2_000,
+            "image",
+            "",
+            "paint.exe",
+            "chrome.exe — untitled",
+        ));
+        index.insert(sourced("c", "local", 1_000, "text", "meeting at 12:30", "teams.exe", "Calendar"));
 
         // The same lowercasing the store does before it hands the filter over.
         let hits = |needle: &str| {
             let needle = needle.trim().to_ascii_lowercase();
             index
-                .query(None, Some(&needle), 10)
+                .query(None, Some(&needle), &ChipFilter::default(), 10)
                 .into_iter()
                 .map(|summary| summary.stem)
                 .collect::<Vec<_>>()
@@ -842,6 +927,15 @@ mod tests {
         // field this program has.
         assert_eq!(hits("12:30"), vec!["c"]);
         assert_eq!(hits("meeting"), vec!["c"]);
+
+        // The full-width colon a Chinese IME types is the same prefix, not a
+        // term that silently finds nothing.
+        assert_eq!(hits("app：chrome"), vec!["a"]);
+        assert_eq!(hits("kind：图片"), vec!["b"]);
+        // …and a full-width colon in the *text* stays a text term too: no field
+        // is named `12`, so the term is what the clip has to say — and clip c
+        // says `12:30` half-width, which is not the same bytes.
+        assert_eq!(hits("12：30"), Vec::<String>::new());
     }
 
     /// A tombstone is how one machine asks another to drop a clip it may not delete
@@ -860,7 +954,7 @@ mod tests {
 
         let visible = |index: &Index| {
             index
-                .query(None, None, 10)
+                .query(None, None, &ChipFilter::default(), 10)
                 .into_iter()
                 .map(|row| row.stem)
                 .collect::<Vec<_>>()
@@ -896,14 +990,117 @@ mod tests {
         assert_eq!(machines, vec!["bbb".to_string(), "aaa".to_string()]);
 
         let mine: Vec<String> = index
-            .query(Some("aaa"), None, 10)
+            .query(Some("aaa"), None, &ChipFilter::default(), 10)
             .into_iter()
             .map(|summary| summary.stem)
             .collect();
         assert_eq!(mine, vec!["a2".to_string(), "a1".to_string()]);
 
-        assert_eq!(index.query(None, None, 10).len(), 3);
-        assert!(index.query(Some("bbb"), Some("clip a"), 10).is_empty());
+        assert_eq!(
+            index
+                .query(None, None, &ChipFilter::default(), 10)
+                .len(),
+            3
+        );
+        assert!(index
+            .query(Some("bbb"), Some("clip a"), &ChipFilter::default(), 10)
+            .is_empty());
+    }
+
+    /// The three buttons beside the search box are chips filled in from menus, so
+    /// the index answers two questions for them: which rows survive a chip, and
+    /// what the app menu should offer. Both narrow to the tab the list is showing,
+    /// and the chips AND with whatever the box holds — a chip that cannot reach
+    /// the rows a term matched is a filter that only pretends to work.
+    #[test]
+    fn chips_narrow_the_list_and_apps_feeds_the_menu() {
+        let mut index = Index::default();
+        index.insert(sourced("a", "local", 3_000, "text", "hello", "chrome.exe", "Inbox"));
+        index.insert(sourced("b", "local", 2_000, "image", "", "paint.exe", "untitled"));
+        index.insert(sourced("c", "local", 1_000, "text", "world", "chrome.exe", "Docs"));
+        // A clip with no source recorded — older than the field, or a window this
+        // process could not read. It must never come back as an app to filter by.
+        index.insert(sourced("d", "other", 500, "text", "lazy", "", "Notes"));
+
+        let stems = |chips: ChipFilter| -> Vec<String> {
+            index
+                .query(None, None, &chips, 10)
+                .into_iter()
+                .map(|summary| summary.stem)
+                .collect()
+        };
+
+        assert_eq!(
+            stems(ChipFilter {
+                kind: Some(ClipKind::Image),
+                ..Default::default()
+            }),
+            vec!["b"]
+        );
+        assert_eq!(
+            stems(ChipFilter {
+                app: Some("chrome.exe".to_string()),
+                ..Default::default()
+            }),
+            vec!["a", "c"]
+        );
+        // Inclusive bound: the clip captured exactly at midnight is in.
+        assert_eq!(
+            stems(ChipFilter {
+                since_ms: Some(2_000),
+                ..Default::default()
+            }),
+            vec!["a", "b"]
+        );
+        // Two chips are two conditions, not two answers.
+        assert_eq!(
+            stems(ChipFilter {
+                kind: Some(ClipKind::Image),
+                since_ms: Some(2_500),
+                ..Default::default()
+            }),
+            Vec::<String>::new()
+        );
+
+        // A chip also has to survive terms — and cut them down.
+        let typed = |chips: ChipFilter| -> Vec<String> {
+            index
+                .query(None, Some("hello"), &chips, 10)
+                .into_iter()
+                .map(|summary| summary.stem)
+                .collect()
+        };
+        assert_eq!(
+            typed(ChipFilter {
+                kind: Some(ClipKind::Text),
+                ..Default::default()
+            }),
+            vec!["a"]
+        );
+        assert!(typed(ChipFilter {
+            kind: Some(ClipKind::Image),
+            ..Default::default()
+        })
+        .is_empty());
+
+        // The menu's rows, noisiest first; the sourceless clip stays out.
+        assert_eq!(
+            index.apps(None),
+            vec![
+                ("chrome.exe".to_string(), 2),
+                ("paint.exe".to_string(), 1)
+            ]
+        );
+
+        // Under one tab the menu only offers what that tab can show, and a
+        // tombstoned clip stops counting — its row is on its way out.
+        assert_eq!(index.apps(Some("other")), Vec::<(String, usize)>::new());
+        let hidden: HashSet<String> = ["b"].iter().map(|stem| stem.to_string()).collect();
+        index.hide_many(&hidden);
+        assert_eq!(
+            index.apps(None),
+            vec![("chrome.exe".to_string(), 2)]
+        );
     }
 
     /// `insert_many` is the load path — one merge for a whole month instead of one
@@ -931,7 +1128,7 @@ mod tests {
 
         fn order(index: &Index) -> Vec<String> {
             index
-                .query(None, None, 10)
+                .query(None, None, &ChipFilter::default(), 10)
                 .into_iter()
                 .map(|row| row.stem)
                 .collect()
@@ -944,7 +1141,12 @@ mod tests {
         let mut again = Index::default();
         again.insert(item("a", "aaa", 100));
         again.insert_many(batch());
-        assert_eq!(again.query(None, None, 10).len(), 5);
+        assert_eq!(
+            again
+                .query(None, None, &ChipFilter::default(), 10)
+                .len(),
+            5
+        );
 
         // And the batch forget takes exactly those rows back out, newest first.
         let stems: HashSet<String> = ["a", "c"]

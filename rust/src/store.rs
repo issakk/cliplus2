@@ -31,7 +31,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 
 use crate::clip::{ClipContext, ClipKind, ClipPayload, ClipRecord};
-use crate::index::{ClipItem, ClipSummary, Index};
+use crate::index::{ChipFilter, ClipItem, ClipSummary, Index};
 use crate::log;
 use crate::settings::{self, Settings};
 
@@ -292,16 +292,31 @@ impl Store {
     /// One instance's clips, or every instance's when `machine` is `None`.
     /// `filter` is the search box, lowercased here and split into `field:value` terms in
     /// the index; every term is then matched with an allocation-free case-insensitive
-    /// substring search against the one field it names.
-    pub fn query(&self, machine: Option<&str>, filter: &str, limit: usize) -> Vec<ClipSummary> {
+    /// substring search against the one field it names. `chips` is what the three
+    /// filter buttons beside the box hold, and it ANDs with the terms.
+    pub fn query(
+        &self,
+        machine: Option<&str>,
+        filter: &str,
+        chips: &ChipFilter,
+        limit: usize,
+    ) -> Vec<ClipSummary> {
         let needle = filter.trim().to_ascii_lowercase();
         let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
 
         if needle.is_empty() {
-            index.query(machine, None, limit)
+            index.query(machine, None, chips, limit)
         } else {
-            index.query(machine, Some(&needle), limit)
+            index.query(machine, Some(&needle), chips, limit)
         }
+    }
+
+    /// The app menu's rows: distinct sources among the visible clips of the
+    /// instances shown, noisiest first. Built on click, never cached — the index
+    /// walk is one pass, and a menu is not a hot path.
+    pub fn apps(&self, machine: Option<&str>) -> Vec<(String, usize)> {
+        let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+        index.apps(machine)
     }
 
     /// The instance strip: everything, then this machine, then the others in the
@@ -1705,7 +1720,7 @@ mod tests {
         // The pinned clip and everything out of scope are still listed; the
         // pinned one comes first because that is how the list orders them.
         let listed: Vec<String> = store
-            .query(None, "", 100)
+            .query(None, "", &ChipFilter::default(), 100)
             .into_iter()
             .map(|row| row.stem)
             .collect();
@@ -1770,7 +1785,7 @@ mod tests {
         // The list shows the kept copies only — the pinned one first, because
         // that is how the list orders them — and the tombstoned one is hidden.
         let listed: Vec<String> = store
-            .query(None, "", 100)
+            .query(None, "", &ChipFilter::default(), 100)
             .into_iter()
             .map(|row| row.stem)
             .collect();
