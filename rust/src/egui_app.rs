@@ -1349,7 +1349,7 @@ impl eframe::App for App {
                 // 画在早退之前,列表空着时也在。
                 let rect = ui.max_rect();
                 for i in 0..2 {
-                    let y = rect.top() + 6.0 + f32::from(i) * 4.0;
+                    let y = rect.top() + 6.0 + i as f32 * 4.0;
                     ui.painter().line_segment(
                         [
                             egui::pos2(rect.right() - 14.0, y),
