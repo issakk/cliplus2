@@ -2203,11 +2203,25 @@ fn set_tab(id: Option<String>) {
 
     *p.tab.lock().unwrap_or_else(|e| e.into_inner()) = id;
     fill_list();
+    repaint_tab_strip(p.hwnd);
+}
 
-    // The strip itself has to be repainted too: the set of tabs did not
-    // change, only which one is lit.
+/// Invalidates just the strip's band: which tab is lit changed, and nothing
+/// outside the band did. Same reasoning as `repaint_filter_button` — a
+/// full-window invalidate erases the children along with everything else, and
+/// that is the blink. No erase: the tabs fill their own rects in `paint`, and
+/// the gaps between them do not change.
+fn repaint_tab_strip(hwnd: HWND) {
+    let scale = current_scale();
+    let rect = win::RECT {
+        left: 0,
+        top: bottom_band_top(hwnd, TAB_FROM_BOTTOM, scale),
+        right: win::client_size(hwnd).map(|(width, _)| width).unwrap_or(0),
+        bottom: bottom_band_top(hwnd, SEARCH_FROM_BOTTOM, scale),
+    };
+
     unsafe {
-        win::InvalidateRect(p.hwnd, std::ptr::null(), 1);
+        win::InvalidateRect(hwnd, &rect, 0);
     }
 }
 
@@ -2261,6 +2275,25 @@ fn filter_click(lparam: LPARAM) -> bool {
     false
 }
 
+/// Invalidates just one filter button's rect — the face that changed. A
+/// full-window invalidate erases the whole client first, children included
+/// (this window has no `WS_CLIPCHILDREN`), and that one frame of blanked list
+/// and search box reads as the popup blinking on every click. The list refills
+/// itself through `fill_list`; nothing outside the button needs the parent.
+/// No erase either: `paint` fills the button's rect before drawing on it.
+fn repaint_filter_button(hwnd: HWND, chip: Chip) {
+    let rect = filter_rects(hwnd)
+        .into_iter()
+        .find(|(_, found)| *found == chip)
+        .map(|(rect, _)| rect);
+
+    if let Some(rect) = rect {
+        unsafe {
+            win::InvalidateRect(hwnd, &rect, 0);
+        }
+    }
+}
+
 /// One of the two checkbox buttons: a click flips the scope it stands for and
 /// the list refills — no menu, a checkbox is its own whole UI.
 fn toggle_filter_box(chip: Chip) {
@@ -2278,10 +2311,7 @@ fn toggle_filter_box(chip: Chip) {
         }
     }
 
-    // The button face lives on the window, the rows on the list: both change.
-    unsafe {
-        win::InvalidateRect(p.hwnd, std::ptr::null(), 1);
-    }
+    repaint_filter_button(p.hwnd, chip);
     fill_list();
 }
 
@@ -2411,10 +2441,10 @@ fn apply_filter_choice(id: i32) {
         }
     }
 
-    // The button faces live on the window, the rows on the list: both change.
-    unsafe {
-        win::InvalidateRect(p.hwnd, std::ptr::null(), 1);
-    }
+    // Only the pressed button's face changed — repaint that one button, not the
+    // window; see `repaint_filter_button` for why the whole-window version blinks.
+    let chip = if id >= MENU_TIME { Chip::Time } else { Chip::Kind };
+    repaint_filter_button(p.hwnd, chip);
     fill_list();
 }
 
