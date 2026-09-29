@@ -57,9 +57,6 @@ const COLOR_PIN: egui::Color32 = egui::Color32::from_rgb(0x4A, 0xA2, 0xD2);
 /// after launch still gets its repaint.
 static UI_CTX: OnceLock<egui::Context> = OnceLock::new();
 
-/// 编辑窗口结束的去处:回调把结果送进这条通道,App 在 `logic` 里收。
-static EDIT_FINISHED_TX: OnceLock<mpsc::Sender<Option<String>>> = OnceLock::new();
-
 /// Where the egui shell runs from `main`. Returns when the app quits; the
 /// caller's only job afterwards is the final log line.
 pub fn run(store: Arc<Store>) {
