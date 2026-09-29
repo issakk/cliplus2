@@ -15,6 +15,7 @@ mod tray;
 mod settings;
 mod settings_window;
 mod store;
+mod thumb;
 mod win;
 
 use std::sync::{Arc, OnceLock, RwLock};

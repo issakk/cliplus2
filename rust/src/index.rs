@@ -51,6 +51,8 @@ pub struct ClipSummary {
     /// the background rather than on the window thread, and this is how it
     /// tells them apart from the instant inline ones.
     pub has_blob: bool,
+    /// 文本/图片/文件:图片行要走缩略图管线,其余行保持纯文本渲染。
+    pub kind: ClipKind,
 }
 
 impl ClipItem {
@@ -110,6 +112,7 @@ impl ClipItem {
             meta: self.meta.clone(),
             pinned: self.pinned,
             has_blob: self.has_blob,
+            kind: self.kind,
         }
     }
 }
