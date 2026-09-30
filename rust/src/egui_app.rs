@@ -1239,7 +1239,12 @@ impl App {
         if page_down {
             self.move_selection(page, shift);
         }
-        self.scroll_caret_into_view();
+        // 跟着滚的只有"键盘把 caret 挪了"这一种。每帧无条件跑的话滚轮会被它按住:
+        // 往上滚到选中那行贴住视图底边,再滚就被它每帧拽回来——看着就是"滚不动了"
+        // (它本来也只该管方向键/翻页,旧 listbox 的 LB_SETCURSEL 就是这个范围)。
+        if up || down || page_up || page_down {
+            self.scroll_caret_into_view();
+        }
         // Delete 在搜索框里是删字,只有焦点不在搜索框上才是删记录——旧弹窗的
         // 两个窗口过程也是这么分的。
         if delete && !self.search_focused {
