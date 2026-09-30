@@ -866,14 +866,9 @@ impl App {
         let Some(rect) = self.list_rect else {
             return;
         };
-        let top = self.caret as f32 * ROW_HEIGHT;
-        let bottom = top + ROW_HEIGHT;
-        if top < self.list_offset {
+        if let Some(offset) = caret_offset(self.caret, self.list_offset, rect.height()) {
             self.scroll_to_newest = false;
-            self.pending_offset = Some(top.max(0.0));
-        } else if bottom > self.list_offset + rect.height() {
-            self.scroll_to_newest = false;
-            self.pending_offset = Some((bottom - rect.height()).max(0.0));
+            self.pending_offset = Some(offset);
         }
     }
 
@@ -1679,6 +1674,15 @@ impl App {
                     return;
                 }
 
+                // 行距必须和 ROW_HEIGHT 一个口径:ScrollArea 的 show_rows 是按
+                // `ROW_HEIGHT + item_spacing.y` 摆放每一行的,而这个文件里所有滚动/
+                // 定位算法(scroll_caret_into_view、scroll_to_newest、删除后归位)都
+                // 按 ROW_HEIGHT 算。留着默认那 3 点间距,下标 i 那一行就比算法以为
+                // 的位置低 3*i 点——可见的行会被算成"在上面",于是点一下列表就往上
+                // 跳一大截(点第 284 行跳 700 多点,一屏),用户看着就是"跳到别的地方、
+                // 选不中"。间距归零,两个口径只剩一个。
+                ui.spacing_mut().item_spacing.y = 0.0;
+
                 let mut rows = egui::ScrollArea::vertical().auto_shrink([false, false]);
                 if self.scroll_to_newest {
                     // Content height: the area clamps it to the bottom edge.
@@ -1724,6 +1728,22 @@ fn pressed_state(
         (next, index)
     } else {
         ([index].into_iter().collect(), index)
+    }
+}
+
+/// caret 该滚到哪个偏移:`None` = 它已经在视野里,这一帧什么都不用做。
+///
+/// 行高口径必须和 ScrollArea 摆放行的口径一致(见 `draw` 里那行 item_spacing):
+/// 对不上时"已经在视野里"会被算成"在上面",于是每点一行列表就往上跳一大截。
+fn caret_offset(caret: usize, offset: f32, view_height: f32) -> Option<f32> {
+    let top = caret as f32 * ROW_HEIGHT;
+    let bottom = top + ROW_HEIGHT;
+    if top < offset {
+        Some(top.max(0.0))
+    } else if bottom > offset + view_height {
+        Some((bottom - view_height).max(0.0))
+    } else {
+        None
     }
 }
 
@@ -1818,6 +1838,26 @@ mod tests {
         assert_eq!(anchor, 5);
         let (selected, _) = pressed_state(&selected, 5, 5, false, true);
         assert!(!selected.contains(&5));
+    }
+
+    /// caret 已经在视野里时不能再滚。"点一下就跳到别的地方"就是这条被算错:
+    /// 行高口径和 ScrollArea 的摆放口径一旦对不上,屏幕上的可见行会被当成在
+    /// 视野上面,于是每点一行就往上跳 3*下标 点。
+    #[test]
+    fn a_visible_caret_never_scrolls_the_list() {
+        let view = 505.0;
+        let offset = 284.0 * ROW_HEIGHT;
+
+        // 视图顶停在 284 行上:这一行和下一行都在视野里。
+        assert_eq!(caret_offset(284, offset, view), None);
+        assert_eq!(caret_offset(285, offset, view), None);
+
+        // 顶上一行:跟着往上。
+        assert_eq!(caret_offset(200, offset, view), Some(200.0 * ROW_HEIGHT));
+
+        // 底下一行:滚到让它整个露出来为止。
+        let shows_row_300 = 301.0 * ROW_HEIGHT - view;
+        assert_eq!(caret_offset(300, offset, view), Some(shows_row_300));
     }
 
     /// 缩放带是看不见的,这是它唯一的定义:算错一个方向就是某条边拖不动,
