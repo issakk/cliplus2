@@ -159,6 +159,19 @@ impl Index {
         self.hashes.contains(hash)
     }
 
+    /// The newest visible clip carrying `hash`, for the capture path: a re-copied
+    /// clip has to surface the copy already stored instead of being swallowed by
+    /// the "already stored" answer, and surfacing means knowing which row to move.
+    /// Items are newest first, so the first match is the one; hidden copies do not
+    /// count — the same visibility rule `has_hash` answers under, so the two never
+    /// disagree about whether a capture is a re-copy.
+    pub fn newest_by_hash(&self, hash: &str) -> Option<ClipItem> {
+        self.items
+            .iter()
+            .find(|item| item.hash == hash && !self.hidden.contains(&item.stem))
+            .cloned()
+    }
+
     pub fn find(&self, stem: &str) -> Option<&ClipItem> {
         self.items.iter().find(|item| item.stem == stem)
     }
@@ -959,6 +972,34 @@ mod tests {
         assert!(index.set_hidden("b", false));
         assert_eq!(visible(&index), vec!["a", "b", "c"]);
         assert!(index.has_hash("hash-b"));
+    }
+
+    /// Re-copying a clip has to find the copy already stored, and the newest one
+    /// at that: that is the row a re-copy re-dates. A tombstoned copy does not
+    /// answer for the content — the same visibility rule `has_hash` goes by — so
+    /// the two can never disagree about whether a capture is a re-copy.
+    #[test]
+    fn newest_by_hash_answers_the_newest_visible_copy() {
+        let mut index = Index::default();
+        let mut oldest = item("c", "local", 100);
+        oldest.hash = "shared".to_string();
+        let mut newer = item("b", "other", 200);
+        newer.hash = "shared".to_string();
+        let mut newest = item("a", "local", 300);
+        newest.hash = "shared".to_string();
+        index.insert(oldest);
+        index.insert(newer);
+        index.insert(newest);
+
+        assert_eq!(index.newest_by_hash("shared").unwrap().stem, "a");
+
+        // The newest copy sits behind a tombstone: it does not count, and the
+        // answer falls to the copy that can still be seen.
+        let hidden: HashSet<String> = ["a"].iter().map(|stem| stem.to_string()).collect();
+        index.hide_many(&hidden);
+        assert_eq!(index.newest_by_hash("shared").unwrap().stem, "b");
+
+        assert!(index.newest_by_hash("hash-x").is_none());
     }
 
     /// The instance strip and the per-instance filter are what the popup tabs

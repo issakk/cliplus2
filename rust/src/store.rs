@@ -13,6 +13,10 @@
 //! * Pins are empty `<stem>.pin` markers in the folder that owns the clip.
 //!   An empty file has identical content on every machine, so two machines
 //!   creating the same marker cannot be seen as a conflict.
+//! * Re-copying what is already stored never writes a second row: the copy
+//!   already stored is re-dated to now, which is what puts it back at the top
+//!   of the list. A copy inside another instance's live month cannot be
+//!   re-dated, so a re-copy of it falls back to a row of this machine's own.
 //! * The `INSERT` is the commit point: a reader sees the previous or the new
 //!   state, never half a clip. Blobs are written before the row that points
 //!   at them, so a crash leaves an unreferenced blob rather than a broken entry.
@@ -225,17 +229,37 @@ impl Store {
         }
 
         let hash = hash_of(payload.kind(), &body);
-        {
+        let now = settings::now_ms();
+
+        let stored = {
             let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            // The set answers "already stored?" in one lookup, which is what
+            // every fresh capture asks; only a re-copy goes on to pay the scan
+            // for the row it should surface. The two answers ride the same
+            // visibility rule, so they can never disagree.
             if index.has_hash(&hash) {
-                // Already stored: re-copied from history, pasted back out, or
-                // written by another machine. Rows are never rewritten.
-                log::info("clip already stored, nothing written");
+                index.newest_by_hash(&hash)
+            } else {
+                None
+            }
+        };
+
+        // Already stored: re-copied from history, pasted back out, or captured
+        // here after another machine's copy synced in. One content stays one
+        // row — but the copy just made has to surface, so the stored row is
+        // re-dated to now instead of a second one being written. Only a row
+        // this machine may write moves (`resurface` draws the line the delete
+        // path draws); one inside another instance's live month cannot, and
+        // the honest way to the top is then a copy of our own — the insert
+        // below, the duplicate the duplicate cleanup knows how to collapse.
+        if let Some(item) = stored {
+            if item.at >= now || self.resurface(&item, now, context) {
+                log::info("clip already stored, surfaced the stored row");
                 return Ok(());
             }
+            log::info("clip already stored in a live month of another machine; storing our own");
         }
 
-        let now = settings::now_ms();
         let stem = settings::unique_stem(now);
         let directory = self
             .settings
@@ -285,6 +309,40 @@ impl Store {
             .insert(item);
 
         Ok(())
+    }
+
+    /// Puts an already-stored clip back at the top of the list: the row is
+    /// re-dated to `now` and given the source window of the copy just made.
+    /// The content columns do not move — the clip says what it always said,
+    /// and the hash keeps answering for it; the `.pin` beside it keeps working
+    /// because the file names never change.
+    ///
+    /// Only rows this machine may write are re-dated, the same line the delete
+    /// path draws (`deletable`): our own rows wherever they sit, and any row in
+    /// a month that is over. Another instance's live month stays theirs, and
+    /// the caller stores a copy of its own instead.
+    ///
+    /// Returns whether the stored row was surfaced; `false` sends the capture
+    /// down the insert path — either because the row is not ours to write, or
+    /// because it went away between the snapshot and this write.
+    fn resurface(&self, item: &ClipItem, now: i64, context: &ClipContext) -> bool {
+        let month = settings::month_bucket(now);
+        if !deletable(item, &self.settings.machine_id, &month) {
+            return false;
+        }
+
+        if let Err(err) = bump_row(&item.db_path, &item.stem, now, &context.app, &context.title) {
+            log::warn(&format!("resurface {}: {err}", item.stem));
+            return false;
+        }
+
+        // The month re-reads into the index the way an edit does: the row comes
+        // back at its new place, and the fresh stamp keeps the watcher and the
+        // rescan from reading it again for nothing.
+        self.refresh_db(&item.db_path, false);
+
+        log::info(&format!("resurfaced {}: re-dated to now", item.stem));
+        true
     }
 
     // ------------------------------------------------------------------- reading
@@ -845,8 +903,10 @@ impl Store {
     /// promise that this clip survives cleanup, and it does not get broken here.
     ///
     /// Duplicates mostly come from two machines having captured the same content
-    /// before sync could tell either one; within one machine the capture path's
-    /// hash set makes them rare. Text only, as asked of it: images have no
+    /// before sync could tell either one — and from a re-copy of a clip whose
+    /// only copy sat in another instance's live month, which falls back to a row
+    /// of this machine's own. Within one machine the capture path's hash set
+    /// keeps them rare. Text only, as asked of it: images have no
     /// inline preview worth keeping and file lists dedupe badly by exact path.
     pub fn scan_duplicates(&self) -> DupeScan {
         let visible = {
@@ -1264,6 +1324,33 @@ fn update_row(
             UPDATE_ROW,
             params![hash, &inline, length, &blob, stem],
         )
+        .map_err(|err| format!("update {}: {err}", db_path.display()))?;
+
+    if changed == 0 {
+        return Err(format!("{} 里已经没有 {stem} 这一行了", db_path.display()));
+    }
+
+    Ok(())
+}
+
+/// Re-dates one row to now and records where the re-copied content came from.
+/// The content columns are untouched: the clip says what it always said, and
+/// re-dating is only the row's way of moving to the top of the list.
+const BUMP_ROW: &str = "
+UPDATE clips SET at = ?1, app = ?2, title = ?3 WHERE stem = ?4";
+
+fn bump_row(db_path: &Path, stem: &str, at: i64, app: &str, title: &str) -> Result<(), String> {
+    // The same flags `update_row` opens with: never create a month that does
+    // not exist, so a bump racing a deleted month litters nothing.
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| format!("open {}: {err}", db_path.display()))?;
+    let _ = conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS));
+
+    let changed = conn
+        .execute(BUMP_ROW, params![at, app, title, stem])
         .map_err(|err| format!("update {}: {err}", db_path.display()))?;
 
     if changed == 0 {
@@ -1940,6 +2027,143 @@ mod tests {
             .map(|row| row.stem)
             .collect();
         assert_eq!(listed, vec!["t2", "t4"]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Re-copying what is already stored must not be a silent no-op: the list
+    /// has to show it at the newest place. It still shows up as one row — the
+    /// stored one, re-dated to this capture, with the source window following —
+    /// which is the dedupe promise kept and the visibility fixed in one move.
+    #[test]
+    fn recopying_our_own_row_resurfaces_it() {
+        let now = settings::now_ms();
+        let (store, dir) = cleanup_store("resurface");
+
+        let text = "surface me";
+        let payload = ClipPayload::Text(text.to_string());
+        let hash = hash_of(ClipKind::Text, &payload.body());
+        plant(
+            &dir,
+            "mach1",
+            &ClipRecord {
+                id: "old".to_string(),
+                at: now - DAY,
+                machine: "mach1".to_string(),
+                kind: "text".to_string(),
+                hash,
+                text: Some(text.to_string()),
+                length: text.len() as i64,
+                blob: None,
+                app: "old.exe".to_string(),
+                title: "Old".to_string(),
+            },
+        );
+        store.rescan();
+
+        store.persist(
+            payload,
+            &ClipContext {
+                app: "new.exe".to_string(),
+                title: "New".to_string(),
+            },
+        )
+        .unwrap();
+
+        // Still one row, still the stored one: no second copy was written.
+        let db = dir
+            .join("sync")
+            .join("mach1")
+            .join(settings::month_bucket(now - DAY))
+            .join(DB_NAME);
+        let rows = read_all(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].stem, "old");
+
+        // Re-dated to this capture (the planted row said exactly now - DAY),
+        // and the source window is the one the re-copy came through.
+        assert!(rows[0].at > now - DAY);
+        assert_eq!(rows[0].app.as_deref(), Some("new.exe"));
+        assert_eq!(rows[0].title.as_deref(), Some("New"));
+
+        // And the list answers with it at the newest place.
+        let list = store.query(None, "", &ChipFilter::default(), 10);
+        assert_eq!(list[0].stem, "old");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Another instance's live month is the one thing a re-copy cannot re-date:
+    /// that database has a writer, and it is not us. The capture then falls
+    /// back to a row of this machine's own — the only way the content reaches
+    /// the top of the list — while the foreign row keeps every byte it had.
+    #[test]
+    fn recopying_another_machines_live_month_stores_our_own() {
+        let now = settings::now_ms();
+        let (store, dir) = cleanup_store("resurface-live");
+
+        let text = "theirs";
+        let payload = ClipPayload::Text(text.to_string());
+        let hash = hash_of(ClipKind::Text, &payload.body());
+
+        // Planted in this month's folder by hand rather than derived from the
+        // timestamp: what makes the row untouchable is the *folder* it sits in,
+        // and a test running in the first second of a month would otherwise
+        // plant it in a finished one. The timestamp only dates the row.
+        let folder = dir
+            .join("sync")
+            .join("mach2")
+            .join(settings::month_bucket(now));
+        fs::create_dir_all(&folder).unwrap();
+        let theirs_db = folder.join(DB_NAME);
+        insert_row(
+            &theirs_db,
+            &ClipRecord {
+                id: "theirs".to_string(),
+                at: now - 1_000,
+                machine: "mach2".to_string(),
+                kind: "text".to_string(),
+                hash,
+                text: Some(text.to_string()),
+                length: text.len() as i64,
+                blob: None,
+                app: "a.exe".to_string(),
+                title: "A".to_string(),
+            },
+        )
+        .unwrap();
+        store.rescan();
+
+        store.persist(
+            payload,
+            &ClipContext {
+                app: "b.exe".to_string(),
+                title: "B".to_string(),
+            },
+        )
+        .unwrap();
+
+        // Their row is untouched: same time, same source, nothing rewritten.
+        let rows = read_all(&theirs_db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].at, now - 1_000);
+        assert_eq!(rows[0].app.as_deref(), Some("a.exe"));
+        assert_eq!(rows[0].title.as_deref(), Some("A"));
+
+        // Our own copy is a fresh row of this machine's, at the top of the list.
+        let mine_db = dir
+            .join("sync")
+            .join("mach1")
+            .join(settings::month_bucket(now))
+            .join(DB_NAME);
+        let mine = read_all(&mine_db);
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].machine, "mach1");
+        assert_eq!(mine[0].text.as_deref(), Some(text));
+        assert!(mine[0].at >= now);
+
+        let list = store.query(None, "", &ChipFilter::default(), 10);
+        assert_eq!(list[0].stem, mine[0].stem);
 
         let _ = fs::remove_dir_all(&dir);
     }
