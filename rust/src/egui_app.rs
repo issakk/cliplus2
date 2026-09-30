@@ -331,6 +331,10 @@ struct App {
     /// A message box this popup put up is the one thing allowed to take the
     /// focus — the focus-loss auto-hide holds its breath while it is open.
     modal_open: bool,
+    /// 热键触发的收起挂起中:组合键还没物理松开,等松开再真的藏(见 `toggle`)。
+    hotkey_hide_pending: bool,
+    /// 挂起的最后期限:键一直不松(卡键)也不能把弹窗吊着一秒以上。
+    hotkey_hide_deadline: Instant,
 
     search: String,
     /// Bottom-up, exactly like the legacy list: the newest clip is the last
@@ -413,6 +417,8 @@ impl App {
             target: 0,
             shown_at: Instant::now(),
             modal_open: false,
+            hotkey_hide_pending: false,
+            hotkey_hide_deadline: Instant::now(),
             search: String::new(),
             items: Vec::new(),
             selected: HashSet::new(),
@@ -527,9 +533,26 @@ impl App {
     fn toggle(&mut self, ctx: &egui::Context) {
         // 准备中(pending)也算"开着":那一瞬间再按热键应当是取消打开。
         if self.visible {
-            self.hide(ctx);
+            self.hide_after_hotkey_release(ctx);
         } else {
             self.show(ctx);
+        }
+    }
+
+    /// 热键按下时的收起路径:热键吞掉的是 key-down,配对的 key-up 会落到
+    /// 此刻持有焦点的窗口。弹窗当场藏掉的话焦点立刻回到目标程序,那串悬空
+    /// 的 key-up(Ctrl↑/W↑,从来没有配对的 down)就进了别人家——输入法/
+    /// AltGr 状态机会把它补全成一次右 Alt,误触前台软件的热键(微信的
+    /// "按住说话"就是这么被凭空拉起来的)。等组合键物理松开再藏,让孤儿
+    /// key-up 落进本窗口自灭。
+    fn hide_after_hotkey_release(&mut self, ctx: &egui::Context) {
+        if hotkey_keys_all_up() {
+            self.hide(ctx);
+        } else {
+            // 键还按着:挂起,交给 logic() 每帧复查,松手即藏;最长吊一秒,
+            // 卡键也不能把弹窗留在屏幕上。
+            self.hotkey_hide_pending = true;
+            self.hotkey_hide_deadline = Instant::now() + Duration::from_secs(1);
         }
     }
 
@@ -560,6 +583,11 @@ impl App {
         self.move_window_to(ctx, park_position(left, top, ppp));
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        // 焦点在停车帧就抢:热键吞掉的 key-down 的配对 key-up 马上就到(用户
+        // 松手),晚两帧再抢它们就落进目标程序,输入法层会把悬空的 Ctrl↑
+        // 补全成右 Alt,误触微信这类前台软件的热键。屏幕外的窗口照样可以
+        // 合法持焦点,用户什么也看不见。
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.request_repaint();
 
         self.visible = true;
@@ -592,7 +620,11 @@ impl App {
         let ppp = (scale as f32).max(0.25);
         self.move_window_to(ctx, egui::pos2(left as f32 / ppp, top as f32 / ppp));
 
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        // 焦点已在停车帧抢过;这里只在状态未知时补一次。用户在这两帧里点去
+        // 了别的窗口就不往回抢——失焦自动收起会接手,抢回来反而是焦点闪烁。
+        if ctx.input(|i| i.viewport().focused).is_none() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         ctx.request_repaint();
 
         self.shown_at = Instant::now();
@@ -718,6 +750,8 @@ impl App {
         self.hydrating = None;
         // 同上:确认框不跟着弹窗过夜。
         self.confirm_delete = None;
+        // 别的路径(Esc、失焦)先藏了的话,挂起中的热键收起就作废。
+        self.hotkey_hide_pending = false;
         self.visible = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
 
@@ -1457,11 +1491,51 @@ impl App {
     }
 }
 
+/// 当前热键组合涉及的每个键是否都已物理松开。
+///
+/// 热键吞的是 key-down,松手产生的 key-up 会投给焦点窗口;热键收起路径用
+/// 这个等"用户已松手",让那串孤儿 key-up 落进本窗口自灭。组合键解析不出
+/// 来时返回 true——不知道该等什么,就不等。
+fn hotkey_keys_all_up() -> bool {
+    let Some(settings) = crate::current_settings() else {
+        return true;
+    };
+    let Some(hotkey) = crate::settings::parse_hotkey(&settings.hotkey) else {
+        return true;
+    };
+
+    let mut vks: Vec<i32> = Vec::new();
+    if hotkey.modifiers & win::MOD_CONTROL != 0 {
+        vks.push(win::VK_CONTROL as i32);
+    }
+    if hotkey.modifiers & win::MOD_ALT != 0 {
+        vks.push(win::VK_MENU);
+    }
+    if hotkey.modifiers & win::MOD_SHIFT != 0 {
+        vks.push(win::VK_SHIFT);
+    }
+    if hotkey.modifiers & win::MOD_WIN != 0 {
+        // 左右 Win 是两颗物理键,任一按着都算组合还没松。
+        vks.push(win::VK_LWIN);
+        vks.push(win::VK_RWIN);
+    }
+    vks.push(hotkey.vk as i32);
+
+    vks.iter().all(|vk| !win::key_held(*vk))
+}
+
 impl eframe::App for App {
     /// Runs for a hidden window too — platform events, thumbnails and
     /// hydration results cannot wait here.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events(ctx);
+        // 热键收起在等组合键松手:松了(或超时)就补上那一步藏。
+        if self.hotkey_hide_pending
+            && (hotkey_keys_all_up() || Instant::now() >= self.hotkey_hide_deadline)
+        {
+            self.hotkey_hide_pending = false;
+            self.hide(ctx);
+        }
         self.drain_workers(ctx);
         self.prepare_startup_geometry(ctx);
         self.enforce_hidden(ctx);

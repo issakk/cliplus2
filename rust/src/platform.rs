@@ -205,6 +205,7 @@ extern "system" fn wnd_proc(
         }
 
         WM_APP_SUSPEND_HOTKEY => {
+            log::info("hotkey suspended: settings hotkey field has focus");
             win::unregister_hotkey(hwnd, HOTKEY_ID);
             0
         }

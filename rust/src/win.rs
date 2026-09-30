@@ -508,6 +508,7 @@ extern "system" {
     pub fn ReleaseCapture() -> i32;
     pub fn SetFocus(hWnd: HWND) -> HWND;
     pub fn GetKeyState(nVirtKey: i32) -> i16;
+    pub fn GetAsyncKeyState(nVirtKey: i32) -> i16;
     pub fn IsWindowVisible(hWnd: HWND) -> i32;
     pub fn SetWindowPos(
         hWnd: HWND,
@@ -1491,6 +1492,13 @@ pub fn work_area_at(point: POINT) -> RECT {
 
 pub fn set_foreground(hwnd: HWND) -> bool {
     unsafe { hwnd != 0 && SetForegroundWindow(hwnd) != 0 }
+}
+
+/// Whether the user is physically holding the key right now, no matter which
+/// window the events are being routed to — the async state reads the hardware
+/// stream, not this thread's queue.
+pub fn key_held(vk: i32) -> bool {
+    unsafe { GetAsyncKeyState(vk) as u16 & 0x8000 != 0 }
 }
 
 
