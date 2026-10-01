@@ -200,6 +200,14 @@ pub fn run(store: Arc<Store>) {
             log::info("dialog key hook installed");
         }
 
+        // 弹窗是唯一的 gpui 窗口:它被 Alt+F4 之类的路径关掉时,进程没有理由
+        // 再挂着(egui 版窗口关闭即退出循环,同一约定)。
+        cx.on_window_closed(|_cx| {
+            log::info("popup window closed; quitting");
+            platform::request_quit();
+        })
+        .detach();
+
         // 平台事件:热键/托盘/退出。flume 的 async recv 就是唤醒机制。
         {
             let window = window.clone();
@@ -1370,8 +1378,8 @@ impl PopupApp {
         };
         match drag {
             DragState::Move { start_cursor, start_rect, scale } => {
-                let dx = ((event.position.x - start_cursor.x).0 as f64 * scale).round() as i32;
-                let dy = ((event.position.y - start_cursor.y).0 as f64 * scale).round() as i32;
+                let dx = (f64::from(event.position.x - start_cursor.x) * scale).round() as i32;
+                let dy = (f64::from(event.position.y - start_cursor.y) * scale).round() as i32;
                 win::set_window_pos(
                     self.hwnd(),
                     start_rect.left + dx,
@@ -1382,8 +1390,8 @@ impl PopupApp {
                 );
             }
             DragState::Resize { dir, start_cursor, start_rect, scale } => {
-                let dx = ((event.position.x - start_cursor.x).0 as f64 * scale).round() as i32;
-                let dy = ((event.position.y - start_cursor.y).0 as f64 * scale).round() as i32;
+                let dx = (f64::from(event.position.x - start_cursor.x) * scale).round() as i32;
+                let dy = (f64::from(event.position.y - start_cursor.y) * scale).round() as i32;
                 let min_w = (MIN_SIZE.0 as f64 * scale).round() as i32;
                 let min_h = (MIN_SIZE.1 as f64 * scale).round() as i32;
                 let (mut left, mut top) = (start_rect.left, start_rect.top);
@@ -1448,12 +1456,12 @@ impl PopupApp {
             return; // 列表自己的滚动,别算两遍
         }
         // gpui 的 offset 语义:向下滚(看更新的内容)delta 为负,和 egui 一致。
-        let delta = event.delta.pixel_delta(px(ROW_HEIGHT)).y;
+        let delta = f32::from(event.delta.pixel_delta(px(ROW_HEIGHT)).y);
         if delta == 0.0 {
             return;
         }
         let rows = ((delta.abs() / ROW_HEIGHT).ceil() as usize).max(1);
-        let top = self.list_handle.logical_scroll_top_index();
+        let top = self.list_handle.0.borrow().base_handle.top_item();
         let last = self.items.len().saturating_sub(1);
         let target = if delta < 0.0 {
             (top + rows).min(last)
@@ -1581,7 +1589,7 @@ impl PopupApp {
             this.visible_rows = range.len();
             range
                 .map(|index| this.render_row(index, view.clone(), window, cx))
-                .collect()
+                .collect::<Vec<Div>>()
         }))
         .track_scroll(self.list_handle.clone())
         .size_full()
@@ -1612,13 +1620,12 @@ impl PopupApp {
         let Some(item) = self.items.get(index) else {
             return div().h(px(ROW_HEIGHT));
         };
-        let (stem, preview, meta, pinned, kind, has_blob) = (
+        let (stem, preview, meta, pinned, kind) = (
             item.stem.clone(),
             item.preview.clone(),
             item.meta.clone(),
             item.pinned,
             item.kind,
-            item.has_blob,
         );
         let selected = self.selected.contains(&index);
         let hover_bg = if selected {
@@ -2138,7 +2145,9 @@ impl PopupApp {
                     .text_size(px(12.5))
                     .text_color(rgb(if active { COLOR_TEXT } else { COLOR_META }))
                     .hover(|style| style.bg(rgb(COLOR_HOVER)))
-                    .on_click(move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                    .on_click({
+                        let label = label.clone();
+                        move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
                         view.update(cx, |this, cx| {
                             match kind_label {
                                 DropdownKind::Type => {
@@ -2162,8 +2171,9 @@ impl PopupApp {
                             this.refill();
                             cx.notify();
                         });
+                        }
                     })
-                    .child(label)
+                    .child(label.clone())
             }))
     }
 
@@ -2730,6 +2740,7 @@ struct TextElement {
 
 struct PrepaintState {
     line: Option<ShapedLine>,
+    selection: Option<gpui::PaintQuad>,
     cursor: Option<gpui::PaintQuad>,
 }
 
@@ -2860,6 +2871,7 @@ impl Element for TextElement {
         };
         PrepaintState {
             line: Some(line),
+            selection,
             cursor,
         }
     }
