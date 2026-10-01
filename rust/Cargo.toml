@@ -22,12 +22,19 @@ notify = "8"
 # depend on a sqlite3.dll the user would have to have.
 rusqlite = { version = "0.40", features = ["bundled"] }
 
-# The egui shell. glow is the smallest GPU backend; the Microsoft YaHei font
-# loads from the system at runtime rather than being packed into the exe.
-# The popup is egui; the three secondary dialogs (settings/cleanup/edit)
-# remain Win32 on the same thread, pumped by winit's shared message loop.
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
-egui = "0.36"
+# The GPUI shell (Zed's framework, GPUI 2 preview line). The popup is GPUI;
+# the three secondary dialogs (settings/cleanup/edit) remain Win32 on the same
+# thread, pumped by gpui's GetMessageW loop. windows-manifest is off on
+# purpose: build.rs embeds the very same manifest once, and two RT_MANIFEST
+# resources in one exe is a linker argument waiting to happen.
+# flume carries events from the platform/thumbnail/hydrate/edit threads into
+# async tasks on the UI thread — its async recv is what wakes gpui's loop.
+# raw_window_handle bridges to the popup HWND for the window management calls
+# gpui does not expose (show/hide/move/resize on demand).
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit"] }
+image = "0.25"
+flume = "0.11"
+raw-window-handle = "0.6"
 
 # The icon resource needs the platform resource compiler; this crate shells out
 # to rc.exe, which ships with the MSVC toolchain the build already requires.

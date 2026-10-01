@@ -203,6 +203,20 @@ pub const SW_HIDE: i32 = 0;
 pub const SWP_NOACTIVATE: u32 = 0x0010;
 pub const SWP_NOZORDER: u32 = 0x0004;
 pub const SWP_SHOWWINDOW: u32 = 0x0040;
+pub const SWP_NOSIZE: u32 = 0x0001;
+pub const SWP_NOMOVE: u32 = 0x0002;
+
+/// 键盘消息钩子:主线程的消息循环归 gpui 之后,它只给**自己的**窗口调
+/// TranslateMessage(WM_KEYDOWN → WM_CHAR)。同线程的三个 Win32 对话框的
+/// 编辑框从此收不到字符消息,打字就死了。这条 WH_GETMESSAGE 钩子补上那一步:
+/// 只翻译落向非 gpui 窗口的键盘消息,落向 gpui 窗口的放行(它自己合成,
+/// 再翻一遍就是双份输入)。
+pub const WH_GETMESSAGE: i32 = 3;
+pub const HC_ACTION: i32 = 0;
+pub const WM_KEYUP: u32 = 0x0101;
+pub const WM_SYSKEYUP: u32 = 0x0105;
+pub type HHOOK = isize;
+pub type HOOKPROC = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 
 pub const VK_RETURN: i32 = 0x0D;
 pub const VK_ESCAPE: i32 = 0x1B;
@@ -527,6 +541,11 @@ extern "system" {
     pub fn BeginPaint(hWnd: HWND, lpPaint: *mut PAINTSTRUCT) -> HDC;
     pub fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) -> i32;
     pub fn GetDpiForWindow(hwnd: HWND) -> u32;
+
+    // --- dialog key translation hook ---
+    pub fn SetWindowsHookExW(idHook: i32, lpfn: Option<HOOKPROC>, hMod: HINSTANCE, dwThreadId: u32) -> HHOOK;
+    pub fn UnhookWindowsHookEx(hhk: HHOOK) -> i32;
+    pub fn CallNextHookEx(hhk: HHOOK, nCode: i32, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
 
     // --- tray icon and its menu ---
     pub fn CreatePopupMenu() -> HMENU;
@@ -1851,4 +1870,69 @@ pub fn dark_title_bar(hwnd: HWND) {
             4,
         );
     }
+}
+
+// ------------------------------------------------------------------ gpui 共存
+
+/// gpui 弹窗的 HWND。钩子用它把键盘消息分成两路:落向 gpui 的放行(它自己在
+/// key handler 里 TranslateMessage),落向其余窗口(三个 Win32 对话框和它们
+/// 的编辑控件)的由钩子补翻一次。
+static GPUI_HWND: AtomicIsize = AtomicIsize::new(0);
+
+pub fn set_gpui_window(hwnd: HWND) {
+    GPUI_HWND.store(hwnd, Ordering::SeqCst);
+}
+
+/// gpui 弹窗的 HWND;钩子和窗口管理调用都认它。
+pub fn gpui_window() -> HWND {
+    GPUI_HWND.load(Ordering::SeqCst)
+}
+
+/// WH_GETMESSAGE 钩子本体。GetMessage 取出消息、派发之前经过这里——正是
+/// TranslateMessage 在普通消息循环里所处的位置,所以直接在这里调用它,WM_CHAR
+/// 就会照常排队进编辑控件。只动键盘消息,别的不碰。
+extern "system" fn dialog_key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION && !lparam.is_null() {
+        let msg = lparam as *const MSG;
+        let message = unsafe { (*msg).message };
+        if matches!(
+            message,
+            WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
+        ) && unsafe { (*msg).hwnd } != GPUI_HWND.load(Ordering::SeqCst)
+        {
+            unsafe { TranslateMessage(msg) };
+        }
+    }
+    unsafe { CallNextHookEx(0, code, wparam, lparam) }
+}
+
+/// 给主线程装上键盘消息钩子,返回钩子句柄(进程生命周期内不必卸载)。
+pub fn install_dialog_key_translation(thread_id: u32) -> HHOOK {
+    unsafe { SetWindowsHookExW(WH_GETMESSAGE, Some(dialog_key_hook), 0, thread_id) }
+}
+
+/// 窗口的屏幕矩形(物理像素)。gpui 不暴露运行时挪窗/量窗,弹窗自己的
+/// 显隐、缩放、拖动都从这里拿基准。
+pub fn window_rect(hwnd: HWND) -> Option<RECT> {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if unsafe { GetWindowRect(hwnd, &mut rect) } != 0 {
+        Some(rect)
+    } else {
+        None
+    }
+}
+
+/// 挪/缩窗口(物理像素)。`flags` 挑选 SWP_NOMOVE/SWP_NOSIZE/SWP_NOZORDER 等。
+pub fn set_window_pos(hwnd: HWND, x: i32, y: i32, w: i32, h: i32, flags: u32) -> bool {
+    unsafe { SetWindowPos(hwnd, 0, x, y, w, h, flags) != 0 }
+}
+
+/// 显隐窗口。SW_SHOW 抢焦点,SW_HIDE 收起。
+pub fn show_window(hwnd: HWND, command: i32) -> bool {
+    unsafe { ShowWindow(hwnd, command) != 0 }
 }

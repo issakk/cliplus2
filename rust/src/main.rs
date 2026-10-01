@@ -5,7 +5,7 @@ mod cleanup_window;
 mod clip;
 mod clipboard;
 mod edit_window;
-mod egui_app;
+mod gpui_app;
 mod index;
 mod log;
 mod paste;
@@ -90,8 +90,10 @@ fn main() {
     win::set_per_monitor_dpi_aware();
 
     // The three secondary windows stay Win32 on purpose: plain system-control
-    // dialogs, living on this same thread and pumped by winit's shared message
-    // loop once the egui loop starts. DPI awareness is set above so they scale.
+    // dialogs, living on this same thread and pumped by gpui's shared message
+    // loop once the GPUI app starts (a keyboard-message hook keeps their edit
+    // controls receiving WM_CHAR — see win::install_dialog_key_translation).
+    // DPI awareness is set above so they scale.
     if !settings_window::create() {
         log::error("settings window could not be created; the tray entry will do nothing");
     }
@@ -102,7 +104,7 @@ fn main() {
         log::error("edit window could not be created; the row menu 编辑 entry will do nothing");
     }
 
-    egui_app::run(store);
+    gpui_app::run(store);
     log::info("=== ClipPlus stopping ===");
 }
 
