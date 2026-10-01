@@ -590,9 +590,11 @@ impl PopupApp {
         // 搜索文本变了才重灌:input 实体只在自己的**内容**变化时发事件,光标
         // 和选择的挪动只走 notify,订阅这边把两者天然分开。
         cx.subscribe(&app.input, |this, _input, event, cx| {
-            if let SearchInputEvent::Changed = event {
-                this.refill(cx);
-                cx.notify();
+            match event {
+                SearchInputEvent::Changed => {
+                    this.refill(cx);
+                    cx.notify();
+                }
             }
         })
         .detach();
@@ -1018,7 +1020,7 @@ impl PopupApp {
         self.anchor = 0;
     }
 
-    fn cycle_tab(&mut self, dir: isize) {
+    fn cycle_tab(&mut self, dir: isize, cx: &mut Context<Self>) {
         if self.tabs.is_empty() {
             return;
         }
@@ -1180,7 +1182,7 @@ impl PopupApp {
 
     /// Ctrl+P: pin or unpin the caret row. Pinning moves the row to the top,
     /// so follow the item rather than the index.
-    fn toggle_pin(&mut self) {
+    fn toggle_pin(&mut self, cx: &mut Context<Self>) {
         let Some(item) = self.items.get(self.caret) else {
             return;
         };
@@ -1311,8 +1313,8 @@ impl PopupApp {
         cx.notify();
     }
 
-    fn on_toggle_pin(&mut self, _: &TogglePin, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.toggle_pin();
+    fn on_toggle_pin(&mut self, _: &TogglePin, _window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_pin(cx);
     }
 
     fn on_copy(&mut self, _: &CopyRecords, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1329,12 +1331,12 @@ impl PopupApp {
         self.select_all();
     }
 
-    fn on_next_tab(&mut self, _: &NextTab, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.cycle_tab(1);
+    fn on_next_tab(&mut self, _: &NextTab, _window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(1, cx);
     }
 
-    fn on_prev_tab(&mut self, _: &PrevTab, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.cycle_tab(-1);
+    fn on_prev_tab(&mut self, _: &PrevTab, _window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(-1, cx);
     }
 
     fn on_confirm_delete(&mut self, _: &ConfirmDelete, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2032,7 +2034,7 @@ impl PopupApp {
                     "固定（Ctrl+P）".into()
                 },
                 true,
-                |this, _, _| this.toggle_pin(),
+                |this, _, cx| this.toggle_pin(cx),
             ))
             .child(
                 div()
@@ -2042,6 +2044,7 @@ impl PopupApp {
                     .bg(rgb(COLOR_BORDER)),
             )
             .child(Self::menu_item(
+                cx,
                 "删除（Delete）".into(),
                 true,
                 |this, window, _| {
