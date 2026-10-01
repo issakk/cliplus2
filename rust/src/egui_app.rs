@@ -335,6 +335,9 @@ struct App {
     hotkey_hide_pending: bool,
     /// 挂起的最后期限:键一直不松(卡键)也不能把弹窗吊着一秒以上。
     hotkey_hide_deadline: Instant,
+    /// 收起那一刻置位:`Visible(false)` 所在的这一帧会先完整上屏(命令比画面
+    /// 晚一步落地),`ui()` 靠它把最后一份内容补画进这一帧——见 `draw_final_frame`。
+    just_hidden: bool,
 
     search: String,
     /// Bottom-up, exactly like the legacy list: the newest clip is the last
@@ -419,6 +422,7 @@ impl App {
             modal_open: false,
             hotkey_hide_pending: false,
             hotkey_hide_deadline: Instant::now(),
+            just_hidden: false,
             search: String::new(),
             items: Vec::new(),
             selected: HashSet::new(),
@@ -753,6 +757,9 @@ impl App {
         // 别的路径(Esc、失焦)先藏了的话,挂起中的热键收起就作废。
         self.hotkey_hide_pending = false;
         self.visible = false;
+        // 这帧的 `Visible(false)` 还要等画完、swap 完才落地,让 `ui()` 把最后
+        // 一份内容补画进这一帧(见 `draw_final_frame`),别让默认清屏色闪出来。
+        self.just_hidden = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
 
         // 收起之后窗口还在,趁它藏着把下次要用的尺寸摆好:停车那一帧就不必再
@@ -1543,12 +1550,19 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         // 藏着的时候 eframe 也可能照样跑这一趟:它只按 `ViewportInfo` 判断可见性,
         // 而 winit 在 Windows 上从不填那个字段。这里是双保险,别当真它不跑。
         if !self.visible {
+            // 收起的那一帧别空着:`Visible(false)` 比画面晚一步落地,hide 所在的
+            // 这一帧会先完整上屏,画空了就是 eframe 默认清屏色(近黑)闪一下——
+            // 热键收起、失焦收起走的都是这里。补画最后一份内容,和上一帧无缝
+            // 衔接;之后的空转帧窗口已经藏了,不值得再画。
+            if self.just_hidden {
+                self.draw_final_frame(&ctx, ui);
+            }
             return;
         }
-        let ctx = ui.ctx().clone();
 
         // 停在屏幕外等首帧的窗口还没有焦点,也没有人会去点它;这一趟只是把内容
         // 画进表面,别的什么都不做。
@@ -1565,6 +1579,8 @@ impl eframe::App for App {
             && !ctx.input(|i| i.viewport().focused.unwrap_or(true))
         {
             self.hide(&ctx);
+            // 这帧同样必须带内容才上屏(见 ui() 开头那条),不然失焦收起也闪黑。
+            self.draw_final_frame(&ctx, ui);
             return;
         }
 
@@ -1600,6 +1616,17 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// 收起前最后一帧的补画。`Visible(false)` 这类 viewport 命令在帧画完、swap
+    /// 完之后才处理,`hide()` 所在的那一帧因此会先完整上屏:画空了,用户看到
+    /// 的就是一帧 eframe 默认清屏色(近黑)再消失——"收起先黑一下"就是它。
+    /// `hide()` 置 `just_hidden`,热键收起/失焦收起这类画不了内容的路径从这里
+    /// 补画一次;Esc/Enter 这类在 `ui()` 中途收起的路径后面本来就有 `draw()`,
+    /// 置了标记也不重复上屏——标记下一帧才消费,而那时窗口已经藏了。
+    fn draw_final_frame(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        self.just_hidden = false;
+        self.draw(ctx, ui);
+    }
+
     /// 画界面本体。停车那一帧走的就是这里:内容必须先画进表面,窗口才能露面。
     fn draw(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         // 0.36 的面板都长在传入的根 Ui 上,不再接 Context。先加的贴底边:
