@@ -31,12 +31,12 @@ use image::{Frame, ImageBuffer};
 use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 
 use gpui::{
-    actions, div, fill, img, prelude::*, px, rgb, rgba, size, uniform_list, App, Application,
-    Bounds, ClipboardItem, Context, CursorStyle, Element, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, GlobalElementId, InspectorElementId, KeyBinding, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render,
-    RenderImage, ScrollStrategy, ScrollWheelEvent, ShapedLine, SharedString, StyledImage, Style,
-    TextRun, UTF16Selection, UnderlineStyle, UniformListScrollHandle, Window,
+    actions, div, fill, img, point, prelude::*, px, rgb, rgba, size, uniform_list, App,
+    Application, Bounds, ClipboardItem, Context, CursorStyle, Div, Element, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, GlobalElementId, InspectorElementId, KeyBinding,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point,
+    Render, RenderImage, ScrollStrategy, ScrollWheelEvent, ShapedLine, SharedString, StyledImage,
+    Style, TextRun, UTF16Selection, UnderlineStyle, UniformListScrollHandle, Window,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
 };
 use crate::clip::{ClipKind, ClipPayload};
@@ -413,7 +413,7 @@ struct MenuState {
 }
 
 /// 筛选下拉(类型/时间)挂起时的状态。
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum DropdownKind {
     Type,
     Time,
@@ -427,7 +427,7 @@ struct DropdownState {
 
 /// 缩放方向。gpui 没有可用的原生 size 循环(弹窗样式是 style 0,没有
 /// THICKFRAME),缩放是手动的:边缘带按下记起点,move 里 SetWindowPos。
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum ResizeDir {
     West,
     East,
@@ -549,7 +549,7 @@ impl PopupApp {
         let input_focus = input.read(cx).focus_handle.clone();
         let root_focus = cx.focus_handle();
 
-        let mut app = Self {
+        let app = Self {
             store,
             input,
             input_focus,
@@ -727,7 +727,7 @@ impl PopupApp {
                         }
                         true
                     });
-                    if still_waiting != Ok(true) {
+                    if !matches!(still_waiting, Ok(true)) {
                         break;
                     }
                 }
@@ -986,8 +986,10 @@ impl PopupApp {
         if self.items.is_empty() {
             return;
         }
-        let top = self.list_handle.base_handle.top_item();
-        let bottom = self.list_handle.base_handle.bottom_item();
+        let (top, bottom) = {
+            let state = self.list_handle.0.borrow();
+            (state.base_handle.top_item(), state.base_handle.bottom_item())
+        };
         if self.caret < top {
             self.pending_scroll = Some((self.caret, ScrollStrategy::Top, false));
         } else if self.caret > bottom {
@@ -1435,7 +1437,14 @@ impl PopupApp {
         if self.items.is_empty() {
             return;
         }
-        if self.list_handle.base_handle.bounds().contains(&event.position) {
+        if self
+            .list_handle
+            .0
+            .borrow()
+            .base_handle
+            .bounds()
+            .contains(&event.position)
+        {
             return; // 列表自己的滚动,别算两遍
         }
         // gpui 的 offset 语义:向下滚(看更新的内容)delta 为负,和 egui 一致。
@@ -1537,7 +1546,7 @@ impl PopupApp {
 
         div()
             .flex_1()
-            .min_h_0()
+            .min_h(px(0.0))
             .relative()
             .child(self.render_grip_marks())
             .when_some(hint, |el, hint| {
@@ -1597,7 +1606,7 @@ impl PopupApp {
         view: Entity<Self>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> Div {
         // Clone out of the list so the mutable work below never overlaps the
         // borrow the widgets need.
         let Some(item) = self.items.get(index) else {
@@ -1640,9 +1649,9 @@ impl PopupApp {
                     view.update(cx, |this, cx| {
                         log::info(&format!(
                             "row {index} pressed (shift={}, ctrl={})",
-                            event.modifiers.shift, event.modifiers.ctrl
+                            event.modifiers.shift, event.modifiers.control
                         ));
-                        this.press_row(index, event.modifiers.shift, event.modifiers.ctrl);
+                        this.press_row(index, event.modifiers.shift, event.modifiers.control);
                         this.drag_from = Some(index);
                         window.focus(&this.root_focus);
                         cx.stop_propagation();
@@ -1710,7 +1719,7 @@ impl PopupApp {
         row.child(
             div()
                 .flex_1()
-                .min_w_0()
+                .min_w(px(0.0))
                 .h_full()
                 .flex()
                 .flex_col()
@@ -1933,7 +1942,7 @@ impl PopupApp {
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(px(0.0))
                     .child(self.input.clone()),
             )
     }
@@ -1967,7 +1976,6 @@ impl PopupApp {
         enabled: bool,
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         view: &Entity<Self>,
-        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let item = div()
             .id(SharedString::from(format!("menu-{label}")))
@@ -2018,14 +2026,12 @@ impl PopupApp {
                 true,
                 |this, _, cx| this.commit(cx),
                 &view,
-                cx,
             ))
             .child(Self::menu_item(
                 "复制（Ctrl+C）".into(),
                 true,
                 |this, _, cx| this.copy_selected(cx),
                 &view,
-                cx,
             ))
             .child(Self::menu_item(
                 // 与旧菜单同一条规则:只有文本、且归本机当月可写时才可编辑。
@@ -2033,7 +2039,6 @@ impl PopupApp {
                 can_edit,
                 |this, _, _| this.edit_selected(),
                 &view,
-                cx,
             ))
             .child(Self::menu_item(
                 if pinned {
@@ -2044,7 +2049,6 @@ impl PopupApp {
                 true,
                 |this, _, _| this.toggle_pin(),
                 &view,
-                cx,
             ))
             .child(
                 div()
@@ -2056,14 +2060,13 @@ impl PopupApp {
             .child(Self::menu_item(
                 "删除（Delete）".into(),
                 true,
-                |this, window, cx| {
+                |this, window, _| {
                     this.delete_selected();
                     if this.confirm_delete.is_some() {
                         window.focus(&this.root_focus);
                     }
                 },
                 &view,
-                cx,
             ))
             .child(
                 div()
@@ -2077,7 +2080,6 @@ impl PopupApp {
                 true,
                 |this, _, _| this.select_all(),
                 &view,
-                cx,
             ))
             .when(has_blob, |el| {
                 el.child(
@@ -2244,6 +2246,29 @@ impl PopupApp {
                             ),
                     ),
             )
+    }
+}
+
+/// 按下列表里的一行之后的选择集与锚点。纯函数,单独测:普通点、Shift 扩选、
+/// Ctrl 切换这三条语义旧弹窗就有,"点了不选中"的毛病正是从这儿冒出来的。
+fn pressed_state(
+    selected: &HashSet<usize>,
+    anchor: usize,
+    index: usize,
+    shift: bool,
+    ctrl: bool,
+) -> (HashSet<usize>, usize) {
+    if shift {
+        let (lo, hi) = (anchor.min(index), anchor.max(index));
+        ((lo..=hi).collect(), anchor)
+    } else if ctrl {
+        let mut next = selected.clone();
+        if !next.remove(&index) {
+            next.insert(index);
+        }
+        (next, index)
+    } else {
+        ([index].into_iter().collect(), index)
     }
 }
 
