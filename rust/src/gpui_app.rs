@@ -162,6 +162,12 @@ pub fn run(store: Arc<Store>) {
                     show: false,
                     focus: false,
                     kind: WindowKind::PopUp,
+                    // titlebar 必须显式给 None:Default 是 Some(appears_transparent:
+                    // false),含义是"系统来画标题栏"——弹窗顶上会多一条系统强调色
+                    // 的小标题栏(PopUp 样式虽是 0,非客户区归 DefWindowProc 管时
+                    // Win11 的 DWM 照画)。None 才是 gpui 无框窗口的正路:gpui 自己
+                    // 接管 WM_NCCALCSIZE,整个窗口都归客户区。
+                    titlebar: None,
                     is_movable: false,
                     is_resizable: false,
                     window_min_size: Some(size(px(MIN_SIZE.0 as f32), px(MIN_SIZE.1 as f32))),
@@ -181,11 +187,12 @@ pub fn run(store: Arc<Store>) {
         let _ = window.update(cx, |_, window, cx| {
             match window.window_handle().map(|h| h.as_raw()) {
                 Ok(RawWindowHandle::Win32(handle)) => {
-                    win::set_gpui_window(handle.hwnd.get() as isize);
-                    log::info(&format!(
-                        "gpui popup window ready (hwnd {:#x})",
-                        handle.hwnd.get()
-                    ));
+                    let hwnd = handle.hwnd.get() as isize;
+                    win::set_gpui_window(hwnd);
+                    // 用户的"强调色用于标题栏和边框"个性化会给无框窗口补一条
+                    // 彩边;弹窗要的是和 egui 版一样的全无框。
+                    win::remove_window_border(hwnd);
+                    log::info(&format!("gpui popup window ready (hwnd {hwnd:#x})"));
                 }
                 other => log::error(&format!("gpui window handle unavailable: {other:?}")),
             }

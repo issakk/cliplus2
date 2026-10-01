@@ -1911,6 +1911,23 @@ pub fn install_dialog_key_translation(thread_id: u32) -> HHOOK {
     unsafe { SetWindowsHookExW(WH_GETMESSAGE, Some(dialog_key_hook), 0, thread_id) }
 }
 
+/// Win11 的窗口边框颜色跟随"在标题栏和窗口边框上显示强调色"个性化设置;
+/// 弹窗要的是完全无框(与 egui 版一致),把边框颜色设为 NONE。Win10 没有这个
+/// 属性,调用失败即没有边框策略可言,静默。
+pub fn remove_window_border(hwnd: HWND) {
+    const DWMWA_BORDER_COLOR: u32 = 34;
+    const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+    let color: u32 = DWMWA_COLOR_NONE;
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &color as *const u32 as *const c_void,
+            4,
+        );
+    }
+}
+
 /// 窗口的屏幕矩形(物理像素)。gpui 不暴露运行时挪窗/量窗,弹窗自己的
 /// 显隐、缩放、拖动都从这里拿基准。
 pub fn window_rect(hwnd: HWND) -> Option<RECT> {
