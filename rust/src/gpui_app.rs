@@ -33,7 +33,8 @@ use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 use gpui::{
     actions, div, fill, img, point, prelude::*, px, rgb, rgba, size, uniform_list, App,
     Application, Bounds, ClipboardItem, Context, CursorStyle, Div, Element, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, GlobalElementId, InspectorElementId, KeyBinding,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, GlobalElementId, InspectorElementId,
+    KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point,
     Render, RenderImage, ScrollStrategy, ScrollWheelEvent, ShapedLine, SharedString, StyledImage,
     Style, TextRun, UTF16Selection, UnderlineStyle, UniformListScrollHandle, Window,
@@ -481,8 +482,6 @@ struct PopupApp {
     input_focus: FocusHandle,
     /// 根焦点:行点击/确认框挂起时把焦点从搜索框挪到这里。
     root_focus: FocusHandle,
-    search_version: u64,
-    search: String,
 
     /// Mirrors the real window visibility.
     visible: bool,
@@ -512,11 +511,8 @@ struct PopupApp {
     anchor: usize,
     /// 鼠标正按着拖动时,按下那一行的下标。None = 没在拖。
     drag_from: Option<usize>,
-    /// 上一帧列表实际可见的行数,翻页键按它算。
-    visible_rows: usize,
-    /// 列表滚动控制柄;pending_scroll 是下一帧要落地的滚动请求。
+    /// 列表滚动控制柄。滚动请求直接落在柄上,由 gpui 延迟到下一次布局执行。
     list_handle: UniformListScrollHandle,
-    pending_scroll: Option<(usize, ScrollStrategy, bool)>,
     /// 窗口手势(背景拖动 / 边缘缩放)。
     drag: Option<DragState>,
 
@@ -562,8 +558,6 @@ impl PopupApp {
             input,
             input_focus,
             root_focus,
-            search_version: 0,
-            search: String::new(),
             visible: false,
             parked: false,
             target: 0,
@@ -576,9 +570,7 @@ impl PopupApp {
             caret: 0,
             anchor: 0,
             drag_from: None,
-            visible_rows: 8,
             list_handle: UniformListScrollHandle::new(),
-            pending_scroll: None,
             drag: None,
             confirm_delete: None,
             menu: None,
@@ -595,13 +587,11 @@ impl PopupApp {
             generation: 0,
         };
 
-        // 搜索文本变了才重灌:版本号把"光标挪了"这类通知挡在外面。
-        cx.observe(&app.input, |this, input, cx| {
-            let version = input.read(cx).version;
-            if version != this.search_version {
-                this.search_version = version;
-                this.search = input.read(cx).content.to_string();
-                this.refill();
+        // 搜索文本变了才重灌:input 实体只在自己的**内容**变化时发事件,光标
+        // 和选择的挪动只走 notify,订阅这边把两者天然分开。
+        cx.subscribe(&app.input, |this, _input, event, cx| {
+            if let SearchInputEvent::Changed = event {
+                this.refill(cx);
                 cx.notify();
             }
         })
@@ -685,7 +675,7 @@ impl PopupApp {
     fn drain_edit(&mut self, saved: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.modal_open = false;
         if let Some(stem) = &saved {
-            self.refill();
+            self.refill(cx);
             if let Some(position) = self.items.iter().position(|item| &item.stem == stem) {
                 self.point_at(position);
             }
@@ -748,8 +738,7 @@ impl PopupApp {
         // Before the window takes focus, or it is already too late.
         self.target = crate::paste::capture_paste_target();
 
-        self.search.clear();
-        self.input.update(cx, |input, _| input.reset());
+        self.input.update(cx, |input, cx| input.reset(cx));
         // 上一次弹窗留下的菜单/确认框不能跟过来:那批 stem 是上一轮选的。
         self.confirm_delete = None;
         self.menu = None;
@@ -762,7 +751,7 @@ impl PopupApp {
         self.chips.kind = None;
         self.chips.time = TimeChip::All;
         self.refresh_tabs();
-        self.refill();
+        self.refill(cx);
 
         // 先在屏幕外亮出来,让 gpui 把内容画进表面(隐藏窗口收不到 WM_PAINT,
         // 画不了);首帧之后挪到位——直接亮在目标位置的话,窗口会先带着空表面
@@ -902,7 +891,9 @@ impl PopupApp {
 
     /// Refills from the index, bottom-up. Also runs per keystroke, exactly
     /// like `fill_list` in the legacy popup.
-    fn refill(&mut self) {
+    /// Refills from the index, bottom-up. Also runs per keystroke, exactly
+    /// like `fill_list` in the legacy popup.
+    fn refill(&mut self, cx: &mut Context<Self>) {
         let chip_filter = ChipFilter {
             in_app: self.chips.in_app,
             in_title: self.chips.in_title,
@@ -910,9 +901,11 @@ impl PopupApp {
             since_ms: self.chips.time.since_ms(crate::settings::now_ms()),
         };
         let machine = self.tab.clone();
+        // 搜索文本归 input 实体所有,这里现场读,不留镜像字段。
+        let search = self.input.read(cx).content.to_string();
         let mut items = self
             .store
-            .query(machine.as_deref(), &self.search, &chip_filter, MAX_RESULTS);
+            .query(machine.as_deref(), &search, &chip_filter, MAX_RESULTS);
         items.reverse();
 
         let newest = items.len().saturating_sub(1);
@@ -920,8 +913,10 @@ impl PopupApp {
         self.point_at(newest);
         // The view follows the newest row on every refill, the way the legacy
         // list's LB_SETTOPINDEX did after each keystroke. strict:已可见也要归位,
-        // 和 egui 版强制滚到内容底是同一件事。
-        self.pending_scroll = Some((newest, ScrollStrategy::Bottom, true));
+        // 和 egui 版强制滚到内容底是同一件事。gpui 的 scroll_to_item 是延迟到
+        // 下一次布局落地的,在这里直接叫即可,不必攒到渲染帧。
+        self.list_handle
+            .scroll_to_item_strict(newest, ScrollStrategy::Bottom);
     }
 
     /// Selection and caret both land on one row — the state after a plain
@@ -989,31 +984,31 @@ impl PopupApp {
 
     /// 方向键/翻页把 caret 挪出可见区时,把列表跟着挪过去。旧 listbox 的
     /// `LB_SETCURSEL` 自带"把光标带进视野";少了这一步 caret 会一路走出屏幕。
-    /// 下一帧落地,非 strict:已在视野里就一步都不动。
+    /// 非 strict:已在视野里就一步都不动。
     fn scroll_caret_into_view(&mut self) {
         if self.items.is_empty() {
             return;
         }
-        let (top, bottom) = {
-            let state = self.list_handle.0.borrow();
-            (state.base_handle.top_item(), state.base_handle.bottom_item())
-        };
+        let (top, bottom) = self.visible_item_range();
         if self.caret < top {
-            self.pending_scroll = Some((self.caret, ScrollStrategy::Top, false));
+            self.list_handle.scroll_to_item(self.caret, ScrollStrategy::Top);
         } else if self.caret > bottom {
-            self.pending_scroll = Some((self.caret, ScrollStrategy::Bottom, false));
+            self.list_handle
+                .scroll_to_item(self.caret, ScrollStrategy::Bottom);
         }
     }
 
-    /// 下一帧要落地的滚动请求,渲染时消费。
-    fn apply_pending_scroll(&mut self) {
-        if let Some((index, strategy, strict)) = self.pending_scroll.take() {
-            if strict {
-                self.list_handle.scroll_to_item_strict(index, strategy);
-            } else {
-                self.list_handle.scroll_to_item(index, strategy);
-            }
-        }
+    /// 当前可见的行范围(闭区间)。滚轮转发和翻页键都按它算。
+    fn visible_item_range(&self) -> (usize, usize) {
+        let state = self.list_handle.0.borrow();
+        (state.base_handle.top_item(), state.base_handle.bottom_item())
+    }
+
+    /// 翻页键一页跳几行:实际可见行数再留一行重叠,与旧弹窗的 page_rows
+    /// 同一约定——跳走的那页永远带着来的那行。
+    fn visible_page(&self) -> isize {
+        let (top, bottom) = self.visible_item_range();
+        (bottom.saturating_sub(top) as isize).max(1)
     }
 
     fn select_all(&mut self) {
@@ -1034,7 +1029,7 @@ impl PopupApp {
             .unwrap_or(0);
         let next = (current as isize + dir).rem_euclid(self.tabs.len() as isize) as usize;
         self.tab = self.tabs[next].id.clone();
-        self.refill();
+        self.refill(cx);
     }
 
     /// Starts reading `.bin` payloads on a worker thread. The result comes
@@ -1195,7 +1190,7 @@ impl PopupApp {
             return;
         }
 
-        self.refill();
+        self.refill(cx);
         if let Some(position) = self.items.iter().position(|item| item.stem == stem) {
             self.point_at(position);
         }
@@ -1235,10 +1230,11 @@ impl PopupApp {
 
         // 旧弹窗删完把光标留给顶替那一行的位置(而不是跳回最新),屏幕上
         // 不跳走:重灌后把光标夹回范围内,并把它滚回视野中间。
-        self.refill();
+        self.refill(cx);
         let index = caret.min(self.items.len().saturating_sub(1));
         self.point_at(index);
-        self.pending_scroll = Some((index, ScrollStrategy::Center, true));
+        self.list_handle
+            .scroll_to_item_strict(index, ScrollStrategy::Center);
         cx.notify();
     }
 
@@ -1294,13 +1290,11 @@ impl PopupApp {
     }
 
     fn on_page_up(&mut self, _: &PageUp, _window: &mut Window, _cx: &mut Context<Self>) {
-        let page = self.visible_rows.saturating_sub(1).max(1) as isize;
-        self.move_selection(-page, false);
+        self.move_selection(-self.visible_page(), false);
     }
 
     fn on_page_down(&mut self, _: &PageDown, _window: &mut Window, _cx: &mut Context<Self>) {
-        let page = self.visible_rows.saturating_sub(1).max(1) as isize;
-        self.move_selection(page, false);
+        self.move_selection(self.visible_page(), false);
     }
 
     fn on_delete(&mut self, _: &DeleteRecords, window: &mut Window, cx: &mut Context<Self>) {
@@ -1476,7 +1470,6 @@ impl PopupApp {
 
 impl Render for PopupApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.apply_pending_scroll();
         let confirming = self.confirm_delete.is_some();
         let overlay_open = self.menu.is_some() || self.dropdown.is_some() || confirming;
         let drag_cursor = self.drag.map(|drag| match drag {
@@ -1584,7 +1577,6 @@ impl PopupApp {
 
     fn render_rows(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.items.len();
-        let view = cx.entity();
         uniform_list(
             "history",
             count,
@@ -1593,9 +1585,8 @@ impl PopupApp {
                       range: Range<usize>,
                       window: &mut Window,
                       cx: &mut Context<Self>| {
-                    this.visible_rows = range.len();
                     range
-                        .map(|index| this.render_row(index, view.clone(), window, cx))
+                        .map(|index| this.render_row(index, window, cx))
                         .collect::<Vec<Div>>()
                 },
             ),
@@ -1617,13 +1608,7 @@ impl PopupApp {
             .child(div().w(px(8.0)).h(px(1.0)).bg(rgb(COLOR_META)))
     }
 
-    fn render_row(
-        &mut self,
-        index: usize,
-        view: Entity<Self>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Div {
+    fn render_row(&mut self, index: usize, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         // Clone out of the list so the mutable work below never overlaps the
         // borrow the widgets need.
         let Some(item) = self.items.get(index) else {
@@ -1657,35 +1642,26 @@ impl PopupApp {
                 rgb(COLOR_BG)
             })
             .hover(move |style| style.bg(hover_bg))
-            .on_mouse_down(MouseButton::Left, {
-                let view = view.clone();
-                move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
-                    // 普通点 = 单选,Shift = 从锚点扩选,Ctrl = 原地切换;
-                    // 按住拖动走同一套"按下"语义,然后从锚点连到指针那一行。
-                    view.update(cx, |this, cx| {
-                        log::info(&format!(
-                            "row {index} pressed (shift={}, ctrl={})",
-                            event.modifiers.shift, event.modifiers.control
-                        ));
-                        this.press_row(index, event.modifiers.shift, event.modifiers.control);
-                        this.drag_from = Some(index);
-                        window.focus(&this.root_focus);
-                        cx.stop_propagation();
-                        cx.notify();
-                    });
-                }
-            })
-            .on_mouse_up(MouseButton::Left, {
-                let view = view.clone();
-                move |_: &MouseUpEvent, _: &mut Window, cx: &mut App| {
-                    view.update(cx, |this, cx| {
-                        this.drag_from = None;
-                        cx.notify();
-                    });
-                }
-            })
-            .on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, _: &mut Window, cx: &mut App| {
-                view.update(cx, |this, cx| {
+            // 普通点 = 单选,Shift = 从锚点扩选,Ctrl = 原地切换;按住拖动走同一
+            // 套"按下"语义,然后从锚点连到指针那一行。松开时的清理由根级
+            // on_mouse_up 负责,行上不重复挂。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    log::info(&format!(
+                        "row {index} pressed (shift={}, ctrl={})",
+                        event.modifiers.shift, event.modifiers.control
+                    ));
+                    this.press_row(index, event.modifiers.shift, event.modifiers.control);
+                    this.drag_from = Some(index);
+                    window.focus(&this.root_focus);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
                     this.point_at_menu_row(index);
                     this.menu = Some(MenuState {
                         origin: event.position,
@@ -1693,8 +1669,8 @@ impl PopupApp {
                     });
                     cx.stop_propagation();
                     cx.notify();
-                });
-            });
+                }),
+            );
 
         // 图片行:左侧缩略图,有缓存画纹理,没有就画占位块并请求后台解码。
         if kind == ClipKind::Image {
@@ -1710,6 +1686,9 @@ impl PopupApp {
                         .object_fit(ObjectFit::ScaleDown),
                 );
             } else {
+                // 懒解码:请求只对"这一帧实际渲染到的行"发,pending 集合保证每
+                // 个 stem 只发一次,不发 notify——渲染期副作用到发送为止,不会
+                // 成环。结果经通道回 drain_thumb。
                 if !self.thumb_pending.contains(&stem) {
                     self.thumb_pending.insert(stem.clone());
                     let _ = self.thumb_tx.send(stem.clone());
@@ -1772,7 +1751,6 @@ impl PopupApp {
             ResizeDir::SouthWest,
             ResizeDir::SouthEast,
         ];
-        let view = cx.entity();
         div().children(dirs.map(|dir| {
             // 每条带的定位:边到边留出 CORNER 给角带,面带只用 RESIZE_GRIP 粗。
             let positioned = match dir {
@@ -1788,28 +1766,26 @@ impl PopupApp {
             positioned
                 .absolute()
                 .cursor(dir.cursor())
-                .on_mouse_down(MouseButton::Left, {
-                    let view = view.clone();
-                    move |event: &MouseDownEvent, _: &mut Window, cx: &mut App| {
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
                         // "窗口变大/变小"要靠这行定位:是不是这条路径拖的窗口。
-                        view.update(cx, |this, cx| {
-                            if let Some(rect) = win::window_rect(this.hwnd()) {
-                                let scale =
-                                    win::dpi_at(win::POINT { x: rect.left, y: rect.top }) as f64
-                                        / 96.0;
-                                log::info(&format!("resize grip engaged: {dir:?}"));
-                                this.drag = Some(DragState::Resize {
-                                    dir,
-                                    start_cursor: event.position,
-                                    start_rect: rect,
-                                    scale,
-                                });
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                        });
-                    }
-                })
+                        if let Some(rect) = win::window_rect(this.hwnd()) {
+                            let scale =
+                                win::dpi_at(win::POINT { x: rect.left, y: rect.top }) as f64
+                                    / 96.0;
+                            log::info(&format!("resize grip engaged: {dir:?}"));
+                            this.drag = Some(DragState::Resize {
+                                dir,
+                                start_cursor: event.position,
+                                start_rect: rect,
+                                scale,
+                            });
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }),
+                )
         }))
     }
 
@@ -1842,7 +1818,7 @@ impl PopupApp {
                     .hover(|style| style.bg(rgb(COLOR_HOVER)))
                     .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _: &mut Window, cx| {
                         this.tab = id.clone();
-                        this.refill();
+                        this.refill(cx);
                         cx.notify();
                     }))
                     .child(label)
@@ -1882,7 +1858,7 @@ impl PopupApp {
                     .hover(|style| style.bg(rgb(COLOR_HOVER)))
                     .on_click(cx.listener(|this, _: &gpui::ClickEvent, _: &mut Window, cx| {
                         this.chips.in_app = !this.chips.in_app;
-                        this.refill();
+                        this.refill(cx);
                         cx.notify();
                     }))
                     .child(format!("{} 应用", check_mark(chips.in_app))),
@@ -1899,7 +1875,7 @@ impl PopupApp {
                     .hover(|style| style.bg(rgb(COLOR_HOVER)))
                     .on_click(cx.listener(|this, _: &gpui::ClickEvent, _: &mut Window, cx| {
                         this.chips.in_title = !this.chips.in_title;
-                        this.refill();
+                        this.refill(cx);
                         cx.notify();
                     }))
                     .child(format!("{} 标题", check_mark(chips.in_title))),
@@ -1914,19 +1890,17 @@ impl PopupApp {
                     .text_color(rgb(if chips.kind.is_some() { COLOR_TEXT } else { COLOR_META }))
                     .bg(rgb(if chips.kind.is_some() { COLOR_HOVER } else { COLOR_BG }))
                     .hover(|style| style.bg(rgb(COLOR_HOVER)))
-                    .on_mouse_down(MouseButton::Left, {
-                        let view = cx.entity();
-                        move |event: &MouseDownEvent, _: &mut Window, cx: &mut App| {
-                            view.update(cx, |this, cx| {
-                                this.dropdown = Some(DropdownState {
-                                    kind: DropdownKind::Type,
-                                    origin: event.position,
-                                });
-                                cx.stop_propagation();
-                                cx.notify();
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                            this.dropdown = Some(DropdownState {
+                                kind: DropdownKind::Type,
+                                origin: event.position,
                             });
-                        }
-                    })
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
                     .child(kind_label),
             )
             .child(
@@ -1939,19 +1913,17 @@ impl PopupApp {
                     .text_color(rgb(if chips.time != TimeChip::All { COLOR_TEXT } else { COLOR_META }))
                     .bg(rgb(if chips.time != TimeChip::All { COLOR_HOVER } else { COLOR_BG }))
                     .hover(|style| style.bg(rgb(COLOR_HOVER)))
-                    .on_mouse_down(MouseButton::Left, {
-                        let view = cx.entity();
-                        move |event: &MouseDownEvent, _: &mut Window, cx: &mut App| {
-                            view.update(cx, |this, cx| {
-                                this.dropdown = Some(DropdownState {
-                                    kind: DropdownKind::Time,
-                                    origin: event.position,
-                                });
-                                cx.stop_propagation();
-                                cx.notify();
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                            this.dropdown = Some(DropdownState {
+                                kind: DropdownKind::Time,
+                                origin: event.position,
                             });
-                        }
-                    })
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
                     .child(time_label),
             )
             // 搜索框占满剩余宽度;它自己渲染文本和光标。
@@ -1988,10 +1960,10 @@ impl PopupApp {
     }
 
     fn menu_item(
+        cx: &mut Context<Self>,
         label: SharedString,
         enabled: bool,
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-        view: &Entity<Self>,
     ) -> impl IntoElement {
         let item = div()
             .id(SharedString::from(format!("menu-{label}")))
@@ -2003,14 +1975,11 @@ impl PopupApp {
             .when(enabled, |el| el.hover(|style| style.bg(rgb(COLOR_HOVER))))
             .child(label);
         if enabled {
-            let view = view.clone();
-            item.on_click(move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
-                view.update(cx, |this, cx| {
-                    this.menu = None;
-                    on_click(this, window, cx);
-                    cx.notify();
-                });
-            })
+            item.on_click(cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
+                this.menu = None;
+                on_click(this, window, cx);
+                cx.notify();
+            }))
         } else {
             item
         }
@@ -2023,7 +1992,6 @@ impl PopupApp {
             .unwrap_or(false);
         let pinned = item.map(|item| item.pinned).unwrap_or(false);
         let has_blob = item.map(|item| item.has_blob).unwrap_or(false);
-        let view = cx.entity();
 
         div()
             .absolute()
@@ -2038,25 +2006,26 @@ impl PopupApp {
             .flex()
             .flex_col()
             .child(Self::menu_item(
+                cx,
                 "粘贴（Enter）".into(),
                 true,
                 |this, _, cx| this.commit(cx),
-                &view,
             ))
             .child(Self::menu_item(
+                cx,
                 "复制（Ctrl+C）".into(),
                 true,
                 |this, _, cx| this.copy_selected(cx),
-                &view,
             ))
             .child(Self::menu_item(
                 // 与旧菜单同一条规则:只有文本、且归本机当月可写时才可编辑。
+                cx,
                 "编辑（Ctrl+E）".into(),
                 can_edit,
                 |this, _, _| this.edit_selected(),
-                &view,
             ))
             .child(Self::menu_item(
+                cx,
                 if pinned {
                     "取消固定（Ctrl+P）".into()
                 } else {
@@ -2064,7 +2033,6 @@ impl PopupApp {
                 },
                 true,
                 |this, _, _| this.toggle_pin(),
-                &view,
             ))
             .child(
                 div()
@@ -2082,7 +2050,6 @@ impl PopupApp {
                         window.focus(&this.root_focus);
                     }
                 },
-                &view,
             ))
             .child(
                 div()
@@ -2092,10 +2059,10 @@ impl PopupApp {
                     .bg(rgb(COLOR_BORDER)),
             )
             .child(Self::menu_item(
+                cx,
                 "全选（Ctrl+A）".into(),
                 true,
                 |this, _, _| this.select_all(),
-                &view,
             ))
             .when(has_blob, |el| {
                 el.child(
@@ -2110,7 +2077,6 @@ impl PopupApp {
     }
 
     fn render_dropdown(&self, dropdown: DropdownState, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity();
         let kind_label = dropdown.kind;
 
         let entries: Vec<(String, bool)> = match dropdown.kind {
@@ -2145,7 +2111,6 @@ impl PopupApp {
             .flex()
             .flex_col()
             .children(entries.into_iter().map(move |(label, active)| {
-                let view = view.clone();
                 div()
                     .id(SharedString::from(format!("dd-{kind_label:?}-{label}")))
                     .px(px(12.0))
@@ -2156,8 +2121,7 @@ impl PopupApp {
                     .hover(|style| style.bg(rgb(COLOR_HOVER)))
                     .on_click({
                         let label = label.clone();
-                        move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-                        view.update(cx, |this, cx| {
+                        cx.listener(move |this, _: &gpui::ClickEvent, _window, cx| {
                             match kind_label {
                                 DropdownKind::Type => {
                                     this.chips.kind = match label.as_str() {
@@ -2177,10 +2141,9 @@ impl PopupApp {
                                 }
                             }
                             this.dropdown = None;
-                            this.refill();
+                            this.refill(cx);
                             cx.notify();
-                        });
-                        }
+                        })
                     })
                     .child(label.clone())
             }))
@@ -2381,9 +2344,16 @@ fn target_geometry() -> (i32, i32, i32, i32, f64) {
 
 // ---------------------------------------------------------------- 搜索框
 
+/// 搜索框内容变了。光标/选择的挪动不发这个,只 notify。
+enum SearchInputEvent {
+    Changed,
+}
+
+impl EventEmitter<SearchInputEvent> for SearchInput {}
+
 /// 单行搜索框。gpui 本体不带文本输入控件,这是按 gpui 官方 input 示例裁出来
 /// 的最小实件:单行、占位文本、光标、选择、中文 IME(marked text)全走
-/// EntityInputHandler。文本变更走版本号,光标移动不算。
+/// EntityInputHandler。内容变化以事件通知订阅方,光标移动只 notify。
 struct SearchInput {
     focus_handle: FocusHandle,
     content: SharedString,
@@ -2394,7 +2364,6 @@ struct SearchInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
-    version: u64,
 }
 
 impl SearchInput {
@@ -2409,11 +2378,10 @@ impl SearchInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
-            version: 0,
         }
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self, cx: &mut Context<Self>) {
         self.content = "".into();
         self.selected_range = 0..0;
         self.selection_reversed = false;
@@ -2421,12 +2389,8 @@ impl SearchInput {
         self.last_layout = None;
         self.last_bounds = None;
         self.is_selecting = false;
-        self.bump_version();
-    }
-
-    /// 文本真变了才叫这个;光标/选择的挪动只 notify,不涨版本。
-    fn bump_version(&mut self) {
-        self.version += 1;
+        cx.emit(SearchInputEvent::Changed);
+        cx.notify();
     }
 
     fn cursor_offset(&self) -> usize {
@@ -2672,7 +2636,7 @@ impl EntityInputHandler for SearchInput {
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
-        self.bump_version();
+        cx.emit(SearchInputEvent::Changed);
         cx.notify();
     }
 
@@ -2704,7 +2668,7 @@ impl EntityInputHandler for SearchInput {
             .map(|new_range| new_range.start + range.start..new_range.end + range.end)
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
 
-        self.bump_version();
+        cx.emit(SearchInputEvent::Changed);
         cx.notify();
     }
 
@@ -2947,6 +2911,7 @@ impl Render for SearchInput {
             .on_action(cx.listener(Self::cut))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_input_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_input_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_input_up))
             .on_mouse_move(cx.listener(Self::on_input_move))
             .child(TextElement { input: cx.entity() })
     }
