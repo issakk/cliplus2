@@ -1585,12 +1585,21 @@ impl PopupApp {
     fn render_rows(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.items.len();
         let view = cx.entity();
-        uniform_list("history", count, cx.processor(move |this, range, window, cx| {
-            this.visible_rows = range.len();
-            range
-                .map(|index| this.render_row(index, view.clone(), window, cx))
-                .collect::<Vec<Div>>()
-        }))
+        uniform_list(
+            "history",
+            count,
+            cx.processor(
+                move |this: &mut Self,
+                      range: Range<usize>,
+                      window: &mut Window,
+                      cx: &mut Context<Self>| {
+                    this.visible_rows = range.len();
+                    range
+                        .map(|index| this.render_row(index, view.clone(), window, cx))
+                        .collect::<Vec<Div>>()
+                },
+            ),
+        )
         .track_scroll(self.list_handle.clone())
         .size_full()
     }

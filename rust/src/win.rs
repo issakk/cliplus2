@@ -1892,7 +1892,7 @@ pub fn gpui_window() -> HWND {
 /// TranslateMessage 在普通消息循环里所处的位置,所以直接在这里调用它,WM_CHAR
 /// 就会照常排队进编辑控件。只动键盘消息,别的不碰。
 extern "system" fn dialog_key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HC_ACTION && !lparam.is_null() {
+    if code == HC_ACTION && lparam != 0 {
         let msg = lparam as *const MSG;
         let message = unsafe { (*msg).message };
         if matches!(
