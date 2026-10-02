@@ -35,18 +35,20 @@ const WM_BINS_DONE: u32 = win::WM_APP + 2;
 const WM_DUPES_SCANNED: u32 = win::WM_APP + 3;
 const WM_DUPES_DONE: u32 = win::WM_APP + 4;
 
-const ID_GROUP_BINS: usize = 1;
-const ID_BINS_TIME: usize = 2;
-const ID_BINS_DAYS: usize = 3;
-const ID_BINS_COUNT: usize = 4;
-const ID_BINS_KEEP: usize = 5;
-const ID_BINS_NOTE: usize = 6;
-const ID_BINS_RUN: usize = 7;
-const ID_GROUP_DUPES: usize = 8;
-const ID_DUPES_NOTE: usize = 9;
-const ID_DUPES_RUN: usize = 10;
-const ID_STATUS: usize = 11;
-const ID_CLOSE: usize = 12;
+const ID_BINS_TITLE: usize = 1;
+const ID_SEP1: usize = 2;
+const ID_BINS_TIME: usize = 3;
+const ID_BINS_DAYS: usize = 4;
+const ID_BINS_COUNT: usize = 5;
+const ID_BINS_KEEP: usize = 6;
+const ID_BINS_NOTE: usize = 7;
+const ID_BINS_RUN: usize = 8;
+const ID_DUPES_TITLE: usize = 9;
+const ID_SEP2: usize = 10;
+const ID_DUPES_NOTE: usize = 11;
+const ID_DUPES_RUN: usize = 12;
+const ID_STATUS: usize = 13;
+const ID_CLOSE: usize = 14;
 /// The two labels beside the numeric fields, one per row.
 const SUFFIX_ID_BASE: usize = 100;
 
@@ -56,50 +58,56 @@ const SUFFIX_ID_BASE: usize = 100;
 const DEFAULT_DAYS: u32 = 30;
 const DEFAULT_KEEP: u32 = 100;
 
-/// No `WS_CLIPCHILDREN`, unlike the settings window: the group boxes are
-/// BUTTON-class controls that draw only their frame and caption, and never
-/// fill their own interior. With clipping on, the parent's background pass
-/// skips their rectangles too, so the inside of every group would stay
-/// whatever the surface was initialised to — the white blocks. Without it the
-/// parent's `COLOR_BTNFACE` erase shows through, exactly like a dialog.
-const WINDOW_STYLE: u32 = win::WS_CAPTION | win::WS_SYSMENU;
+/// `WS_CLIPCHILDREN` like the settings window: every child paints its own
+/// rectangle — statics erase with the brush their CTLCOLOR answer hands them —
+/// so the parent's background pass can skip the child rects without anything
+/// staying unpainted. (It used to be off because the old group boxes never
+/// filled their interiors; the sections below are statics, and those do.)
+const WINDOW_STYLE: u32 = win::WS_CAPTION | win::WS_SYSMENU | win::WS_CLIPCHILDREN;
 
 const MARGIN: i32 = 16;
 const CONTENT_WIDTH: i32 = 560;
-/// Inset of the controls inside their group box, on every side that matters.
-const GROUP_PAD: i32 = 14;
 const ROW_HEIGHT: i32 = 24;
 const BUTTON_WIDTH: i32 = 120;
 const BUTTON_HEIGHT: i32 = 26;
 const RADIO_WIDTH: i32 = 84;
 const FIELD_WIDTH: i32 = 64;
-/// Room for three lines of the note (and the gap before the button is the
-/// same thought as everywhere below: written as offsets, not as absolutes).
+/// Room for three lines of the bins note; the dupes note wraps to two, and
+/// the status grows to three while a run reports. The gaps ahead of the
+/// buttons and the next header are written as offsets below, not absolutes.
 const NOTE1_HEIGHT: i32 = 54;
-const NOTE2_HEIGHT: i32 = 40;
-const STATUS_HEIGHT: i32 = 68;
+const NOTE2_HEIGHT: i32 = 36;
+const STATUS_HEIGHT: i32 = 54;
+/// Between the two option rows, and ahead of the note under them.
+const ROW_STEP: i32 = 30;
+
+/// A section is a bold header over a hairline; its content starts a fixed
+/// step below the line. No group boxes: their etched frame drew straight
+/// through the caption under the dark palette, and a light heading plus a
+/// one-pixel line groups the same content with less noise.
+const HEADER_HEIGHT: i32 = 22;
+const HEADER_TO_SEP: i32 = 26;
+const SEP_TO_CONTENT: i32 = 14;
 
 const CLIENT_WIDTH: i32 = MARGIN * 2 + CONTENT_WIDTH;
-const INNER_X: i32 = MARGIN + GROUP_PAD;
-const NOTE_WIDTH: i32 = CONTENT_WIDTH - GROUP_PAD * 2;
-const EDIT_X: i32 = INNER_X + RADIO_WIDTH + 8;
+const EDIT_X: i32 = MARGIN + RADIO_WIDTH + 8;
 const SUFFIX_X: i32 = EDIT_X + FIELD_WIDTH + 8;
-const SUFFIX_WIDTH: i32 = MARGIN + CONTENT_WIDTH - SUFFIX_X - GROUP_PAD;
+const SUFFIX_WIDTH: i32 = MARGIN + CONTENT_WIDTH - SUFFIX_X;
 
-const G1_TOP: i32 = MARGIN;
-const R1_Y: i32 = G1_TOP + 30;
-const R2_Y: i32 = R1_Y + 32;
-const NOTE1_Y: i32 = R2_Y + 34;
-const BTN1_Y: i32 = NOTE1_Y + NOTE1_HEIGHT + 8;
-const G1_BOTTOM: i32 = BTN1_Y + BUTTON_HEIGHT + 10;
+const H1_TOP: i32 = MARGIN;
+const SEP1_Y: i32 = H1_TOP + HEADER_TO_SEP;
+const R1_Y: i32 = SEP1_Y + SEP_TO_CONTENT;
+const R2_Y: i32 = R1_Y + ROW_STEP;
+const NOTE1_Y: i32 = R2_Y + ROW_STEP + 2;
+const BTN1_Y: i32 = NOTE1_Y + NOTE1_HEIGHT + 10;
 
-const G2_TOP: i32 = G1_BOTTOM + 10;
-const NOTE2_Y: i32 = G2_TOP + 26;
-const BTN2_Y: i32 = NOTE2_Y + NOTE2_HEIGHT + 8;
-const G2_BOTTOM: i32 = BTN2_Y + BUTTON_HEIGHT + 10;
+const H2_TOP: i32 = BTN1_Y + BUTTON_HEIGHT + 16;
+const SEP2_Y: i32 = H2_TOP + HEADER_TO_SEP;
+const NOTE2_Y: i32 = SEP2_Y + SEP_TO_CONTENT;
+const BTN2_Y: i32 = NOTE2_Y + NOTE2_HEIGHT + 10;
 
-const STATUS_TOP: i32 = G2_BOTTOM + 12;
-const BUTTON_TOP: i32 = STATUS_TOP + STATUS_HEIGHT + 12;
+const STATUS_Y: i32 = BTN2_Y + BUTTON_HEIGHT + 16;
+const BUTTON_TOP: i32 = STATUS_Y + STATUS_HEIGHT + 14;
 const CLIENT_HEIGHT: i32 = BUTTON_TOP + BUTTON_HEIGHT + MARGIN;
 
 /// The frame this window is created with; the outside size is computed from it
@@ -161,20 +169,30 @@ pub fn create() -> bool {
 
     let field_style = win::WS_CHILD | win::WS_VISIBLE | win::WS_BORDER | win::WS_TABSTOP;
     let label_style = win::WS_CHILD | win::WS_VISIBLE;
-    let group_style = win::WS_CHILD | win::WS_VISIBLE | win::BS_GROUPBOX;
     let radio_style = win::WS_CHILD | win::WS_VISIBLE | win::WS_TABSTOP | win::BS_AUTORADIOBUTTON;
     let button_style = win::WS_CHILD | win::WS_VISIBLE | win::WS_TABSTOP | win::BS_PUSHBUTTON;
 
     win::create_child_id(
-        "BUTTON",
+        "STATIC",
         "清理 .bin 大条目（图片、超长文本）",
-        group_style,
+        label_style,
         hwnd,
-        ID_GROUP_BINS,
+        ID_BINS_TITLE,
         MARGIN,
-        G1_TOP,
+        H1_TOP,
         CONTENT_WIDTH,
-        G1_BOTTOM - G1_TOP,
+        HEADER_HEIGHT,
+    );
+    win::create_child_id(
+        "STATIC",
+        "",
+        label_style,
+        hwnd,
+        ID_SEP1,
+        MARGIN,
+        SEP1_Y,
+        CONTENT_WIDTH,
+        1,
     );
 
     // The two radios are created together so `WS_GROUP` makes them one arrow-key
@@ -185,7 +203,7 @@ pub fn create() -> bool {
         radio_style | win::WS_GROUP,
         hwnd,
         ID_BINS_TIME,
-        INNER_X,
+        MARGIN,
         R1_Y,
         RADIO_WIDTH,
         ROW_HEIGHT,
@@ -196,7 +214,7 @@ pub fn create() -> bool {
         radio_style,
         hwnd,
         ID_BINS_COUNT,
-        INNER_X,
+        MARGIN,
         R2_Y,
         RADIO_WIDTH,
         ROW_HEIGHT,
@@ -253,9 +271,9 @@ pub fn create() -> bool {
         label_style,
         hwnd,
         ID_BINS_NOTE,
-        INNER_X,
+        MARGIN,
         NOTE1_Y,
-        NOTE_WIDTH,
+        CONTENT_WIDTH,
         NOTE1_HEIGHT,
     );
 
@@ -265,22 +283,33 @@ pub fn create() -> bool {
         button_style,
         hwnd,
         ID_BINS_RUN,
-        INNER_X,
+        MARGIN,
         BTN1_Y,
         BUTTON_WIDTH,
         BUTTON_HEIGHT,
     );
 
     win::create_child_id(
-        "BUTTON",
+        "STATIC",
         "清理重复文本",
-        group_style,
+        label_style,
         hwnd,
-        ID_GROUP_DUPES,
+        ID_DUPES_TITLE,
         MARGIN,
-        G2_TOP,
+        H2_TOP,
         CONTENT_WIDTH,
-        G2_BOTTOM - G2_TOP,
+        HEADER_HEIGHT,
+    );
+    win::create_child_id(
+        "STATIC",
+        "",
+        label_style,
+        hwnd,
+        ID_SEP2,
+        MARGIN,
+        SEP2_Y,
+        CONTENT_WIDTH,
+        1,
     );
 
     win::create_child_id(
@@ -289,9 +318,9 @@ pub fn create() -> bool {
         label_style,
         hwnd,
         ID_DUPES_NOTE,
-        INNER_X,
+        MARGIN,
         NOTE2_Y,
-        NOTE_WIDTH,
+        CONTENT_WIDTH,
         NOTE2_HEIGHT,
     );
 
@@ -301,7 +330,7 @@ pub fn create() -> bool {
         button_style,
         hwnd,
         ID_DUPES_RUN,
-        INNER_X,
+        MARGIN,
         BTN2_Y,
         BUTTON_WIDTH,
         BUTTON_HEIGHT,
@@ -314,18 +343,20 @@ pub fn create() -> bool {
         hwnd,
         ID_STATUS,
         MARGIN,
-        STATUS_TOP,
+        STATUS_Y,
         CONTENT_WIDTH,
         STATUS_HEIGHT,
     );
 
+    // Bottom-right, the commit-button corner; the status line it reports into
+    // sits directly above.
     win::create_child_id(
         "BUTTON",
         "关闭",
         button_style,
         hwnd,
         ID_CLOSE,
-        MARGIN,
+        MARGIN + CONTENT_WIDTH - BUTTON_WIDTH,
         BUTTON_TOP,
         BUTTON_WIDTH,
         BUTTON_HEIGHT,
@@ -387,23 +418,25 @@ fn is_checked(id: usize) -> bool {
 fn layout(hwnd: HWND, scale: f64) {
     let margin = win::scaled(MARGIN, scale);
     let content_width = win::scaled(CONTENT_WIDTH, scale);
-    let group_pad = win::scaled(GROUP_PAD, scale);
-    let inner_x = margin + group_pad;
-    let note_width = content_width - group_pad * 2;
+    let row_height = win::scaled(ROW_HEIGHT, scale);
+    let header_height = win::scaled(HEADER_HEIGHT, scale);
     let radio_width = win::scaled(RADIO_WIDTH, scale);
     let field_width = win::scaled(FIELD_WIDTH, scale);
-    let edit_x = inner_x + radio_width + win::scaled(8, scale);
+    let edit_x = margin + radio_width + win::scaled(8, scale);
     let suffix_x = edit_x + field_width + win::scaled(8, scale);
-    let suffix_width = margin + content_width - suffix_x - group_pad;
-    let row_height = win::scaled(ROW_HEIGHT, scale);
+    let suffix_width = margin + content_width - suffix_x;
     let note1_height = win::scaled(NOTE1_HEIGHT, scale);
     let note2_height = win::scaled(NOTE2_HEIGHT, scale);
     let status_height = win::scaled(STATUS_HEIGHT, scale);
     let button_width = win::scaled(BUTTON_WIDTH, scale);
     let button_height = win::scaled(BUTTON_HEIGHT, scale);
     let font = win::ui_font_for_scale(scale);
+    let header_font = win::ui_font_bold_for_scale(scale);
 
-    let place = |id: usize, x: i32, y: i32, width: i32, height: i32| {
+    // SWP_NOZORDER: a layout pass moves controls, it does not restack them —
+    // the radio group's exclusion walk runs in Z order, and bringing controls
+    // to the top one by one would reorder it under the group's feet.
+    let place = |id: usize, font: win::HFONT, x: i32, y: i32, width: i32, height: i32| {
         let control = win::child_by_id(hwnd, id);
         if control == 0 {
             return;
@@ -411,108 +444,104 @@ fn layout(hwnd: HWND, scale: f64) {
 
         unsafe {
             win::SendMessageW(control, win::WM_SETFONT, font as usize, 1);
-            win::SetWindowPos(control, 0, x, y, width, height, win::SWP_NOACTIVATE);
+            win::SetWindowPos(
+                control,
+                0,
+                x,
+                y,
+                width,
+                height,
+                win::SWP_NOACTIVATE | win::SWP_NOZORDER,
+            );
         }
     };
-    let scaled_y = |value: i32| win::scaled(value, scale);
+    let y = |value: i32| win::scaled(value, scale);
 
     place(
-        ID_GROUP_BINS,
+        ID_BINS_TITLE,
+        header_font,
         margin,
-        scaled_y(G1_TOP),
+        y(H1_TOP),
         content_width,
-        scaled_y(G1_BOTTOM - G1_TOP),
+        header_height,
     );
-    place(
-        ID_BINS_TIME,
-        inner_x,
-        scaled_y(R1_Y),
-        radio_width,
-        row_height,
-    );
-    place(
-        ID_BINS_COUNT,
-        inner_x,
-        scaled_y(R2_Y),
-        radio_width,
-        row_height,
-    );
-    place(
-        ID_BINS_DAYS,
-        edit_x,
-        scaled_y(R1_Y),
-        field_width,
-        row_height,
-    );
-    place(
-        ID_BINS_KEEP,
-        edit_x,
-        scaled_y(R2_Y),
-        field_width,
-        row_height,
-    );
+    place(ID_SEP1, font, margin, y(SEP1_Y), content_width, y(1));
+    place(ID_BINS_TIME, font, margin, y(R1_Y), radio_width, row_height);
+    place(ID_BINS_COUNT, font, margin, y(R2_Y), radio_width, row_height);
+    place(ID_BINS_DAYS, font, edit_x, y(R1_Y), field_width, row_height);
+    place(ID_BINS_KEEP, font, edit_x, y(R2_Y), field_width, row_height);
     place(
         SUFFIX_ID_BASE,
+        font,
         suffix_x,
-        scaled_y(R1_Y),
+        y(R1_Y),
         suffix_width,
         row_height,
     );
     place(
         SUFFIX_ID_BASE + 1,
+        font,
         suffix_x,
-        scaled_y(R2_Y),
+        y(R2_Y),
         suffix_width,
         row_height,
     );
     place(
         ID_BINS_NOTE,
-        inner_x,
-        scaled_y(NOTE1_Y),
-        note_width,
+        font,
+        margin,
+        y(NOTE1_Y),
+        content_width,
         note1_height,
     );
     place(
         ID_BINS_RUN,
-        inner_x,
-        scaled_y(BTN1_Y),
+        font,
+        margin,
+        y(BTN1_Y),
         button_width,
         button_height,
     );
 
     place(
-        ID_GROUP_DUPES,
+        ID_DUPES_TITLE,
+        header_font,
         margin,
-        scaled_y(G2_TOP),
+        y(H2_TOP),
         content_width,
-        scaled_y(G2_BOTTOM - G2_TOP),
+        header_height,
     );
+    place(ID_SEP2, font, margin, y(SEP2_Y), content_width, y(1));
     place(
         ID_DUPES_NOTE,
-        inner_x,
-        scaled_y(NOTE2_Y),
-        note_width,
+        font,
+        margin,
+        y(NOTE2_Y),
+        content_width,
         note2_height,
     );
     place(
         ID_DUPES_RUN,
-        inner_x,
-        scaled_y(BTN2_Y),
+        font,
+        margin,
+        y(BTN2_Y),
         button_width,
         button_height,
     );
 
     place(
         ID_STATUS,
+        font,
         margin,
-        scaled_y(STATUS_TOP),
+        y(STATUS_Y),
         content_width,
         status_height,
     );
     place(
         ID_CLOSE,
-        margin,
-        scaled_y(BUTTON_TOP),
+        font,
+        margin + content_width - button_width,
+        y(BUTTON_TOP),
         button_width,
         button_height,
     );
@@ -850,6 +879,18 @@ extern "system" fn window_proc(
 
             if notification == win::BN_CLICKED || notification == 0 {
                 match id as usize {
+                    // BS_AUTORADIOBUTTON is supposed to exclude its group on
+                    // its own, but that walk runs in Z order and does not stay
+                    // between the two radios — both could end up checked. Two
+                    // ids, done here where it is deterministic.
+                    ID_BINS_TIME => {
+                        set_checked(ID_BINS_TIME, true);
+                        set_checked(ID_BINS_COUNT, false);
+                    }
+                    ID_BINS_COUNT => {
+                        set_checked(ID_BINS_COUNT, true);
+                        set_checked(ID_BINS_TIME, false);
+                    }
                     ID_BINS_RUN => start_bins(),
                     ID_DUPES_RUN => start_dupes(),
                     ID_CLOSE => hide(),
@@ -934,14 +975,26 @@ extern "system" fn window_proc(
             0
         }
 
-        // Dark palette, shared with settings_window and the popup.
+        // Dark palette, shared with settings_window and the popup. The statics
+        // answer per control: the separators draw as the one-pixel line brush,
+        // the notes and the status line as secondary text.
         win::WM_CTLCOLOREDIT | win::WM_CTLCOLORLISTBOX => {
             win::set_dialog_text(wparam as win::HDC);
             win::dialog_input_brush() as win::LRESULT
         }
         win::WM_CTLCOLORSTATIC => {
-            win::set_dialog_text(wparam as win::HDC);
-            win::dialog_brush() as win::LRESULT
+            let control = lparam as win::HWND;
+            match win::dialog_ctrl_id(control) {
+                ID_SEP1 | ID_SEP2 => win::dialog_line_brush() as win::LRESULT,
+                _ => {
+                    win::dialog_static_text(
+                        wparam as win::HDC,
+                        control,
+                        &[ID_BINS_NOTE, ID_DUPES_NOTE, ID_STATUS],
+                    );
+                    win::dialog_brush() as win::LRESULT
+                }
+            }
         }
 
         _ => win::def_window_proc(hwnd, message, wparam, lparam),

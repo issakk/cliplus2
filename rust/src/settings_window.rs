@@ -27,7 +27,10 @@ const CLIENT_WIDTH: i32 = MARGIN + LABEL_WIDTH + FIELD_GAP + FIELD_WIDTH + MARGI
 const CLIENT_HEIGHT: i32 = BUTTON_TOP + BUTTON_HEIGHT + MARGIN;
 
 const MARGIN: i32 = 16;
-const LABEL_WIDTH: i32 = 220;
+/// The longest caption is twelve full-width characters; a little slack over
+/// that, and no more — every unused point here is dead air between the labels
+/// and the fields they name.
+const LABEL_WIDTH: i32 = 200;
 const FIELD_WIDTH: i32 = 360;
 const ROW_HEIGHT: i32 = 26;
 const ROW_STEP: i32 = 38;
@@ -223,13 +226,15 @@ pub fn create() -> bool {
     );
 
     let button_y = BUTTON_TOP;
+    // The commit pair right-aligned where dialogs keep it, the tool that opens
+    // another window off to the left where it cannot be mistaken for one.
     win::create_child_id(
         "BUTTON",
         "保存",
         button_style | win::BS_DEFPUSHBUTTON,
         hwnd,
         ID_SAVE,
-        MARGIN,
+        CLIENT_WIDTH - MARGIN - BUTTON_WIDTH * 2 - BUTTON_GAP,
         button_y,
         BUTTON_WIDTH,
         BUTTON_HEIGHT,
@@ -240,7 +245,7 @@ pub fn create() -> bool {
         button_style,
         hwnd,
         ID_CANCEL,
-        MARGIN + BUTTON_WIDTH + BUTTON_GAP,
+        CLIENT_WIDTH - MARGIN - BUTTON_WIDTH,
         button_y,
         BUTTON_WIDTH,
         BUTTON_HEIGHT,
@@ -251,7 +256,7 @@ pub fn create() -> bool {
         button_style,
         hwnd,
         ID_CLEANUP,
-        MARGIN + (BUTTON_WIDTH + BUTTON_GAP) * 2,
+        MARGIN,
         button_y,
         BUTTON_WIDTH,
         BUTTON_HEIGHT,
@@ -303,6 +308,7 @@ fn layout(hwnd: HWND, scale: f64) {
     let field_x = margin + label_width + win::scaled(FIELD_GAP, scale);
     let font = win::ui_font_for_scale(scale);
 
+    // SWP_NOZORDER: a layout pass moves controls, it does not restack them.
     let place = |id: usize, x: i32, y: i32, width: i32, height: i32| {
         let control = win::child_by_id(hwnd, id);
         if control == 0 {
@@ -318,7 +324,7 @@ fn layout(hwnd: HWND, scale: f64) {
                 y,
                 width,
                 height,
-                win::SWP_NOACTIVATE,
+                win::SWP_NOACTIVATE | win::SWP_NOZORDER,
             );
         }
     };
@@ -359,22 +365,23 @@ fn layout(hwnd: HWND, scale: f64) {
     let button_y = win::scaled(BUTTON_TOP, scale);
     let button_width = win::scaled(BUTTON_WIDTH, scale);
     let button_height = win::scaled(BUTTON_HEIGHT, scale);
+    let client_width = win::scaled(CLIENT_WIDTH, scale);
 
-    place(ID_SAVE, margin, button_y, button_width, button_height);
+    place(
+        ID_SAVE,
+        client_width - margin - button_width * 2 - win::scaled(BUTTON_GAP, scale),
+        button_y,
+        button_width,
+        button_height,
+    );
     place(
         ID_CANCEL,
-        margin + button_width + win::scaled(BUTTON_GAP, scale),
+        client_width - margin - button_width,
         button_y,
         button_width,
         button_height,
     );
-    place(
-        ID_CLEANUP,
-        margin + (button_width + win::scaled(BUTTON_GAP, scale)) * 2,
-        button_y,
-        button_width,
-        button_height,
-    );
+    place(ID_CLEANUP, margin, button_y, button_width, button_height);
 }
 
 /// Thread-safe "open the settings window": posts to the window so `show` runs
@@ -774,7 +781,9 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             win::dialog_input_brush() as win::LRESULT
         }
         win::WM_CTLCOLORSTATIC => {
-            win::set_dialog_text(wparam as win::HDC);
+            // The note under the rows is secondary text; the row captions and
+            // the checkbox labels are not.
+            win::dialog_static_text(wparam as win::HDC, lparam as win::HWND, &[NOTE_ID]);
             win::dialog_brush() as win::LRESULT
         }
 

@@ -452,7 +452,8 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             win::dialog_input_brush() as win::LRESULT
         }
         win::WM_CTLCOLORSTATIC => {
-            win::set_dialog_text(wparam as win::HDC);
+            // The key hint beside the buttons is secondary text.
+            win::dialog_static_text(wparam as win::HDC, lparam as win::HWND, &[ID_HINT]);
             win::dialog_brush() as win::LRESULT
         }
 

@@ -216,6 +216,7 @@ pub const VK_RWIN: i32 = 0x5C;
 
 // CreateFontW arguments.
 pub const FW_NORMAL: i32 = 400;
+pub const FW_BOLD: i32 = 700;
 pub const CHARSET_DEFAULT: u32 = 1;
 pub const QUALITY_CLEARTYPE: u32 = 5;
 
@@ -555,6 +556,7 @@ extern "system" {
     ) -> HICON;
     pub fn AdjustWindowRectEx(lpRect: *mut RECT, dwStyle: u32, bMenu: i32, dwExStyle: u32) -> i32;
     pub fn GetDlgItem(hDlg: HWND, nIDDlgItem: i32) -> HWND;
+    pub fn GetDlgCtrlID(hWnd: HWND) -> i32;
 }
 
 // ---------------------------------------------------------------- kernel32.dll
@@ -1312,16 +1314,32 @@ pub const UI_FONT_HEIGHT: i32 = 16;
 /// character-height convention `CreateFontW` wants; callers that need another
 /// size (the popup's rows are 16 px) make their own.
 pub fn ui_font(pixel_height: i32) -> HFONT {
-    // One font per height, kept for the life of the process: every control asks
-    // for its font when it is created, and the same height comes back after a
-    // DPI change.
-    static FONTS: OnceLock<Mutex<HashMap<i32, HFONT>>> = OnceLock::new();
+    cached_font(pixel_height, FW_NORMAL)
+}
+
+/// The bold half of `ui_font`, for the section headers of the redesigned
+/// cleanup window. Same face and height, heavier stroke.
+pub fn ui_font_bold(pixel_height: i32) -> HFONT {
+    cached_font(pixel_height, FW_BOLD)
+}
+
+/// The bold variant of `ui_font_for_scale`.
+pub fn ui_font_bold_for_scale(scale: f64) -> HFONT {
+    ui_font_bold(scaled(UI_FONT_HEIGHT, scale))
+}
+
+fn cached_font(pixel_height: i32, weight: i32) -> HFONT {
+    // One font per height and weight, kept for the life of the process: every
+    // control asks for its font when it is created, and the same height comes
+    // back after a DPI change.
+    static FONTS: OnceLock<Mutex<HashMap<(i32, i32), HFONT>>> = OnceLock::new();
     let fonts = FONTS.get_or_init(|| Mutex::new(HashMap::new()));
 
+    let key = (pixel_height, weight);
     if let Some(font) = fonts
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .get(&pixel_height)
+        .get(&key)
     {
         return *font;
     }
@@ -1334,7 +1352,7 @@ pub fn ui_font(pixel_height: i32) -> HFONT {
             0,
             0,
             0,
-            FW_NORMAL,
+            weight,
             0,
             0,
             0,
@@ -1350,7 +1368,7 @@ pub fn ui_font(pixel_height: i32) -> HFONT {
     fonts
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(pixel_height, font);
+        .insert(key, font);
 
     font
 }
@@ -1783,6 +1801,12 @@ fn uxtheme_export(ordinal: usize) -> Option<*mut c_void> {
 pub const DIALOG_BG: u32 = 0x001E_1E1E;
 pub const DIALOG_INPUT_BG: u32 = 0x002A_2A2A;
 pub const DIALOG_TEXT: u32 = 0x00E6_E6E6;
+/// Secondary text — notes, status lines, the editor's key hint — a mid grey
+/// that still reads on the dark background but steps back from the labels.
+pub const DIALOG_TEXT_DIM: u32 = 0x009E_9E9E;
+/// The hairline under a section header; a step above the background, well
+/// below the text.
+pub const DIALOG_LINE: u32 = 0x003A_3A3A;
 
 /// Shared background brushes, created once. `WM_CTLCOLOR*` handlers return
 /// these, so they must outlive every message.
@@ -1796,6 +1820,21 @@ pub fn dialog_input_brush() -> HBRUSH {
     *BRUSH.get_or_init(|| unsafe { CreateSolidBrush(DIALOG_INPUT_BG) })
 }
 
+/// A one-pixel static painted with this brush becomes the separator line
+/// under a section header. The static erases itself with the brush its
+/// parent answers `WM_CTLCOLORSTATIC` with, so no drawing code is needed.
+pub fn dialog_line_brush() -> HBRUSH {
+    static BRUSH: OnceLock<HBRUSH> = OnceLock::new();
+    *BRUSH.get_or_init(|| unsafe { CreateSolidBrush(DIALOG_LINE) })
+}
+
+/// The id a child control carries, for the CTLCOLOR answers that differ by
+/// control rather than by class. A control without an id answers 0, which no
+/// caller lists.
+pub fn dialog_ctrl_id(control: HWND) -> usize {
+    unsafe { GetDlgCtrlID(control).max(0) as usize }
+}
+
 /// Light text on a transparent background — the half the CTLCOLOR answer does
 /// before returning the brush.
 pub fn set_dialog_text(dc: HDC) {
@@ -1803,6 +1842,18 @@ pub fn set_dialog_text(dc: HDC) {
     unsafe {
         SetTextColor(dc, DIALOG_TEXT);
         SetBkMode(dc, TRANSPARENT);
+    }
+}
+
+/// The static-text answer with secondary ids in the dim shade: every control
+/// sends `WM_CTLCOLORSTATIC` with its own handle in lParam, so the caller just
+/// names which ids are secondary and this picks the colour.
+pub fn dialog_static_text(dc: HDC, control: HWND, dim_ids: &[usize]) {
+    set_dialog_text(dc);
+    if dim_ids.contains(&dialog_ctrl_id(control)) {
+        unsafe {
+            SetTextColor(dc, DIALOG_TEXT_DIM);
+        }
     }
 }
 
