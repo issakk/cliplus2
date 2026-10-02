@@ -1,10 +1,9 @@
 #![windows_subsystem = "windows"]
 
 mod autostart;
-mod cleanup_window;
 mod clip;
 mod clipboard;
-mod edit_window;
+mod dialogs;
 mod egui_app;
 mod index;
 mod log;
@@ -12,7 +11,6 @@ mod paste;
 mod platform;
 mod tray;
 mod settings;
-mod settings_window;
 mod store;
 mod thumb;
 mod win;
@@ -84,23 +82,10 @@ fn main() {
     let _watcher = store.start_watcher();
 
     // Dark-mode hack for the tray menu, which is still a Win32 `TrackPopupMenu`;
-    // the egui popup paints its own dark theme and needs none of it. A window
+    // the egui windows paint their own dark theme and need none of it. A window
     // keeps the theme it was made with, so this has to come before any window.
     win::allow_dark_mode();
     win::set_per_monitor_dpi_aware();
-
-    // The three secondary windows stay Win32 on purpose: plain system-control
-    // dialogs, living on this same thread and pumped by winit's shared message
-    // loop once the egui loop starts. DPI awareness is set above so they scale.
-    if !settings_window::create() {
-        log::error("settings window could not be created; the tray entry will do nothing");
-    }
-    if !cleanup_window::create() {
-        log::error("cleanup window could not be created; the settings 清理 button will do nothing");
-    }
-    if !edit_window::create() {
-        log::error("edit window could not be created; the row menu 编辑 entry will do nothing");
-    }
 
     egui_app::run(store);
     log::info("=== ClipPlus stopping ===");
@@ -120,8 +105,7 @@ pub fn store() -> Option<std::sync::Arc<store::Store>> {
 
 pub fn set_settings(updated: settings::Settings) {
     // Every settings change arrives here — at startup and again on each save —
-    // which makes this the one place the settings-window scale is applied from.
-    win::set_settings_scale(updated.settings_scale);
+    // which makes this the one place that publishes the live snapshot.
     *SETTINGS.write().unwrap_or_else(|p| p.into_inner()) = Some(updated);
 }
 

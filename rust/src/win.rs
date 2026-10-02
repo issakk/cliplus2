@@ -12,9 +12,7 @@
 
 #![allow(dead_code, non_snake_case)]
 
-use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // --------------------------------------------------------------------- aliases
@@ -25,9 +23,6 @@ pub type HMENU = isize;
 pub type HICON = isize;
 pub type HCURSOR = isize;
 pub type HBRUSH = isize;
-pub type HDC = isize;
-pub type HFONT = isize;
-pub type HGDIOBJ = isize;
 pub type HGLOBAL = isize;
 pub type HANDLE = isize;
 pub type HKEY = isize;
@@ -38,15 +33,12 @@ pub type LRESULT = isize;
 pub type PCWSTR = *const u16;
 
 pub type WNDPROC = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
-pub type SUBCLASSPROC =
-    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT;
 
 // ------------------------------------------------------------------- constants
 
 pub const WM_DESTROY: u32 = 0x0002;
 pub const WM_CLIPBOARDUPDATE: u32 = 0x031D;
 pub const WM_HOTKEY: u32 = 0x0312;
-pub const WM_DPICHANGED: u32 = 0x02E0;
 
 pub const MOD_ALT: u32 = 0x0001;
 pub const MOD_CONTROL: u32 = 0x0002;
@@ -57,44 +49,7 @@ pub const MOD_NOREPEAT: u32 = 0x4000;
 pub const WS_POPUP: u32 = 0x8000_0000;
 pub const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 
-/// The popup is resizable while showing no frame: this style keeps the resize
-/// edges real, and the frame it brings is taken back off in `WM_NCCALCSIZE`.
-pub const WS_THICKFRAME: u32 = 0x0004_0000;
-
-// --- settings window ---
-pub const WS_CAPTION: u32 = 0x00C0_0000;
-pub const WS_SYSMENU: u32 = 0x0008_0000;
-pub const WS_MINIMIZEBOX: u32 = 0x0002_0000;
-pub const WS_CLIPCHILDREN: u32 = 0x0200_0000;
-
-pub const BS_PUSHBUTTON: u32 = 0x0000_0000;
-pub const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
-pub const BS_AUTOCHECKBOX: u32 = 0x0000_0003;
-/// Auto radio button; a pair of them headed by `WS_GROUP` toggles as one group.
-pub const BS_AUTORADIOBUTTON: u32 = 0x0000_0009;
-/// Marks the first control of a radio group, so the arrow keys cycle the pair
-/// instead of walking into unrelated tab stops.
-pub const WS_GROUP: u32 = 0x0002_0000;
-/// A group box is a BUTTON that draws only its frame and caption.
-pub const BS_GROUPBOX: u32 = 0x0000_0007;
-pub const ES_NUMBER: u32 = 0x2000;
-
-pub const WM_CLOSE: u32 = 0x0010;
 pub const WM_QUIT: u32 = 0x0012;
-
-/// Passed as `hbrBackground`. When the value is in 1..=COLOR_ENDCOLORS the
-/// low byte names a system colour and the system supplies a stock brush, so
-/// the dialog face needs no CreateSolidBrush. COLOR_BTNFACE is 15.
-pub const COLOR_BTNFACE_BRUSH: HBRUSH = 16;
-pub const WS_BORDER: u32 = 0x0080_0000;
-pub const WS_TABSTOP: u32 = 0x0001_0000;
-
-pub const BM_SETCHECK: u32 = 0x00F1;
-pub const BM_GETCHECK: u32 = 0x00F0;
-
-/// The only button notification we care about, and it is zero, which is why
-/// the settings window also accepts a bare zero notification code.
-pub const BN_CLICKED: u32 = 0;
 
 pub const INPUT_KEYBOARD: u32 = 1;
 pub const KEYEVENTF_KEYUP: u32 = 0x0002;
@@ -157,77 +112,21 @@ pub const ERROR_SUCCESS: i32 = 0;
 /// GlobalAlloc flag: the block can move, which is what the clipboard requires.
 pub const GMEM_MOVEABLE: u32 = 0x0002;
 
-// --- popup window and its child controls ---
-pub const WS_CHILD: u32 = 0x4000_0000;
-pub const WS_VISIBLE: u32 = 0x1000_0000;
-pub const WS_VSCROLL: u32 = 0x0020_0000;
-pub const ES_AUTOHSCROLL: u32 = 0x0080;
-/// Multi-line edit: the editor window's text box. Without `ES_AUTOVSCROLL` the
-/// box scrolls the caret out of view instead of following it past the last line.
-pub const ES_MULTILINE: u32 = 0x0004;
-pub const ES_AUTOVSCROLL: u32 = 0x0040;
-
-/// The one style a `STATIC` needs to report its clicks instead of swallowing them.
-pub const LB_SETTOPINDEX: u32 = 0x0197;
-
-pub const WM_ACTIVATE: u32 = 0x0006;
-pub const WM_DRAWITEM: u32 = 0x002B;
-pub const WM_ERASEBKGND: u32 = 0x0014;
-pub const WM_KEYDOWN: u32 = 0x0100;
-pub const WM_COMMAND: u32 = 0x0111;
-/// The three CTLCOLOR messages: the parent gets to hand each control its text
-/// colour and background brush while it draws. The dark dialogs answer them.
-pub const WM_CTLCOLOREDIT: u32 = 0x0133;
-pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
-pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
-pub const WM_LBUTTONDOWN: u32 = 0x0201;
-pub const WM_SIZE: u32 = 0x0005;
-pub const WM_GETMINMAXINFO: u32 = 0x0024;
-pub const WM_NCCALCSIZE: u32 = 0x0083;
-
 /// Hit-test code for "the title bar": the popup hands it to `DefWindowProc` so
 /// Windows runs the window move itself. Not a control id, it just happens to be 2.
 /// What `begin_drag_move` sends, because the button came down on the window's own
 /// background rather than on a child control.
 
-pub const WM_SETFONT: u32 = 0x0030;
-pub const WM_CHAR: u32 = 0x0102;
-pub const WM_SYSKEYDOWN: u32 = 0x0104;
-pub const WM_SYSCHAR: u32 = 0x0106;
-
-pub const EN_SETFOCUS: u32 = 0x0100;
-pub const EN_KILLFOCUS: u32 = 0x0200;
-
-pub const SW_SHOW: i32 = 5;
-pub const SW_HIDE: i32 = 0;
-pub const SWP_NOACTIVATE: u32 = 0x0010;
-pub const SWP_NOZORDER: u32 = 0x0004;
-pub const SWP_SHOWWINDOW: u32 = 0x0040;
-
-pub const VK_RETURN: i32 = 0x0D;
-pub const VK_ESCAPE: i32 = 0x1B;
 pub const VK_SHIFT: i32 = 0x10;
 pub const VK_MENU: i32 = 0x12;
 pub const VK_LWIN: i32 = 0x5B;
 pub const VK_RWIN: i32 = 0x5C;
 
-
-
-
-// CreateFontW arguments.
-pub const FW_NORMAL: i32 = 400;
-pub const FW_BOLD: i32 = 700;
-pub const CHARSET_DEFAULT: u32 = 1;
-pub const QUALITY_CLEARTYPE: u32 = 5;
-
-pub const MB_ICONINFORMATION: u32 = 0x0000_0040;
 pub const MB_OK: u32 = 0x0000_0000;
 pub const MB_ICONERROR: u32 = 0x0000_0010;
 pub const MB_ICONWARNING: u32 = 0x0000_0030;
 pub const MB_SETFOREGROUND: u32 = 0x0001_0000;
 pub const MB_TOPMOST: u32 = 0x0004_0000;
-pub const MB_YESNO: u32 = 0x0000_0004;
-pub const IDYES: i32 = 6;
 
 // --------------------------------------------------------------------- structs
 
@@ -245,31 +144,6 @@ pub struct RECT {
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
-}
-
-/// What `WM_GETMINMAXINFO` hands over. The popup fills in the minimum tracking
-/// size and leaves the rest: Windows' own values are right for a window with no
-/// maximum worth enforcing.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct MINMAXINFO {
-    pub pt_reserved: POINT,
-    pub pt_max_size: POINT,
-    pub pt_max_position: POINT,
-    pub pt_min_track_size: POINT,
-    pub pt_max_track_size: POINT,
-}
-
-/// Only ever filled in by `BeginPaint`, never read field by field here.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PAINTSTRUCT {
-    pub hdc: HDC,
-    pub erase: i32,
-    pub paint_rect: RECT,
-    pub restore: i32,
-    pub inc_update: i32,
-    pub reserved: [u8; 32],
 }
 
 #[repr(C)]
@@ -378,21 +252,6 @@ pub struct INPUT {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub struct BITMAPINFOHEADER {
-    pub bi_size: u32,
-    pub bi_width: i32,
-    pub bi_height: i32,
-    pub bi_planes: u16,
-    pub bi_bit_count: u16,
-    pub bi_compression: u32,
-    pub bi_size_image: u32,
-    pub bi_x_pels_per_meter: i32,
-    pub bi_y_pels_per_meter: i32,
-    pub bi_clr_used: u32,
-    pub bi_clr_important: u32,
-}
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
 pub struct FILETIME {
     pub dw_low_date_time: u32,
     pub dw_high_date_time: u32,
@@ -455,14 +314,10 @@ extern "system" {
     ) -> HWND;
     fn DefWindowProcW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
     fn GetMessageW(lpMsg: *mut MSG, hWnd: HWND, wMsgFilterMin: u32, wMsgFilterMax: u32) -> i32;
-    fn EnumChildWindows(hWndParent: HWND, lpEnumFunc: Option<unsafe extern "system" fn(HWND, LPARAM) -> i32>, lParam: LPARAM) -> i32;
-    fn TranslateMessage(lpMsg: *const MSG) -> i32;
-    fn DispatchMessageW(lpMsg: *const MSG) -> i32;
     fn PostQuitMessage(nExitCode: i32);
     fn PostMessageW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> i32;
     fn PostThreadMessageW(idThread: u32, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> i32;
     fn DestroyWindow(hWnd: HWND) -> i32;
-    pub fn ShowWindow(hWnd: HWND, nCmdShow: i32) -> i32;
 
     fn RegisterHotKey(hWnd: HWND, id: i32, fsModifiers: u32, vk: u32) -> i32;
     fn UnregisterHotKey(hWnd: HWND, id: i32) -> i32;
@@ -475,14 +330,11 @@ extern "system" {
     pub fn IsClipboardFormatAvailable(format: u32) -> i32;
     pub fn GetClipboardData(uFormat: u32) -> HANDLE;
     pub fn SetClipboardData(uFormat: u32, hMem: HANDLE) -> HANDLE;
-    pub fn RegisterClipboardFormatW(lpszFormat: PCWSTR) -> u32;
-    pub fn EnumClipboardFormats(format: u32) -> u32;
     pub fn EmptyClipboard() -> i32;
 
     pub fn GetForegroundWindow() -> HWND;
     pub fn GetWindowTextW(hWnd: HWND, lpString: *mut u16, nMaxCount: i32) -> i32;
     pub fn GetWindowTextLengthW(hWnd: HWND) -> i32;
-    pub fn SetWindowTextW(hWnd: HWND, lpString: PCWSTR) -> i32;
     fn SetForegroundWindow(hWnd: HWND) -> i32;
     fn GetCursorPos(lpPoint: *mut POINT) -> i32;
     fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *mut u32) -> u32;
@@ -504,30 +356,10 @@ extern "system" {
     fn MessageBoxW(hWnd: HWND, lpText: PCWSTR, lpCaption: PCWSTR, uType: u32) -> i32;
 
     // --- popup support ---
-    pub fn SendMessageW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
-    pub fn EnableWindow(hWnd: HWND, bEnable: i32) -> i32;
-    pub fn ReleaseCapture() -> i32;
-    pub fn SetFocus(hWnd: HWND) -> HWND;
     pub fn GetKeyState(nVirtKey: i32) -> i16;
     pub fn GetAsyncKeyState(nVirtKey: i32) -> i16;
-    pub fn IsWindowVisible(hWnd: HWND) -> i32;
-    pub fn SetWindowPos(
-        hWnd: HWND,
-        hWndInsertAfter: HWND,
-        X: i32,
-        Y: i32,
-        cx: i32,
-        cy: i32,
-        uFlags: u32,
-    ) -> i32;
-    pub fn GetClientRect(hWnd: HWND, lpRect: *mut RECT) -> i32;
-    pub fn GetWindowRect(hWnd: HWND, lpRect: *mut RECT) -> i32;
     fn ScreenToClient(hWnd: HWND, lpPoint: *mut POINT) -> i32;
     fn ClientToScreen(hWnd: HWND, lpPoint: *mut POINT) -> i32;
-    pub fn InvalidateRect(hWnd: HWND, lpRect: *const RECT, bErase: i32) -> i32;
-    pub fn BeginPaint(hWnd: HWND, lpPaint: *mut PAINTSTRUCT) -> HDC;
-    pub fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) -> i32;
-    pub fn GetDpiForWindow(hwnd: HWND) -> u32;
 
     // --- tray icon and its menu ---
     pub fn CreatePopupMenu() -> HMENU;
@@ -554,9 +386,7 @@ extern "system" {
         cyDesired: i32,
         flags: u32,
     ) -> HICON;
-    pub fn AdjustWindowRectEx(lpRect: *mut RECT, dwStyle: u32, bMenu: i32, dwExStyle: u32) -> i32;
-    pub fn GetDlgItem(hDlg: HWND, nIDDlgItem: i32) -> HWND;
-    pub fn GetDlgCtrlID(hWnd: HWND) -> i32;
+    pub fn FindWindowW(lpClassName: PCWSTR, lpWindowName: PCWSTR) -> HWND;
 }
 
 // ---------------------------------------------------------------- kernel32.dll
@@ -640,66 +470,6 @@ extern "system" {
         nShowCmd: i32,
     ) -> HINSTANCE;
     pub fn DragQueryFileW(hDrop: HANDLE, iFile: u32, lpszFile: *mut u16, cch: u32) -> u32;
-}
-
-// ------------------------------------------------------------------- gdi32.dll
-
-#[link(name = "gdi32")]
-extern "system" {
-    pub fn CreateFontW(
-        cHeight: i32,
-        cWidth: i32,
-        cEscapement: i32,
-        cOrientation: i32,
-        cWeight: i32,
-        bItalic: u32,
-        bUnderline: u32,
-        bStrikeOut: u32,
-        iCharSet: u32,
-        iOutPrecision: u32,
-        iClipPrecision: u32,
-        iQuality: u32,
-        iPitchAndFamily: u32,
-        pszFaceName: PCWSTR,
-    ) -> HFONT;
-    pub fn CreateSolidBrush(color: u32) -> HBRUSH;
-    pub fn DeleteObject(ho: HGDIOBJ) -> i32;
-    pub fn SelectObject(hdc: HDC, h: HGDIOBJ) -> HGDIOBJ;
-    pub fn SetTextColor(hdc: HDC, color: u32) -> u32;
-    pub fn SetBkColor(hdc: HDC, color: u32) -> u32;
-    pub fn SetBkMode(hdc: HDC, mode: i32) -> i32;
-    pub fn DrawTextW(hdc: HDC, lpchText: PCWSTR, cchText: i32, lprc: *mut RECT, format: u32) -> i32;
-    pub fn FillRect(hdc: HDC, lprc: *const RECT, hbr: HBRUSH) -> i32;
-    pub fn FrameRect(hdc: HDC, lprc: *const RECT, hbr: HBRUSH) -> i32;
-}
-
-// ---------------------------------------------------------------- comctl32.dll
-
-#[link(name = "comctl32")]
-extern "system" {
-    pub fn SetWindowSubclass(
-        hWnd: HWND,
-        pfnSubclass: SUBCLASSPROC,
-        uIdSubclass: usize,
-        dwRefData: usize,
-    ) -> i32;
-    pub fn DefSubclassProc(hWnd: HWND, uMsg: u32, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
-}
-
-/// What the listbox hands us on `WM_DRAWITEM`. x64 layout:
-/// 5 UINTs (20) + 4 pad + HWND(8) + HDC(8) + RECT(16) + ULONG_PTR(8) = 64.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct DRAWITEMSTRUCT {
-    pub ctl_type: u32,
-    pub ctl_id: u32,
-    pub item_id: u32,
-    pub item_action: u32,
-    pub item_state: u32,
-    pub hwnd_item: HWND,
-    pub hdc: HDC,
-    pub rc_item: RECT,
-    pub item_data: usize,
 }
 
 // ---------------------------------------------------------------- advapi32.dll
@@ -936,11 +706,6 @@ pub fn current_thread_id() -> u32 {
 
 /// Greys a control in and out. The previous state is rarely interesting; the
 /// callers re-enable unconditionally when their operation finishes.
-pub fn enable_window(hwnd: HWND, enabled: bool) {
-    unsafe {
-        EnableWindow(hwnd, i32::from(enabled));
-    }
-}
 
 // ------------------------------------------------------------------ app icon
 
@@ -1045,6 +810,55 @@ fn large_icon_size() -> u32 {
     unsafe { GetSystemMetrics(SM_CXICON) as u32 }
 }
 
+/// The window icon for the egui dialogs, as RGBA straight out of the embedded
+/// .ico. The file's large entries are PNG-compressed, and the PNG decoder this
+/// crate already ships reads one of those directly — no HICON, no GDI, no
+/// DIB wrangling for what is just a handful of title-bar pixels.
+pub fn window_icon_rgba() -> Option<(usize, usize, Vec<u8>)> {
+    const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+    if APP_ICON.len() < 6 || u16::from_le_bytes([APP_ICON[2], APP_ICON[3]]) != 1 {
+        return None;
+    }
+
+    let count = u16::from_le_bytes([APP_ICON[4], APP_ICON[5]]) as usize;
+    let mut best: Option<(usize, usize)> = None; // (bytes, offset)
+
+    for index in 0..count {
+        let base = 6 + index * 16;
+        if APP_ICON.len() < base + 16 {
+            break;
+        }
+
+        let bytes = u32::from_le_bytes([
+            APP_ICON[base + 8],
+            APP_ICON[base + 9],
+            APP_ICON[base + 10],
+            APP_ICON[base + 11],
+        ]) as usize;
+        let offset = u32::from_le_bytes([
+            APP_ICON[base + 12],
+            APP_ICON[base + 13],
+            APP_ICON[base + 14],
+            APP_ICON[base + 15],
+        ]) as usize;
+
+        if offset + bytes > APP_ICON.len() {
+            continue;
+        }
+        if !APP_ICON[offset..offset + 8].starts_with(&PNG_SIGNATURE) {
+            continue;
+        }
+        if best.map(|(seen, _)| bytes > seen).unwrap_or(true) {
+            best = Some((bytes, offset));
+        }
+    }
+
+    let (bytes, offset) = best?;
+    let (width, height, rgba) = crate::thumb::decode_png_rgba(&APP_ICON[offset..offset + bytes])?;
+    Some((width, height, rgba))
+}
+
 
 /// Titles are a title bar, not a document, and this one ends up in a row and in a
 /// search: cut to something both can hold.
@@ -1108,8 +922,7 @@ fn process_name_of(hwnd: HWND) -> String {
     }
 }
 
-/// Current text of a control. Shared so the popup and the settings window do
-/// not each carry their own copy of the two-call dance.
+/// Current text of a control. The paste target's caption comes through here.
 pub fn window_text(hwnd: HWND) -> String {
     unsafe {
         let length = GetWindowTextLengthW(hwnd);
@@ -1128,16 +941,9 @@ pub fn window_text(hwnd: HWND) -> String {
     }
 }
 
-/// A child control by its id. Works for any window, not just dialogs.
-pub fn child_by_id(parent: HWND, id: usize) -> HWND {
-    unsafe { GetDlgItem(parent, id as i32) }
-}
-
 /// A daemon has no window to fail in front of, so a fatal startup problem would
 /// otherwise be completely invisible to whoever just double-clicked the exe.
-///
-/// The button the user pressed comes back, which is what lets the same box ask a
-/// question rather than only report: `MB_YESNO` with `IDYES` is the asking half.
+
 pub fn message_box(title: &str, text: &str, flags: u32) -> i32 {
     let title = wide(title);
     let text = wide(text);
@@ -1232,203 +1038,19 @@ fn create_window_wide(
     }
 }
 
-/// Creates a child control from one of the Win32 system classes ("EDIT",
-/// "LISTBOX", "STATIC", ...), which need no registration of ours.
-pub fn create_child(
-    class_name: &str,
-    title: &str,
-    style: u32,
-    parent: HWND,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-) -> HWND {
-    create_child_id(class_name, title, style, parent, 0, x, y, width, height)
-}
-
-/// Same as `create_child`, but with a control id. The id travels in the
-/// `hMenu` slot, which is how Windows reports button presses back through
-/// `WM_COMMAND` — without one there is no way to tell the controls apart.
-pub fn create_child_id(
-    class_name: &str,
-    title: &str,
-    style: u32,
-    parent: HWND,
-    id: usize,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-) -> HWND {
-    let class_wide = wide(class_name);
-    let title_wide = wide(title);
-
-    let child = unsafe {
-        let instance = GetModuleHandleW(std::ptr::null());
-        CreateWindowExW(
-            0,
-            class_wide.as_ptr(),
-            title_wide.as_ptr(),
-            style,
-            x,
-            y,
-            width,
-            height,
-            parent,
-            id as HMENU,
-            instance,
-            std::ptr::null(),
-        )
-    };
-
-    // Windows hands a new control the stock system font, and this app draws in
-    // one face at a size that follows the monitor, so it is set here rather than
-    // at each of the dozen call sites.
-    unsafe {
-        let font = ui_font_for_scale(dpi_scale_of(parent));
-        SendMessageW(child, WM_SETFONT, font as usize, 1);
-    }
-
-    child
-}
-
 pub fn destroy_window(hwnd: HWND) {
     unsafe {
         DestroyWindow(hwnd);
     }
 }
 
-/// The one face the whole app draws in. Microsoft YaHei UI ships with every
-/// supported Windows and covers the CJK the interface is written in.
-pub const UI_FACE: &str = "Microsoft YaHei UI";
 
-/// The height the settings window's controls draw at, in logical pixels at 96 DPI:
-/// 16 px, which is what the popup's own rows use. It used to be 12 px — Windows'
-/// stock 9 pt, the size every other window draws at — and that is the size that
-/// reads as too small on a 1080p display at 100% scaling, where 12 px is all the
-/// font ever gets.
-pub const UI_FONT_HEIGHT: i32 = 16;
-
-/// A font in the app's face. The height is in pixels and negative, the
-/// character-height convention `CreateFontW` wants; callers that need another
-/// size (the popup's rows are 16 px) make their own.
-pub fn ui_font(pixel_height: i32) -> HFONT {
-    cached_font(pixel_height, FW_NORMAL)
-}
-
-/// The bold half of `ui_font`, for the section headers of the redesigned
-/// cleanup window. Same face and height, heavier stroke.
-pub fn ui_font_bold(pixel_height: i32) -> HFONT {
-    cached_font(pixel_height, FW_BOLD)
-}
-
-/// The bold variant of `ui_font_for_scale`.
-pub fn ui_font_bold_for_scale(scale: f64) -> HFONT {
-    ui_font_bold(scaled(UI_FONT_HEIGHT, scale))
-}
-
-fn cached_font(pixel_height: i32, weight: i32) -> HFONT {
-    // One font per height and weight, kept for the life of the process: every
-    // control asks for its font when it is created, and the same height comes
-    // back after a DPI change.
-    static FONTS: OnceLock<Mutex<HashMap<(i32, i32), HFONT>>> = OnceLock::new();
-    let fonts = FONTS.get_or_init(|| Mutex::new(HashMap::new()));
-
-    let key = (pixel_height, weight);
-    if let Some(font) = fonts
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(&key)
-    {
-        return *font;
-    }
-
-    let face = wide(UI_FACE);
-
-    let font = unsafe {
-        CreateFontW(
-            pixel_height,
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            CHARSET_DEFAULT,
-            0,
-            0,
-            QUALITY_CLEARTYPE,
-            0,
-            face.as_ptr(),
-        )
-    };
-
-    fonts
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(key, font);
-
-    font
-}
-
-/// The default control font for a monitor scale. Windows would hand a control the
-/// stock system font at one fixed pixel height; following the display instead is
-/// what keeps text readable on a 4K screen.
-pub fn ui_font_for_scale(scale: f64) -> HFONT {
-    ui_font(scaled(UI_FONT_HEIGHT, scale))
-}
-
-/// The scale factor of the monitor a window is on (1.0 = 96 DPI).
-pub fn dpi_scale_of(hwnd: HWND) -> f64 {
-    if hwnd == 0 {
-        return 1.0;
-    }
-
-    let dpi = unsafe { GetDpiForWindow(hwnd) };
-    if dpi == 0 {
-        1.0
-    } else {
-        dpi as f64 / 96.0
-    }
-}
 
 /// Logical pixels to physical. Sizes in this crate are written at 96 DPI and
-/// multiplied by the monitor's scale before they are used.
-///
-/// Deliberately *only* the monitor's scale: the popup is a fixed-density list and
-/// must not move when the user's own scale does. The settings window applies that on
-/// top of this, in `settings_window::window_scale`.
+/// multiplied by the monitor's scale before they are used: the popup's
+/// remembered layout is in these units and its park position divides them out.
 pub fn scaled(value: i32, scale: f64) -> i32 {
     (value as f64 * scale).round() as i32
-}
-
-/// The user's own multiplier for the settings window, in percent, on top of the
-/// display's scale. That window was laid out at the size Windows draws its own
-/// controls (12 px text), which reads as too small on a 1080p screen at 100%
-/// scaling, and this is the knob for it.
-///
-/// Deliberately not folded into `scaled`: the popup is a fixed-density list, and
-/// the two windows should not be forced to move together.
-static SETTINGS_SCALE: AtomicIsize = AtomicIsize::new(DEFAULT_SETTINGS_SCALE as isize);
-
-/// The range the settings window offers. Below it the interface stops being
-/// readable; above it the window no longer fits on a 1080p screen.
-pub const MIN_SETTINGS_SCALE: u32 = 50;
-pub const MAX_SETTINGS_SCALE: u32 = 300;
-pub const DEFAULT_SETTINGS_SCALE: u32 = 125;
-
-/// Sets the user scale, clamped. A change takes effect at the next layout: the
-/// settings window recomputes its own when it is saved and reopened.
-pub fn set_settings_scale(percent: u32) {
-    let clamped = percent.clamp(MIN_SETTINGS_SCALE, MAX_SETTINGS_SCALE);
-    SETTINGS_SCALE.store(clamped as isize, Ordering::SeqCst);
-}
-
-/// The factor above, as a multiplier.
-pub fn settings_scale_factor() -> f64 {
-    SETTINGS_SCALE.load(Ordering::SeqCst) as f64 / 100.0
 }
 
 pub fn register_hotkey(hwnd: HWND, id: i32, modifiers: u32, vk: u32) -> bool {
@@ -1464,16 +1086,6 @@ pub fn cursor_position() -> POINT {
 }
 
 
-/// The client area's size. For the popup that is the window's size too — it
-/// answers `WM_NCCALCSIZE` with 0 — and it is the box the rows live in.
-pub fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
-    let mut rect = RECT::default();
-    if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
-        return None;
-    }
-
-    Some((rect.right - rect.left, rect.bottom - rect.top))
-}
 
 
 
@@ -1742,13 +1354,6 @@ fn key_stroke(vk: u16, up: bool) -> INPUT {
 // down a dark popup, which is what it had before.
 
 /// The dark theme class the scrollbar lives in, on Windows 10 1809 and later.
-const DARK_THEME: &str = "DarkMode_Explorer";
-
-/// uxtheme exports these two by number only, and the numbers have been stable since
-/// 1809. `AllowDarkModeForWindow` is the per-window half — a control keeps the
-/// light theme until it is told otherwise — and `SetPreferredAppMode` is the
-/// process-wide one, which is also what colours the context menus.
-const ORD_ALLOW_DARK_MODE_FOR_WINDOW: usize = 133;
 const ORD_SET_PREFERRED_APP_MODE: usize = 135;
 
 /// `LoadLibraryExW` flag: resolve against the system directory only, so a stray
@@ -1794,98 +1399,24 @@ fn uxtheme_export(ordinal: usize) -> Option<*mut c_void> {
     }
 }
 
-// ---------------------------------------------------------------- dark dialogs
 
-/// The settings/cleanup/edit dialogs share the popup's palette. Everything is a
-/// grey, so the COLORREF byte order (`0x00BBGGRR`) never shows.
-pub const DIALOG_BG: u32 = 0x001E_1E1E;
-pub const DIALOG_INPUT_BG: u32 = 0x002A_2A2A;
-pub const DIALOG_TEXT: u32 = 0x00E6_E6E6;
-/// Secondary text — notes, status lines, the editor's key hint — a mid grey
-/// that still reads on the dark background but steps back from the labels.
-pub const DIALOG_TEXT_DIM: u32 = 0x009E_9E9E;
-/// The hairline under a section header; a step above the background, well
-/// below the text.
-pub const DIALOG_LINE: u32 = 0x003A_3A3A;
 
-/// Shared background brushes, created once. `WM_CTLCOLOR*` handlers return
-/// these, so they must outlive every message.
-pub fn dialog_brush() -> HBRUSH {
-    static BRUSH: OnceLock<HBRUSH> = OnceLock::new();
-    *BRUSH.get_or_init(|| unsafe { CreateSolidBrush(DIALOG_BG) })
-}
-
-pub fn dialog_input_brush() -> HBRUSH {
-    static BRUSH: OnceLock<HBRUSH> = OnceLock::new();
-    *BRUSH.get_or_init(|| unsafe { CreateSolidBrush(DIALOG_INPUT_BG) })
-}
-
-/// A one-pixel static painted with this brush becomes the separator line
-/// under a section header. The static erases itself with the brush its
-/// parent answers `WM_CTLCOLORSTATIC` with, so no drawing code is needed.
-pub fn dialog_line_brush() -> HBRUSH {
-    static BRUSH: OnceLock<HBRUSH> = OnceLock::new();
-    *BRUSH.get_or_init(|| unsafe { CreateSolidBrush(DIALOG_LINE) })
-}
-
-/// The id a child control carries, for the CTLCOLOR answers that differ by
-/// control rather than by class. A control without an id answers 0, which no
-/// caller lists.
-pub fn dialog_ctrl_id(control: HWND) -> usize {
-    unsafe { GetDlgCtrlID(control).max(0) as usize }
-}
-
-/// Light text on a transparent background — the half the CTLCOLOR answer does
-/// before returning the brush.
-pub fn set_dialog_text(dc: HDC) {
-    const TRANSPARENT: i32 = 1;
-    unsafe {
-        SetTextColor(dc, DIALOG_TEXT);
-        SetBkMode(dc, TRANSPARENT);
-    }
-}
-
-/// The static-text answer with secondary ids in the dim shade: every control
-/// sends `WM_CTLCOLORSTATIC` with its own handle in lParam, so the caller just
-/// names which ids are secondary and this picks the colour.
-pub fn dialog_static_text(dc: HDC, control: HWND, dim_ids: &[usize]) {
-    set_dialog_text(dc);
-    if dim_ids.contains(&dialog_ctrl_id(control)) {
-        unsafe {
-            SetTextColor(dc, DIALOG_TEXT_DIM);
-        }
-    }
-}
-
-/// The per-window dark switch, restored from the legacy popup: a control keeps
-/// the light theme until told otherwise, and the explorer theme class is what
-/// darkens checkboxes, radios and combo dropdowns that draw themselves.
-pub fn dark_theme(hwnd: HWND) {
-    if let Some(entry) = uxtheme_export(ORD_ALLOW_DARK_MODE_FOR_WINDOW) {
-        // Declared as taking a bool; passing the integer is the same call on x64.
-        let allow: unsafe extern "system" fn(HWND, i32) -> i32 =
-            unsafe { std::mem::transmute(entry) };
-        unsafe {
-            allow(hwnd, 1);
-        }
+/// Dark title bar for an egui viewport window. eframe/winit pick the title-bar
+/// theme from the system, so a light-mode Windows would put a light bar over
+/// our dark face; the egui side never sees an HWND, so the window is found by
+/// title — the three dialog titles are unique to this process.
+///
+/// Returns false when the window does not exist (yet); callers retry on the
+/// next frame until it answers.
+pub fn dark_title_bar_titled(title: &str) -> bool {
+    let wide = wide(title);
+    let hwnd = unsafe { FindWindowW(std::ptr::null(), wide.as_ptr()) };
+    if hwnd == 0 {
+        return false;
     }
 
-    let theme = wide(DARK_THEME);
-    unsafe {
-        SetWindowTheme(hwnd, theme.as_ptr(), std::ptr::null());
-    }
-}
-
-/// Every child control of `parent`, in one call. The dialogs have a dozen
-/// controls each and every one of them needs the dark switch.
-pub fn dark_theme_children(parent: HWND) {
-    extern "system" fn on_child(hwnd: HWND, _lparam: LPARAM) -> i32 {
-        dark_theme(hwnd);
-        1 // TRUE: keep walking
-    }
-    unsafe {
-        EnumChildWindows(parent, Some(on_child), 0);
-    }
+    dark_title_bar(hwnd);
+    true
 }
 
 /// Dark title bar. Windows 10 1903 and later understand attribute 20; older

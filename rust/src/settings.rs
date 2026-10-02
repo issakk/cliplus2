@@ -76,12 +76,6 @@ pub struct Settings {
     #[serde(rename = "RescanSeconds")]
     pub rescan_seconds: u64,
 
-    /// Percent: the user's own multiplier for the settings window's controls, on
-    /// top of the display's DPI. The popup is a fixed-density list and deliberately
-    /// does not follow this.
-    #[serde(rename = "SettingsScale")]
-    pub settings_scale: u32,
-
     /// Where the popup was last left, in screen coordinates. `None` until it is
     /// dragged somewhere: the first open has nothing to go on and centres itself
     /// on whichever monitor the cursor is on. Written by the popup, not by the
@@ -136,7 +130,6 @@ impl Default for Settings {
             max_blob_bytes: 10 * 1024 * 1024,
             inline_text_limit: 8192,
             rescan_seconds: 60,
-            settings_scale: win::DEFAULT_SETTINGS_SCALE,
             popup_position: None,
             popup_size: None,
             capture_text: true,
@@ -173,11 +166,6 @@ impl Settings {
         settings.machine_id = load_machine_id(&settings.app_dir);
         settings.sync_root =
             resolve_sync_root(&settings.app_dir, settings.sync_root_override.as_deref());
-        // Hand-edited values are brought back into range here, so nothing
-        // downstream has to wonder what a scale of 0 or 9000 would do.
-        settings.settings_scale = settings
-            .settings_scale
-            .clamp(win::MIN_SETTINGS_SCALE, win::MAX_SETTINGS_SCALE);
 
         // Rewritten every start so a first run leaves an editable file behind.
         if let Err(err) = settings.save() {

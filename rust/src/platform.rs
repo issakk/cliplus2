@@ -34,6 +34,8 @@ pub enum PlatformEvent {
     Hotkey,
     /// 托盘左键:切换弹窗。
     TrayToggle,
+    /// 托盘菜单的「设置…」:打开设置对话框。
+    TraySettings,
     /// 托盘菜单的退出项:各 UI 收尾自己的部分,再回到这里结束进程。
     Quit,
 }

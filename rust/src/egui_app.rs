@@ -54,12 +54,13 @@ const THUMB_PX: usize = 96;
 /// 缓存条数:160 张 96px 纹理约 6 MB 显存,足够覆盖一屏可见行的来回滚动。
 const THUMB_CACHE_CAP: usize = 160;
 
-const COLOR_BG: egui::Color32 = egui::Color32::from_rgb(0x1E, 0x1E, 0x1E);
-const COLOR_INPUT_BG: egui::Color32 = egui::Color32::from_rgb(0x2A, 0x2A, 0x2A);
+/// 弹窗与三个次级对话框共用的一套深色调:对话框从 dialogs.rs 引这几样。
+pub const COLOR_BG: egui::Color32 = egui::Color32::from_rgb(0x1E, 0x1E, 0x1E);
+pub const COLOR_INPUT_BG: egui::Color32 = egui::Color32::from_rgb(0x2A, 0x2A, 0x2A);
 const COLOR_SELECTED: egui::Color32 = egui::Color32::from_rgb(0x99, 0x5A, 0x3C);
 const COLOR_HOVER: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x2E, 0x2E);
-const COLOR_TEXT: egui::Color32 = egui::Color32::from_rgb(0xE6, 0xE6, 0xE6);
-const COLOR_META: egui::Color32 = egui::Color32::from_rgb(0x8C, 0x8C, 0x8C);
+pub const COLOR_TEXT: egui::Color32 = egui::Color32::from_rgb(0xE6, 0xE6, 0xE6);
+pub const COLOR_META: egui::Color32 = egui::Color32::from_rgb(0x8C, 0x8C, 0x8C);
 const COLOR_PIN: egui::Color32 = egui::Color32::from_rgb(0x4A, 0xA2, 0xD2);
 
 /// The context handle the platform thread needs to wake the UI loop. Set in
@@ -82,15 +83,6 @@ pub fn run(store: Arc<Store>) {
 
     let (thumb_tx, thumb_rx) = spawn_thumb_worker(Arc::clone(&store));
     let (hydrate_tx, hydrate_rx) = mpsc::channel();
-    let (edit_tx, edit_rx) = mpsc::channel::<Option<String>>();
-
-    // 编辑窗口是两种弹窗共用的 Win32 实件:结束的回话经这条通道回 App。
-    crate::edit_window::set_finish_callback(Box::new(move |saved| {
-        let _ = edit_tx.send(saved);
-        if let Some(ctx) = UI_CTX.get() {
-            ctx.request_repaint();
-        }
-    }));
 
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -108,15 +100,7 @@ pub fn run(store: Arc<Store>) {
         ..Default::default()
     };
 
-    let app = App::new(
-        store,
-        event_rx,
-        thumb_tx,
-        thumb_rx,
-        hydrate_tx,
-        hydrate_rx,
-        edit_rx,
-    );
+    let app = App::new(store, event_rx, thumb_tx, thumb_rx, hydrate_tx, hydrate_rx);
     let result = eframe::run_native(
         "ClipPlus",
         native,
@@ -394,8 +378,8 @@ struct App {
     /// generation no longer matches is dropped.
     generation: usize,
 
-    /// 编辑窗口的收尾(保存了哪个 stem,或 None = 取消)。
-    edit_rx: mpsc::Receiver<Option<String>>,
+    /// 三个次级对话框(设置/清理/编辑)的 egui 视口。
+    dialogs: crate::dialogs::Dialogs,
 }
 
 impl App {
@@ -407,7 +391,6 @@ impl App {
         thumb_rx: mpsc::Receiver<(String, usize, usize, Vec<u8>)>,
         hydrate_tx: mpsc::Sender<(usize, HydrateAction, Vec<String>, Option<ClipPayload>)>,
         hydrate_rx: mpsc::Receiver<(usize, HydrateAction, Vec<String>, Option<ClipPayload>)>,
-        edit_rx: mpsc::Receiver<Option<String>>,
     ) -> Self {
         Self {
             store,
@@ -450,7 +433,7 @@ impl App {
             hydrate_rx,
             hydrating: None,
             generation: 0,
-            edit_rx,
+            dialogs: crate::dialogs::Dialogs::new(),
         }
     }
 
@@ -460,6 +443,8 @@ impl App {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 PlatformEvent::Hotkey | PlatformEvent::TrayToggle => self.toggle(ctx),
+                // 托盘菜单的「设置…」:对话框自己按当前设置填字段。
+                PlatformEvent::TraySettings => self.dialogs.open_settings(),
                 PlatformEvent::Quit => self.quit(ctx),
             }
         }
@@ -516,20 +501,6 @@ impl App {
                         self.open_editor(stem, &payload);
                     }
                 }
-            }
-        }
-
-        // 编辑窗口收尾:取消 = 原样收回焦点;保存 = 重灌列表并跟到那一行。
-        while let Ok(saved) = self.edit_rx.try_recv() {
-            self.modal_open = false;
-            if let Some(stem) = &saved {
-                self.refill();
-                if let Some(position) = self.items.iter().position(|item| &item.stem == stem) {
-                    self.point_at(position);
-                }
-            }
-            if self.visible {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
     }
@@ -1065,9 +1036,8 @@ impl App {
         self.open_editor(&stem, &payload);
     }
 
-    /// Hands one clip's text to the Win32 editor, holding the popup up the way
-    /// a message box does. The editor is a shared window on this same thread;
-    /// its closing comes back through the edit channel.
+    /// Hands one clip's text to the editor dialog, holding the popup up the way
+    /// a message box does. Its closing comes back through `App::ui` next frame.
     fn open_editor(&mut self, stem: &str, payload: &ClipPayload) {
         let ClipPayload::Text(text) = payload else {
             log::warn("edit is text-only; refusing a non-text payload");
@@ -1075,12 +1045,7 @@ impl App {
         };
 
         self.modal_open = true;
-        let opened = crate::edit_window::show(stem, text);
-        if !opened {
-            // A hold with no editor behind it would pin the popup on screen
-            // forever.
-            self.modal_open = false;
-        }
+        self.dialogs.open_edit(stem, text);
     }
 
     /// Ctrl+P: pin or unpin the caret row. Pinning moves the row to the top,
@@ -1547,10 +1512,38 @@ impl eframe::App for App {
         self.prepare_startup_geometry(ctx);
         self.enforce_hidden(ctx);
         self.keep_repainting_just_after_show(ctx);
+
+        // 对话框开着时保持低频醒来:弹窗藏着的时候 eframe 可能整趟 pass 都
+        // 不跑,扫描回传和输入路由都得有帧可用。每秒几帧,代价可忽略。
+        if self.dialogs.any_open() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // 三个次级对话框与弹窗同一趟 pass 画出来;弹窗藏着时它们也可能开着,
+        // 所以注册必须走在可见性早退之前。编辑窗的收尾从这里回话——保存了
+        // 哪个 stem(或取消),和旧原生窗口经通道回话等价。
+        let edit_finished = {
+            let dialogs = &mut self.dialogs;
+            let store = Arc::clone(&self.store);
+            dialogs.show(&ctx, &store)
+        };
+        if let Some(outcome) = edit_finished {
+            self.modal_open = false;
+            if let crate::dialogs::EditOutcome::Saved(stem) = outcome {
+                self.refill();
+                if let Some(position) = self.items.iter().position(|item| item.stem == stem) {
+                    self.point_at(position);
+                }
+            }
+            if self.visible {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
+
         // 藏着的时候 eframe 也可能照样跑这一趟:它只按 `ViewportInfo` 判断可见性,
         // 而 winit 在 Windows 上从不填那个字段。这里是双保险,别当真它不跑。
         if !self.visible {
