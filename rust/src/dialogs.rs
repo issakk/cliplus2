@@ -73,8 +73,8 @@ impl Dialogs {
         let (scan_tx, scan_rx) = mpsc::channel();
         let icon = win::window_icon_rgba().map(|(width, height, rgba)| {
             Arc::new(egui::IconData {
-                width,
-                height,
+                width: width as u32,
+                height: height as u32,
                 rgba,
             })
         });
@@ -581,15 +581,26 @@ fn held_modifiers() -> u32 {
 }
 
 /// egui 按键 → Windows 虚拟键码。热键拼法只认字母、数字和 F1-F24,其余键
-/// (包括左右修饰键本身)一概不录。
+/// (包括左右修饰键本身)一概不录。egui 的 Key 不许 range pattern,而各段
+/// 变体在声明序里连续,判别式区间即可——测试钉住了两端。
 fn vk_of(key: egui::Key) -> Option<u32> {
     use egui::Key;
-    match key {
-        Key::A..=Key::Z => Some(0x41 + (key as u32 - Key::A as u32)),
-        Key::Num0..=Key::Num9 => Some(0x30 + (key as u32 - Key::Num0 as u32)),
-        Key::F1..=Key::F24 => Some(0x70 + (key as u32 - Key::F1 as u32)),
-        _ => None,
+    let index = key as u32;
+
+    let (a, z) = (Key::A as u32, Key::Z as u32);
+    if (a..=z).contains(&index) {
+        return Some(0x41 + index - a);
     }
+    let (num0, num9) = (Key::Num0 as u32, Key::Num9 as u32);
+    if (num0..=num9).contains(&index) {
+        return Some(0x30 + index - num0);
+    }
+    let (f1, f24) = (Key::F1 as u32, Key::F24 as u32);
+    if (f1..=f24).contains(&index) {
+        return Some(0x70 + index - f1);
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------- 清理对话框

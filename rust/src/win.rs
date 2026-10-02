@@ -13,8 +13,6 @@
 #![allow(dead_code, non_snake_case)]
 
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
-
 // --------------------------------------------------------------------- aliases
 
 pub type HWND = isize;
@@ -314,6 +312,8 @@ extern "system" {
     ) -> HWND;
     fn DefWindowProcW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
     fn GetMessageW(lpMsg: *mut MSG, hWnd: HWND, wMsgFilterMin: u32, wMsgFilterMax: u32) -> i32;
+    fn TranslateMessage(lpMsg: *const MSG) -> i32;
+    fn DispatchMessageW(lpMsg: *const MSG) -> i32;
     fn PostQuitMessage(nExitCode: i32);
     fn PostMessageW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> i32;
     fn PostThreadMessageW(idThread: u32, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> i32;
