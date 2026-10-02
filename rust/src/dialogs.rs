@@ -2,15 +2,16 @@
 //!
 //! 曾经是三个 Win32 手摆控件窗口：深色化靠 uxtheme 的暗开关，布局按 96 DPI
 //! 逻辑像素手乘，各活各的消息循环。UI 换到 egui 之后这些必要都没了——
-//! `show_viewport_immediate` 让它们变成与弹窗同一套渲染、同一套深色主题、
+//! `show_viewport_deferred` 让它们变成与弹窗同一套渲染、同一套深色主题、
 //! 同一套字体的额外视口，主循环照旧只有一条。控件的深浅、字号、间距从此
 //! 不再是本模块的事。
 //!
-//! 线程：视口闭包只在 UI 线程的 pass 里跑。清理的两段后台线程（扫描/执行）
-//! 经 mpsc 回传结果并 `request_repaint` 叫醒主循环，与缩略图 worker 同款；
-//! 一次「扫描-确认-执行」全程由 `CLEANUP_IN_FLIGHT` 守着，窗口关了再开也不
-//! 许并行两趟。热键录制期间照旧走 suspend/apply 的平台命令，录制状态的
-//! 逐帧变化就是挂起与恢复的全部依据。
+//! 线程：视口是 deferred 的，闭包被 egui 持有、在那扇窗口自己的 pass 里跑
+//! （同一 UI 线程），所以状态都住在 `Arc<Mutex>` 里跟着闭包走。清理的两段
+//! 后台线程（扫描/执行）经 mpsc 回传结果并 `request_repaint` 叫醒主循环，与
+//! 缩略图 worker 同款；一次「扫描-确认-执行」全程由 `CLEANUP_IN_FLIGHT` 守
+//! 着，窗口关了再开也不许并行两趟。热键录制期间照旧走 suspend/apply 的平台
+//! 命令，录制状态的逐帧变化就是挂起与恢复的全部依据。
 //!
 //! 设置窗口字号（%）旋钮随这次迁移移除：egui 按显示器 DPI 原生渲染，没有
 //! 按视口缩放的 API，而弹窗是固定密度列表不能跟着缩；原生窗口时代那个旋钮
@@ -18,7 +19,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::log;
 use crate::settings::{self, Hotkey};
@@ -59,11 +60,21 @@ pub enum EditOutcome {
     Cancelled,
 }
 
+/// 常规锁;中毒的锁也要能开——上一帧的 panic 不该永久焊死对话框。
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// 三个视口加它们的共享件。App 持有,每趟 pass 在 `show` 里把开着的注册出去。
+///
+/// 状态都在 `Arc<Mutex>` 里,因为 deferred 视口的闭包会被 egui 持有、在那扇
+/// 窗口自己的 pass 里调用——state 跟着闭包走,借不动 App。
 pub struct Dialogs {
-    settings: SettingsDialog,
-    cleanup: CleanupDialog,
-    edit: EditDialog,
+    settings: Arc<Mutex<SettingsDialog>>,
+    cleanup: Arc<Mutex<CleanupDialog>>,
+    edit: Arc<Mutex<EditDialog>>,
     /// 三个窗口共用的图标,从内嵌 .ico 里拆出来的 RGBA。
     icon: Option<Arc<egui::IconData>>,
 }
@@ -80,73 +91,86 @@ impl Dialogs {
         });
 
         Self {
-            settings: SettingsDialog::default(),
-            cleanup: CleanupDialog::new(scan_tx, scan_rx),
-            edit: EditDialog::default(),
+            settings: Arc::new(Mutex::new(SettingsDialog::default())),
+            cleanup: Arc::new(Mutex::new(CleanupDialog::new(scan_tx, scan_rx))),
+            edit: Arc::new(Mutex::new(EditDialog::default())),
             icon,
         }
     }
 
-    /// 把开着的对话框注册成本趟 pass 的视口。弹窗藏着时它们也可能开着,
-    /// 所以这一步必须在弹窗可见性早退之前跑。返回编辑窗的收尾(有值 = 关了)。
-    pub fn show(&mut self, ctx: &egui::Context, store: &Arc<Store>) -> Option<EditOutcome> {
-        let mut edit_outcome = None;
-
-        if self.settings.opening.open {
-            // egui 建窗拿不到 hwnd,DWM 深色标题栏只能开窗之后按标题找。
-            if !self.settings.opening.themed {
-                self.settings.opening.themed = win::dark_title_bar_titled(SETTINGS_TITLE);
+    /// 把开着的对话框注册成本趟 pass 的 deferred 视口。弹窗藏着时它们也可能
+    /// 开着,所以这一步必须在弹窗可见性早退之前跑。
+    ///
+    /// 为什么是 deferred 而不是 immediate:eframe 0.36 的后端不执行 immediate
+    /// 视口回调,注册即同步等回调、等不到就 panic「user callback was never
+    /// called」——点设置闪退就是它。deferred 是 0.36 唯一画得出来的路。
+    pub fn show(&self, ctx: &egui::Context, store: &Arc<Store>) {
+        // egui 建窗拿不到 hwnd,DWM 深色标题栏只能开窗之后按标题找。
+        if lock(&self.settings).opening.open {
+            if !lock(&self.settings).opening.themed && win::dark_title_bar_titled(SETTINGS_TITLE) {
+                lock(&self.settings).opening.themed = true;
             }
-            let builder = self.settings.builder(self.icon.clone());
-            let settings = &mut self.settings;
-            let cleanup = &mut self.cleanup;
-            ctx.show_viewport_immediate(settings_viewport(), builder, |ui, _| {
-                settings.ui(ui, cleanup);
+            let builder = lock(&self.settings).builder(self.icon.clone());
+            let settings = Arc::clone(&self.settings);
+            let cleanup = Arc::clone(&self.cleanup);
+            ctx.show_viewport_deferred(settings_viewport(), builder, move |ui, _class| {
+                let mut settings = lock(&settings);
+                let mut cleanup = lock(&cleanup);
+                settings.ui(ui, &mut cleanup);
             });
         }
 
-        if self.cleanup.opening.open {
-            if !self.cleanup.opening.themed {
-                self.cleanup.opening.themed = win::dark_title_bar_titled(CLEANUP_TITLE);
+        if lock(&self.cleanup).opening.open {
+            if !lock(&self.cleanup).opening.themed && win::dark_title_bar_titled(CLEANUP_TITLE) {
+                lock(&self.cleanup).opening.themed = true;
             }
-            let builder = self.cleanup.builder(self.icon.clone());
-            let cleanup = &mut self.cleanup;
-            let ctx = ctx.clone();
+            let builder = lock(&self.cleanup).builder(self.icon.clone());
+            let cleanup = Arc::clone(&self.cleanup);
             let store = Arc::clone(store);
-            ctx.show_viewport_immediate(cleanup_viewport(), builder, |ui, _| {
+            ctx.show_viewport_deferred(cleanup_viewport(), builder, move |ui, _class| {
+                let mut cleanup = lock(&cleanup);
+                let ctx = ui.ctx().clone();
                 cleanup.ui(ui, &ctx, &store);
             });
         }
 
-        if self.edit.opening.open {
-            if !self.edit.opening.themed {
-                self.edit.opening.themed = win::dark_title_bar_titled(EDIT_TITLE);
+        if lock(&self.edit).opening.open {
+            if !lock(&self.edit).opening.themed && win::dark_title_bar_titled(EDIT_TITLE) {
+                lock(&self.edit).opening.themed = true;
             }
-            let builder = self.edit.builder(self.icon.clone());
-            let edit = &mut self.edit;
+            let builder = lock(&self.edit).builder(self.icon.clone());
+            let edit = Arc::clone(&self.edit);
             let store = Arc::clone(store);
-            edit_outcome =
-                ctx.show_viewport_immediate(edit_viewport(), builder, |ui, _| edit.ui(ui, &store));
-            if edit_outcome.is_some() {
-                self.edit.opening.open = false;
-            }
+            ctx.show_viewport_deferred(edit_viewport(), builder, move |ui, _class| {
+                let mut edit = lock(&edit);
+                let outcome = edit.ui(ui, &store);
+                if outcome.is_some() {
+                    edit.opening.open = false;
+                    edit.finished = outcome;
+                }
+            });
         }
-
-        edit_outcome
     }
 
     pub fn any_open(&self) -> bool {
-        self.settings.opening.open || self.cleanup.opening.open || self.edit.opening.open
+        lock(&self.settings).opening.open
+            || lock(&self.cleanup).opening.open
+            || lock(&self.edit).opening.open
+    }
+
+    /// 编辑窗的收尾:上一帧里关掉的话,这里取走(保存了哪个 stem,或取消)。
+    pub fn take_edit_outcome(&self) -> Option<EditOutcome> {
+        lock(&self.edit).finished.take()
     }
 
     /// 托盘「设置…」:按当前设置填好每个字段再露面。
-    pub fn open_settings(&mut self) {
-        self.settings.open_dialog();
+    pub fn open_settings(&self) {
+        lock(&self.settings).open_dialog();
     }
 
     /// 弹窗行菜单的「编辑」:拿着 stem 和文本开门。
-    pub fn open_edit(&mut self, stem: &str, text: &str) {
-        self.edit.open_dialog(stem, text);
+    pub fn open_edit(&self, stem: &str, text: &str) {
+        lock(&self.edit).open_dialog(stem, text);
     }
 }
 
@@ -1033,6 +1057,8 @@ struct EditDialog {
     stem: String,
     text: String,
     error: Option<String>,
+    /// 关窗那一帧写进来,下一帧由 `Dialogs::take_edit_outcome` 取走。
+    finished: Option<EditOutcome>,
 }
 
 impl EditDialog {

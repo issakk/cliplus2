@@ -1523,15 +1523,11 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // 三个次级对话框与弹窗同一趟 pass 画出来;弹窗藏着时它们也可能开着,
-        // 所以注册必须走在可见性早退之前。编辑窗的收尾从这里回话——保存了
-        // 哪个 stem(或取消),和旧原生窗口经通道回话等价。
-        let edit_finished = {
-            let dialogs = &mut self.dialogs;
-            let store = Arc::clone(&self.store);
-            dialogs.show(&ctx, &store)
-        };
-        if let Some(outcome) = edit_finished {
+        // 三个次级对话框与弹窗同一套 egui;deferred 视口在那扇窗口自己的
+        // pass 里画,弹窗藏着时也照常,所以注册走在可见性早退之前。
+        self.dialogs.show(&ctx, &self.store);
+        // 编辑窗上一帧关掉的话,收尾从这里回话——保存了哪个 stem,或取消。
+        if let Some(outcome) = self.dialogs.take_edit_outcome() {
             self.modal_open = false;
             if let crate::dialogs::EditOutcome::Saved(stem) = outcome {
                 self.refill();
