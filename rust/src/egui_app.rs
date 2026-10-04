@@ -2057,7 +2057,8 @@ mod tests {
         let galley = ellipsized_line(&ctx, "短", font, 100.0, COLOR_TEXT);
         assert_eq!(galley.text(), "短");
 
-        ctx.end_pass();
+        // end_pass 的收尾 token 是 must-use,显式消费。
+        drop(ctx.end_pass());
     }
 
     /// The time button's presets become absolute bounds at refill time, so the
