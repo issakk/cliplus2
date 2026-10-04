@@ -1139,8 +1139,12 @@ impl EditDialog {
     }
 
     fn builder(&mut self, icon: Option<Arc<egui::IconData>>) -> egui::ViewportBuilder {
+        // 弹窗永久置顶,编辑窗又是从弹窗里呼出的:不置顶的话一开就压在弹窗
+        // 底下,字都看不见。两个 topmost 窗口之间仍按激活先后排,编辑窗创建
+        // 即获焦,自然盖在弹窗上面。
         self.opening
             .builder(EDIT_TITLE, icon, EDIT_SIZE, Some(EDIT_MIN_SIZE))
+            .with_always_on_top()
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, store: &Arc<Store>) -> Option<EditOutcome> {
