@@ -1355,23 +1355,37 @@ impl App {
             text_left = thumb_rect.right() + 8.0;
         }
 
-        painter.text(
-            egui::pos2(text_left, rect.top() + 4.0),
-            egui::Align2::LEFT_TOP,
+        // 行内文本的可用宽:左缘(缩略图右侧)到行右缘再留 8 点边距。
+        let text_width = (rect.right() - text_left - 8.0).max(40.0);
+        let preview_galley = ellipsized_line(
+            ui.ctx(),
             &preview,
             egui::FontId::proportional(15.0),
+            text_width,
+            COLOR_TEXT,
+        );
+        painter.galley(
+            egui::pos2(text_left, rect.top() + 4.0),
+            preview_galley,
             COLOR_TEXT,
         );
         let mut meta = meta;
         if pinned {
             meta.insert_str(0, "📌 ");
         }
-        painter.text(
-            egui::pos2(text_left, rect.bottom() - 4.0),
-            egui::Align2::LEFT_BOTTOM,
+        let meta_color = if pinned { COLOR_PIN } else { COLOR_META };
+        let meta_galley = ellipsized_line(
+            ui.ctx(),
             &meta,
             egui::FontId::proportional(11.5),
-            if pinned { COLOR_PIN } else { COLOR_META },
+            text_width,
+            meta_color,
+        );
+        // 原来是底边对齐,galley 从左上角起画,自己扣掉行高。
+        painter.galley(
+            egui::pos2(text_left, rect.bottom() - 4.0 - meta_galley.size().y),
+            meta_galley,
+            meta_color,
         );
 
         // 旧弹窗的列表键:普通点 = 单选,Shift 点 = 从锚点扩选,Ctrl 点 = 原地
@@ -1842,6 +1856,24 @@ fn caret_offset(caret: usize, offset: f32, view_height: f32) -> Option<f32> {
     }
 }
 
+/// 一行文本按像素宽截断,放不下就以省略号收尾。
+///
+/// 行预览的截断上限是字符数(160),汉字 15pt 排出来两倍于窗口宽,裸画会在
+/// 右缘被拦腰切断、切在哪个字上随窗宽漂。egui 的排版在超过 `max_rows` 时
+/// 自动把末尾换成省略号(galley 有缓存,逐帧取是哈希查找,不贵)。
+fn ellipsized_line(
+    ctx: &egui::Context,
+    text: &str,
+    font: egui::FontId,
+    max_width: f32,
+    color: egui::Color32,
+) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple(text.to_owned(), font, color, max_width);
+    job.wrap.max_rows = 1;
+    job.wrap.overflow_character = Some('…');
+    ctx.fonts(|f| f.layout_job(job))
+}
+
 /// 停车点:目标位置的左边 `PARK_OFFSET` 物理像素处,尺寸不变。没有任何显示器
 /// 会延伸到那个坐标上,所以窗口在那儿是"亮着但没人看得见"。
 fn park_position(left: i32, top: i32, ppp: f32) -> egui::Pos2 {
@@ -2007,6 +2039,24 @@ mod tests {
         // Wider than the screen it has to fit on: the top-left corner is the best
         // that can be done, and this is the case that panics without the `max`.
         assert_eq!(placed(Some((-500, -500)), &work_area(), 2000, 1200), (0, 0));
+    }
+
+    /// 长行按像素截断并以省略号收尾,短行原样。行预览超宽被窗口硬裁(切在
+    /// 哪个字上随窗宽漂)就是这条要挡住的毛病。字体要过一遍 pass 才有。
+    #[test]
+    fn a_long_preview_line_is_ellipsized_and_a_short_one_is_not() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+
+        let font = egui::FontId::proportional(15.0);
+        let galley = ellipsized_line(&ctx, &"字".repeat(300), font.clone(), 100.0, COLOR_TEXT);
+        assert!(galley.size().x <= 100.0);
+        assert!(galley.text().ends_with('…'));
+
+        let galley = ellipsized_line(&ctx, "短", font, 100.0, COLOR_TEXT);
+        assert_eq!(galley.text(), "短");
+
+        ctx.end_pass();
     }
 
     /// The time button's presets become absolute bounds at refill time, so the

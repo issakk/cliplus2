@@ -1159,11 +1159,23 @@ impl EditDialog {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(COLOR_BG).inner_margin(12.0))
             .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.text)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(14),
-                );
+                // TextEdit 随内容长高(desired_rows 只是下限),不封顶的话长
+                // 文本会把底下的保存/取消顶出窗外。套一个封顶的滚动区:高度
+                // = 窗内剩余减去底部按钮带(间距+按钮行+一行错误的余量),长
+                // 内容在框内滚;打字时 TextEdit 会 scroll_to_rect,外层跟着
+                // 光标走,不会盲打。
+                let band = 8.0 + 20.0 + 24.0;
+                let editor_height = (ui.available_height() - band).max(120.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .max_height(editor_height)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.text)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(14),
+                        );
+                    });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label(
