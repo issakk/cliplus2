@@ -1871,7 +1871,8 @@ fn ellipsized_line(
     let mut job = egui::text::LayoutJob::simple(text.to_owned(), font, color, max_width);
     job.wrap.max_rows = 1;
     job.wrap.overflow_character = Some('…');
-    ctx.fonts(|f| f.layout_job(job))
+    // 0.36 的排版经 FontsView,galley 缓存要可变借用。
+    ctx.fonts_mut(|f| f.layout_job(job))
 }
 
 /// 停车点:目标位置的左边 `PARK_OFFSET` 物理像素处,尺寸不变。没有任何显示器
