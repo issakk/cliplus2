@@ -2061,8 +2061,10 @@ mod tests {
         assert!(!galley.elided);
         assert_eq!(galley.text(), "短");
 
-        // end_pass 的收尾 token 是 must-use,显式消费。
-        drop(ctx.end_pass());
+        // end_pass 的产出必须被消费:字体光栅化攒下的 TexturesDelta 不清掉,
+        // FullOutput 释放时的 debug 断言会炸。
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
     }
 
     /// The time button's presets become absolute bounds at refill time, so the
