@@ -36,12 +36,14 @@ const SETTINGS_TITLE: &str = "ClipPlus 设置";
 const CLEANUP_TITLE: &str = "ClipPlus 清理";
 const EDIT_TITLE: &str = "ClipPlus 编辑";
 
-/// 打开时的点尺寸(96 DPI 逻辑像素,和 egui 的 point 同一口径)。设置窗的
-/// 高度只是开窗首帧的暂定值:那一帧就会按内容的自然高度收口(见 fitted_for)。
+/// 打开时的点尺寸(96 DPI 逻辑像素,和 egui 的 point 同一口径)。高度只是
+/// 开窗首帧的暂定值:那一帧就会按内容的自然高度收口(见 `Opening::fit_height`)。
 const SETTINGS_SIZE: [f32; 2] = [640.0, 310.0];
 /// 设置面板四周的留白。收口算客户区高度时要把上下两份加回去。
 const SETTINGS_MARGIN: f32 = 14.0;
-const CLEANUP_SIZE: [f32; 2] = [620.0, 540.0];
+const CLEANUP_SIZE: [f32; 2] = [620.0, 340.0];
+/// 清理面板四周的留白,同上。
+const CLEANUP_MARGIN: f32 = 16.0;
 const EDIT_SIZE: [f32; 2] = [560.0, 360.0];
 const EDIT_MIN_SIZE: [f32; 2] = [380.0, 240.0];
 
@@ -205,6 +207,8 @@ struct Opening {
     /// DWM 深色标题栏设过了就不用再 FindWindow。
     themed: bool,
     position: Option<egui::Pos2>,
+    /// 已按哪一档内容高度收过口。None = 这扇窗还没量过。
+    fitted_height: Option<f32>,
 }
 
 impl Opening {
@@ -223,6 +227,8 @@ impl Opening {
         }
         if !self.placed {
             self.placed = true;
+            // 每次都是一扇新窗,上一扇的收口不作数。
+            self.fitted_height = None;
             builder = builder.with_inner_size(size);
             if let Some(min_size) = min_size {
                 builder = builder.with_min_inner_size(min_size);
@@ -239,6 +245,32 @@ impl Opening {
         let cursor = win::cursor_position();
         let area = win::work_area_at(cursor);
         self.position = Some(placed_points(cursor, &area, width_pt, height_pt));
+    }
+
+    /// 窗口高度跟着内容走:量到一份和上次收过的不一样(差半点以上)的内容
+    /// 高度,就把客户区收到正好。每帧都发不行——内容没变的帧会白白重建
+    /// GL 表面,用户手动拖出的尺寸也会被拽回去;宽度假手拖,只收高度。
+    fn fit_height(
+        &mut self,
+        ctx: &egui::Context,
+        fallback_width: f32,
+        content_height: f32,
+        margin: f32,
+    ) {
+        if self
+            .fitted_height
+            .map_or(false, |fitted| (fitted - content_height).abs() < 0.5)
+        {
+            return;
+        }
+        self.fitted_height = Some(content_height);
+        let width = ctx
+            .input(|i| i.viewport().inner_rect)
+            .map_or(fallback_width, |rect| rect.width());
+        // 显式指名本视口:这是 deferred 闭包,不想赌「当前视口」的语义。
+        ctx.send_viewport_cmd_to(ctx.viewport_id(), {
+            egui::ViewportCommand::InnerSize(egui::vec2(width, content_height + 2.0 * margin))
+        });
     }
 }
 
@@ -260,9 +292,6 @@ struct SettingsDialog {
     /// 热键框处于录制中:任何组合键入框,点别处或 Esc 收工。
     recording: bool,
     error: Option<String>,
-    /// 窗口已按哪一档内容高度收过口:None = 还没收;Some(错误行当时在不在)。
-    /// 错误行是唯一会变高度的内容,它出现/消失时窗口跟着再收一次。
-    fitted_for: Option<bool>,
 }
 
 impl SettingsDialog {
@@ -283,7 +312,6 @@ impl SettingsDialog {
         self.write_blobs = current.write_blobs;
         self.recording = false;
         self.error = None;
-        self.fitted_for = None;
         self.opening.placed = false;
         self.opening.themed = false;
         self.opening
@@ -404,24 +432,9 @@ impl SettingsDialog {
                 content_height = ui.min_size().y;
             });
 
-        // 窗口高度跟着内容走:开窗首帧按内容自然高度收口,之后唯一会变高度
-        // 的内容是错误行,它出现/消失时再收一次。不能每帧都发——用户手动
-        // 拖出的尺寸会被拽回去,而且发一次尺寸就重建一次 GL 表面。
-        let error_shown = self.error.is_some();
-        if self.fitted_for != Some(error_shown) {
-            self.fitted_for = Some(error_shown);
-            let width = ui
-                .ctx()
-                .input(|i| i.viewport().inner_rect)
-                .map_or(SETTINGS_SIZE[0], |rect| rect.width());
-            // 显式指名本视口:这是 deferred 闭包,不想赌「当前视口」的语义。
-            ui.ctx().send_viewport_cmd_to(ui.ctx().viewport_id(), {
-                egui::ViewportCommand::InnerSize(egui::vec2(
-                    width,
-                    content_height + 2.0 * SETTINGS_MARGIN,
-                ))
-            });
-        }
+        // 错误行是设置窗里唯一会变高度的内容,出现/消失由收口跟着长/缩。
+        self.opening
+            .fit_height(ui.ctx(), SETTINGS_SIZE[0], content_height, SETTINGS_MARGIN);
 
         // 录制状态的变化就是挂起/恢复热键的全部依据,放在面板外统一看。
         if self.recording != was_recording {
@@ -782,9 +795,14 @@ impl CleanupDialog {
 
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, store: &Arc<Store>) {
         self.drain();
+        let mut content_height = 0.0;
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(COLOR_BG).inner_margin(16.0))
+            .frame(
+                egui::Frame::default()
+                    .fill(COLOR_BG)
+                    .inner_margin(CLEANUP_MARGIN),
+            )
             .show(ui, |ui| {
                 for text in [&mut self.days, &mut self.keep] {
                     text.retain(|c| c.is_ascii_digit());
@@ -860,12 +878,21 @@ impl CleanupDialog {
                 }
 
                 ui.add_space(10.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Align::Min 贴住上面的内容;竖直居中会把按钮悬浮到剩余
+                // 空间的中部(这一行不在 horizontal 里,没东西给它撑高)。
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     if ui.button("关闭").clicked() {
                         self.close();
                     }
                 });
+
+                // 量在内容末尾,拿到的才是整份内容的自然高度。
+                content_height = ui.min_size().y;
             });
+
+        // 状态行是清理窗里唯一会变高度的内容,扫描报告多长窗口就长多高。
+        self.opening
+            .fit_height(ui.ctx(), CLEANUP_SIZE[0], content_height, CLEANUP_MARGIN);
 
         self.draw_confirm(ui, ctx, store);
     }
