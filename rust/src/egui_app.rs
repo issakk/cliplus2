@@ -2052,9 +2052,13 @@ mod tests {
         let font = egui::FontId::proportional(15.0);
         let galley = ellipsized_line(&ctx, &"字".repeat(300), font.clone(), 100.0, COLOR_TEXT);
         assert!(galley.size().x <= 100.0);
-        assert!(galley.text().ends_with('…'));
+        assert_eq!(galley.rows.len(), 1);
+        // Galley::text() 返回的是完整原文,截断只发生在字形上——elided 才是
+        // 排版层的"已按行数截断"标记。
+        assert!(galley.elided);
 
         let galley = ellipsized_line(&ctx, "短", font, 100.0, COLOR_TEXT);
+        assert!(!galley.elided);
         assert_eq!(galley.text(), "短");
 
         // end_pass 的收尾 token 是 must-use,显式消费。
