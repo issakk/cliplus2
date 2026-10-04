@@ -36,8 +36,11 @@ const SETTINGS_TITLE: &str = "ClipPlus 设置";
 const CLEANUP_TITLE: &str = "ClipPlus 清理";
 const EDIT_TITLE: &str = "ClipPlus 编辑";
 
-/// 打开时的点尺寸(96 DPI 逻辑像素,和 egui 的 point 同一口径)。
-const SETTINGS_SIZE: [f32; 2] = [640.0, 460.0];
+/// 打开时的点尺寸(96 DPI 逻辑像素,和 egui 的 point 同一口径)。设置窗的
+/// 高度只是开窗首帧的暂定值:那一帧就会按内容的自然高度收口(见 fitted_for)。
+const SETTINGS_SIZE: [f32; 2] = [640.0, 310.0];
+/// 设置面板四周的留白。收口算客户区高度时要把上下两份加回去。
+const SETTINGS_MARGIN: f32 = 14.0;
 const CLEANUP_SIZE: [f32; 2] = [620.0, 540.0];
 const EDIT_SIZE: [f32; 2] = [560.0, 360.0];
 const EDIT_MIN_SIZE: [f32; 2] = [380.0, 240.0];
@@ -257,6 +260,9 @@ struct SettingsDialog {
     /// 热键框处于录制中:任何组合键入框,点别处或 Esc 收工。
     recording: bool,
     error: Option<String>,
+    /// 窗口已按哪一档内容高度收过口:None = 还没收;Some(错误行当时在不在)。
+    /// 错误行是唯一会变高度的内容,它出现/消失时窗口跟着再收一次。
+    fitted_for: Option<bool>,
 }
 
 impl SettingsDialog {
@@ -277,6 +283,7 @@ impl SettingsDialog {
         self.write_blobs = current.write_blobs;
         self.recording = false;
         self.error = None;
+        self.fitted_for = None;
         self.opening.placed = false;
         self.opening.themed = false;
         self.opening
@@ -297,9 +304,14 @@ impl SettingsDialog {
 
     fn ui(&mut self, ui: &mut egui::Ui, cleanup: &mut CleanupDialog) {
         let was_recording = self.recording;
+        let mut content_height = 0.0;
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(COLOR_BG).inner_margin(14.0))
+            .frame(
+                egui::Frame::default()
+                    .fill(COLOR_BG)
+                    .inner_margin(SETTINGS_MARGIN),
+            )
             .show(ui, |ui| {
                 // 数字框只认数字(ES_NUMBER 的等价物),范围校验留到存盘。
                 for text in [
@@ -387,7 +399,29 @@ impl SettingsDialog {
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new(reason).size(12.0).color(COLOR_ERROR));
                 }
+
+                // 量在内容末尾,拿到的才是整份内容的自然高度。
+                content_height = ui.min_size().y;
             });
+
+        // 窗口高度跟着内容走:开窗首帧按内容自然高度收口,之后唯一会变高度
+        // 的内容是错误行,它出现/消失时再收一次。不能每帧都发——用户手动
+        // 拖出的尺寸会被拽回去,而且发一次尺寸就重建一次 GL 表面。
+        let error_shown = self.error.is_some();
+        if self.fitted_for != Some(error_shown) {
+            self.fitted_for = Some(error_shown);
+            let width = ui
+                .ctx()
+                .input(|i| i.viewport().inner_rect)
+                .map_or(SETTINGS_SIZE[0], |rect| rect.width());
+            // 显式指名本视口:这是 deferred 闭包,不想赌「当前视口」的语义。
+            ui.ctx().send_viewport_cmd_to(ui.ctx().viewport_id(), {
+                egui::ViewportCommand::InnerSize(egui::vec2(
+                    width,
+                    content_height + 2.0 * SETTINGS_MARGIN,
+                ))
+            });
+        }
 
         // 录制状态的变化就是挂起/恢复热键的全部依据,放在面板外统一看。
         if self.recording != was_recording {

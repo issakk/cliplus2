@@ -44,7 +44,8 @@ pub fn add(hwnd: HWND, settings: &Settings) -> bool {
     // rendered for it instead of resampling a bigger one.
     data.icon = win::app_icon(win::small_icon_size());
 
-    let tip = win::wide("ClipPlus — Win+Alt+V 打开历史");
+    // 只报名字:热键是可配置的,写死在这里迟早和实际配置对不上。
+    let tip = win::wide("ClipPlus");
     let copied = tip.len().min(win::TIP_CHARS);
     data.tip[..copied].copy_from_slice(&tip[..copied]);
 
