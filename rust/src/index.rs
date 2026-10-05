@@ -312,12 +312,15 @@ impl Index {
             .collect();
     }
 
-    /// Drops every entry that came out of one container. Used when a database
-    /// changed (its rows are re-read from scratch) or disappeared.
+    /// Drops every entry whose database is not in `keep`: one pass over the
+    /// index rather than a `forget` per stem, and the same stem-and-hash
+    /// cleanup either way. This is the general shape `forget_db` is the
+    /// one-path special case of — the rescan uses it to carry out what its
+    /// walk no longer sees.
     ///
-    /// One pass over the index rather than a `forget` per stem: this runs again for
-    /// every change to a database, and each of those scans the whole index.
-    pub fn forget_db(&mut self, db_path: &std::path::Path) {
+    /// The hash set loses exactly the hashes no kept row still carries — a
+    /// hash two clips share survives when only one of their databases goes.
+    pub fn retain_dbs(&mut self, keep: &HashSet<PathBuf>) -> usize {
         // Taken rather than borrowed, because the stem and hash sets are updated
         // from inside the loop and holding a borrow of the items would not allow it.
         let existing = std::mem::take(&mut self.items);
@@ -325,18 +328,26 @@ impl Index {
         let mut dropped: HashSet<String> = HashSet::new();
 
         for item in existing {
-            if item.db_path == db_path {
+            if keep.contains(&item.db_path) {
+                kept.push(item);
+            } else {
                 self.stems.remove(&item.stem);
                 if !item.hash.is_empty() {
                     dropped.insert(item.hash);
                 }
-            } else {
-                kept.push(item);
             }
         }
 
+        let count = existing.len() - kept.len();
         self.items = kept;
         self.forget_hashes(&dropped);
+        count
+    }
+
+    /// Drops every entry that came out of one container. Used when a database
+    /// changed (its rows are re-read from scratch) or disappeared.
+    pub fn forget_db(&mut self, db_path: &std::path::Path) {
+        self.retain_dbs(&std::iter::once(db_path.to_path_buf()).collect());
     }
 
     pub fn set_pinned(&mut self, stem: &str, pinned: bool) -> bool {
@@ -1253,6 +1264,27 @@ mod tests {
             .collect();
         merged.forget_many(&stems);
         assert_eq!(order(&merged), vec!["e", "b", "d"]);
+    }
+
+    /// The rescan's backstop: a database the walk no longer sees loses its
+    /// rows, stems and hashes — `forget_db` is this over one path. A database
+    /// inside the set keeps everything, down to the hash another of its rows
+    /// carries.
+    #[test]
+    fn retain_dbs_drops_everything_outside_the_set() {
+        let mut index = Index::default();
+        index.insert(item("a", "local", 300));
+        index.insert(item("b", "local", 200));
+
+        // The database the items carry: nothing goes.
+        let keep: HashSet<PathBuf> = [PathBuf::from("C:/sync/clips.db")].into();
+        assert_eq!(index.retain_dbs(&keep), 0);
+        assert_eq!(index.query(None, None, &ChipFilter::default(), 10).len(), 2);
+
+        // The walk no longer sees that database: both rows and their hashes go.
+        assert_eq!(index.retain_dbs(&HashSet::<PathBuf>::new()), 2);
+        assert!(index.query(None, None, &ChipFilter::default(), 10).is_empty());
+        assert!(!index.has_hash("hash-a"));
     }
 
     /// A row is one line tall, so the preview is the only place that can say a clip

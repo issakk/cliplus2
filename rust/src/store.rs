@@ -440,27 +440,67 @@ impl Store {
     // ---------------------------------------------------------------- indexing
 
     /// Full folder walk: every database under the sync root, plus the pin and
-    /// tombstone markers beside them. Databases are stamped, so one that has not
-    /// changed costs a `stat`.
+    /// tombstone markers beside them. Databases are stamped, so one that has
+    /// not changed costs a `stat`. Databases the walk no longer sees leave the
+    /// index — the backstop for a removal the watcher missed.
     pub fn rescan(&self) {
         let root = self.settings.sync_root.clone();
+
+        // An unreadable root is not an empty one: a signed-out sync client or
+        // an asleep network drive must leave the previous snapshot in place,
+        // the same contract `load_db` keeps for one unreadable database.
+        match fs::read_dir(&root) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                log::info(&format!(
+                    "sync root {} does not exist yet; nothing to index",
+                    root.display()
+                ));
+                return;
+            }
+            Err(err) => {
+                log::warn(&format!(
+                    "sync root {} unreadable ({err}); keeping the previous index",
+                    root.display()
+                ));
+                return;
+            }
+            Ok(_) => {}
+        }
+
         let mut pinned = HashSet::new();
         let mut hidden = HashSet::new();
-        self.walk(&root, &mut pinned, &mut hidden);
+        let mut live: HashSet<PathBuf> = HashSet::new();
+        self.walk(&root, &mut pinned, &mut hidden, &mut live);
 
-        let (clips, pinned_count, hidden_count) = {
+        let (clips, pinned_count, hidden_count, dropped) = {
             let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
             index.apply_pin_state(&pinned);
             index.apply_hidden_state(&hidden);
-            (index.len(), pinned.len(), hidden.len())
+            // The walk just answered what exists; a database the index still
+            // holds that is not in that answer has left the folder.
+            let dropped = index.retain_dbs(&live);
+            (index.len(), pinned.len(), hidden.len(), dropped)
         };
 
+        // Stamps for the databases that went ride along, so a folder that
+        // comes back is read fresh instead of matching a stale stamp.
+        self.loaded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|path, _| live.contains(path));
+
         log::info(&format!(
-            "rescan: {clips} clip(s) indexed, {pinned_count} pinned, {hidden_count} hidden"
+            "rescan: {clips} clip(s) indexed, {pinned_count} pinned, {hidden_count} hidden, {dropped} dropped"
         ));
     }
 
-    fn walk(&self, directory: &Path, pinned: &mut HashSet<String>, hidden: &mut HashSet<String>) {
+    fn walk(
+        &self,
+        directory: &Path,
+        pinned: &mut HashSet<String>,
+        hidden: &mut HashSet<String>,
+        live: &mut HashSet<PathBuf>,
+    ) {
         let Ok(entries) = fs::read_dir(directory) else {
             return;
         };
@@ -472,7 +512,7 @@ impl Store {
             };
 
             if file_type.is_dir() {
-                self.walk(&path, pinned, hidden);
+                self.walk(&path, pinned, hidden, live);
                 continue;
             }
 
@@ -482,6 +522,7 @@ impl Store {
             };
 
             if name == DB_NAME {
+                live.insert(path.clone());
                 self.refresh_db(&path, false);
             } else if name.ends_with(PIN_SUFFIX) {
                 let stem = stem_of(&path, PIN_SUFFIX);
@@ -682,12 +723,12 @@ impl Store {
             return;
         }
 
-        delete_clips(&doomed);
-        self.forget_deleted(&doomed);
+        let removed = delete_clips(&doomed);
+        self.forget_deleted(&removed);
 
         log::info(&format!(
             "retention removed {} clip(s) older than {days} day(s)",
-            doomed.len()
+            removed.len()
         ));
     }
 
@@ -746,10 +787,15 @@ impl Store {
     /// machine reads as gone and the owner carries out on its next rescan.
     /// Reports `(deleted, marked)`.
     fn remove_clips(&self, doomed: Vec<ClipItem>, marked: Vec<ClipItem>) -> (usize, usize) {
-        if !doomed.is_empty() {
-            delete_clips(&doomed);
-            self.forget_deleted(&doomed);
-        }
+        // Only rows that really went leave the index: a row the database
+        // refused to drop stays visible, with its bytes intact.
+        let removed = if doomed.is_empty() {
+            Vec::new()
+        } else {
+            let removed = delete_clips(&doomed);
+            self.forget_deleted(&removed);
+            removed
+        };
 
         // Only the ones whose marker actually landed: a row left on this list with no
         // tombstone behind it is a delete that did not happen, and staying visible is
@@ -766,7 +812,7 @@ impl Store {
             index.hide_many(&hidden);
         }
 
-        (doomed.len(), hidden.len())
+        (removed.len(), hidden.len())
     }
 
     /// Drops a batch from the index after `delete_clips` took the rows out. The
@@ -800,12 +846,12 @@ impl Store {
             return;
         }
 
-        delete_clips(&doomed);
-        self.forget_deleted(&doomed);
+        let removed = delete_clips(&doomed);
+        self.forget_deleted(&removed);
 
         log::info(&format!(
             "reaped {} tombstoned clip(s) of our own",
-            doomed.len()
+            removed.len()
         ));
     }
 
@@ -888,14 +934,14 @@ impl Store {
             return 0;
         }
 
-        delete_clips(&doomed);
-        self.forget_deleted(&doomed);
+        let removed = delete_clips(&doomed);
+        self.forget_deleted(&removed);
 
         log::info(&format!(
             "bin cleanup removed {} heavy clip(s)",
-            doomed.len()
+            removed.len()
         ));
-        doomed.len()
+        removed.len()
     }
 
     /// Groups the visible text clips by content hash and lists every copy except
@@ -1382,13 +1428,20 @@ fn write_marker(item: &ClipItem) -> bool {
     }
 }
 
-/// Deletes a batch of clips: the rows of every database involved, then the blob, the
-/// pin and the tombstone beside them.
+/// Deletes a batch of clips and returns the ones that really went: the rows of
+/// every database involved in one transaction each, then the blob, the pin and
+/// the tombstone beside each row that went.
 ///
 /// A batch rather than one call per clip because retention empties in bursts — one
 /// transaction per database instead of a commit per row, and one file open instead
 /// of one per clip.
-fn delete_clips(items: &[ClipItem]) {
+///
+/// A row the database refuses to drop keeps its files and its index entry: row
+/// and blob are pointer and bytes, and deleting the bytes under a living row is
+/// the one broken shape — an entry that lists but cannot paste — that this
+/// module's bytes-before-pointer rule exists to prevent. Callers forget only
+/// what comes back here, so such a row stays visible and pasteable.
+fn delete_clips(items: &[ClipItem]) -> Vec<ClipItem> {
     let mut stems_by_db: HashMap<&Path, Vec<&str>> = HashMap::new();
 
     for item in items {
@@ -1398,13 +1451,17 @@ fn delete_clips(items: &[ClipItem]) {
             .push(item.stem.as_str());
     }
 
-    for (db_path, stems) in stems_by_db {
-        delete_rows(db_path, &stems);
+    let mut failed: HashSet<String> = HashSet::new();
+    for (db_path, stems) in &stems_by_db {
+        failed.extend(delete_rows(db_path, stems));
     }
 
-    // The files go even when the row could not: an orphaned blob costs disk, a row
-    // pointing at a missing blob is a broken entry, so this is the safe order.
+    let mut removed = Vec::new();
     for item in items {
+        if failed.contains(&item.stem) {
+            continue;
+        }
+
         if item.has_blob && !item.blob_path.as_os_str().is_empty() {
             remove_file(&item.blob_path);
         }
@@ -1413,13 +1470,17 @@ fn delete_clips(items: &[ClipItem]) {
         // The tombstone has done its job the moment the row is gone, so it goes with
         // it — whether it was ours or another instance's request that this happen.
         remove_file(&item.hidden_path());
+        removed.push(item.clone());
     }
+
+    removed
 }
 
-/// Deletes rows from one database in a single transaction. The transaction is the
-/// whole point: without it SQLite commits per statement, and each of those is a
-/// journal write and an fsync.
-fn delete_rows(db_path: &Path, stems: &[&str]) {
+/// Deletes rows from one database in a single transaction, returning the stems
+/// that are still there. The transaction is all-or-nothing — the whole point is
+/// one journal write and one fsync instead of one per row — so a failure marks
+/// the whole batch.
+fn delete_rows(db_path: &Path, stems: &[&str]) -> Vec<String> {
     let result = open_rw(db_path).and_then(|mut conn| {
         let transaction = conn.transaction().map_err(|err| err.to_string())?;
 
@@ -1438,12 +1499,16 @@ fn delete_rows(db_path: &Path, stems: &[&str]) {
         transaction.commit().map_err(|err| err.to_string())
     });
 
-    if let Err(err) = result {
-        log::error(&format!(
-            "delete {} clip(s) from {}: {err}",
-            stems.len(),
-            db_path.display()
-        ));
+    match result {
+        Ok(()) => Vec::new(),
+        Err(err) => {
+            log::error(&format!(
+                "delete {} clip(s) from {}: {err}",
+                stems.len(),
+                db_path.display()
+            ));
+            stems.iter().map(|stem| (*stem).to_string()).collect()
+        }
     }
 }
 
@@ -1639,7 +1704,7 @@ mod tests {
         assert_eq!(second.text, None);
         assert_eq!(second.blob.as_deref(), Some("stem-2.bin"));
 
-        delete_rows(&path, &["stem-1"]);
+        assert!(delete_rows(&path, &["stem-1"]).is_empty());
         let left = read_all(&path);
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].stem, "stem-2");
@@ -1727,7 +1792,7 @@ mod tests {
         assert_eq!(plain.app.as_deref(), Some(""));
         assert_eq!(plain.title.as_deref(), Some(""));
 
-        delete_rows(&path, &["stem-1"]);
+        assert!(delete_rows(&path, &["stem-1"]).is_empty());
         assert_eq!(read_all(&path).len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
@@ -1756,13 +1821,74 @@ mod tests {
             "3f9a2c81",
             crate::settings::current_year(),
         );
-        delete_clips(&[item]);
+        let removed = delete_clips(&[item]);
+        assert_eq!(removed.len(), 1);
 
         assert!(path.exists(), "the database must outlive its own row");
         assert_eq!(read_all(&path).len(), 1);
         assert!(!dir.join("stem-1.bin").exists());
         assert!(!dir.join("stem-1.pin").exists());
         assert!(!dir.join("stem-1.del").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A row the database refuses to drop keeps its files: deleting the bytes
+    /// under a living row would leave an entry that lists but cannot paste,
+    /// the one broken shape the bytes-before-pointer rule exists to prevent.
+    /// The failure is provoked by putting a directory where the database
+    /// should be — the open fails at once, no three-second busy wait.
+    #[test]
+    fn a_failed_row_delete_leaves_its_files_alone() {
+        let dir = scratch("delete-failure");
+        let db = dir.join(DB_NAME);
+        fs::create_dir(&db).unwrap();
+
+        let row = record("stem-1", Some("hello"), Some("stem-1.bin"));
+        let item = ClipItem::from_record(
+            &row,
+            db.clone(),
+            "stem-1".to_string(),
+            false,
+            "mach1",
+            crate::settings::current_year(),
+        );
+        fs::write(dir.join("stem-1.bin"), b"blob").unwrap();
+
+        let removed = delete_clips(&[item]);
+        assert!(removed.is_empty(), "the row did not go, so nothing did");
+        assert!(dir.join("stem-1.bin").exists(), "the blob must survive");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A database that left the folder without the watcher noticing must not
+    /// keep haunting the list: the rescan's walk answers what exists, and the
+    /// rest of the index goes. An unreadable root is the boundary — that must
+    /// read as "cannot see", not "nothing there".
+    #[test]
+    fn rescan_drops_databases_that_left_the_folder() {
+        let (store, dir) = cleanup_store("rescan-prune");
+        plant(
+            &dir,
+            "mach1",
+            &clip_row("s1", settings::now_ms() - DAY, "mach1", "text", "h1", None),
+        );
+        store.rescan();
+        assert_eq!(store.query(None, "", &ChipFilter::default(), 10).len(), 1);
+
+        // The root itself gone — sync client signed out, drive asleep: the
+        // walk saw nothing, and wiping the index then would read "cannot
+        // see" as "history deleted". The previous snapshot stays.
+        let _ = fs::remove_dir_all(dir.join("sync"));
+        store.rescan();
+        assert_eq!(store.query(None, "", &ChipFilter::default(), 10).len(), 1);
+
+        // The root is back but the month folder is not: the walk's answer is
+        // authoritative, and the row its database held goes.
+        fs::create_dir_all(dir.join("sync").join("mach1")).unwrap();
+        store.rescan();
+        assert!(store.query(None, "", &ChipFilter::default(), 10).is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
