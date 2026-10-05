@@ -1057,11 +1057,10 @@ fn fill_list() {
         }
 
         if summaries.is_empty() {
-            // A blank list reads as a broken one; the hint takes the row that
-            // would have been the newest, right above the search box.
-            // `draw_item` draws it grey off the empty `items`, and every
-            // action on it — commit, delete, edit — no-ops for the same
-            // reason: there is no item behind the row.
+            // A blank list reads as a broken one, so the empty area still gets
+            // one row: the hint, drawn grey by `draw_item` off the empty
+            // `items` — and every action on it, commit / delete / edit, no-ops
+            // for the same reason: there is no item behind the row.
             let text = win::wide(HINT_WHEN_EMPTY);
             win::SendMessageW(p.list, win::LB_ADDSTRING, 0, text.as_ptr() as LPARAM);
         }
@@ -2449,6 +2448,7 @@ fn finish_thumbs() {
     {
         let mut thumbs = p.thumbs.lock().unwrap_or_else(|e| e.into_inner());
         let mut order = p.thumb_order.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = p.thumb_pending.lock().unwrap_or_else(|e| e.into_inner());
 
         for result in results {
             let bmp = dib_from_rgba(result.width, result.height, &result.rgba);
@@ -2472,6 +2472,10 @@ fn finish_thumbs() {
                     win::DeleteObject(old.bmp as win::HGDIOBJ);
                 }
             }
+            // The ask is answered: clear it so an evicted or re-decoded stem
+            // may ask again later. A failed bitmap keeps its pending entry —
+            // every future ask would fail the same way.
+            pending.remove(&result.stem);
             order.push_back(result.stem);
 
             while order.len() > THUMB_CACHE_CAP {
@@ -2538,9 +2542,9 @@ fn dib_from_rgba(width: usize, height: usize, rgba: &[u8]) -> win::HBITMAP {
 /// How wide each tab is drawn, left to right: its label measured in the strip's
 /// own font plus a third of a tab of breathing room on each side. Measured per
 /// repaint rather than cached — there are two or three tabs, and the paint and
-/// the hit test must agree on the rects to the pixel.
-fn tab_widths(p: &Popup, scale: f64) -> Vec<i32> {
-    let tabs = p.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+/// the hit test must agree on the rects to the pixel. Takes the caller's own
+/// strip snapshot, so the labels and their widths cannot disagree.
+fn tab_widths(p: &Popup, tabs: &[MachineTab], scale: f64) -> Vec<i32> {
     let font = p.font_main.load(Ordering::SeqCst);
     let pad = scaled(TAB_WIDTH, scale) / 3;
 
@@ -2591,7 +2595,7 @@ fn paint(hwnd: HWND) {
 
     let selected = p.tab.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let tabs = p.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let widths = tab_widths(p, scale);
+    let widths = tab_widths(p, &tabs, scale);
     let font = p.font_main.load(Ordering::SeqCst);
 
     unsafe {
@@ -2705,7 +2709,7 @@ fn tab_click(lparam: LPARAM) -> bool {
     // The same rects `paint` draws, walked linearly: tab widths are measured,
     // so there is no fixed step to divide by.
     let tabs = p.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let widths = tab_widths(p, scale);
+    let widths = tab_widths(p, &tabs, scale);
     let mut left = scaled(PAD, scale);
 
     for (tab, width) in tabs.iter().zip(&widths) {
