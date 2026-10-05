@@ -10,10 +10,11 @@
 //! 显隐必须回到创建它的线程去做,所以事件从不对 UI 窗口直接动手。
 
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 
-use crate::clip::ClipPayload;
-use crate::clipboard;
+use crate::clip::{ClipContext, ClipPayload};
+use crate::clipboard::{self, Capture};
 use crate::log;
 use crate::settings;
 use crate::tray;
@@ -229,41 +230,104 @@ extern "system" fn wnd_proc(
 fn handle_clipboard_update() {
     let sequence = win::clipboard_sequence_number();
     if LAST_CLIPBOARD_SEQUENCE.swap(sequence, Ordering::SeqCst) != sequence {
-        if let Some(payload) = clipboard::read() {
-            let description = match &payload {
-                ClipPayload::Text(text) => format!("text, {} chars", text.chars().count()),
-                ClipPayload::Files(paths) => format!("{} file(s)", paths.len()),
-                ClipPayload::Image(png) => format!("image, {} PNG bytes", png.len()),
-            };
-            if capture_enabled(&payload) {
-                log::info(&format!("captured {description}"));
-                if let Some(store) = crate::store() {
-                    store.enqueue(payload, clipboard::capture_context());
-                }
-            } else {
-                log::info(&format!("ignored {description} (switched off)"));
+        let Some(capture) = clipboard::read() else {
+            return;
+        };
+        // 来源窗口在捕获那一刻读,也就是这条线程上:等转换线程跑完,用户
+        // 早移开了,前台已经是别家窗口。
+        let context = clipboard::capture_context();
+
+        match capture_tx() {
+            Some(tx) => {
+                let _ = tx.send((capture, context));
             }
+            None => log::warn("capture worker unavailable; this copy was skipped"),
         }
     }
 }
 
-/// The capture switches are consulted at capture time rather than at startup,
-/// which is what lets the settings window turn them off and have it take effect
-/// on the next copy instead of the next launch.
-fn capture_enabled(payload: &ClipPayload) -> bool {
+/// 图片捕获的慢半段(像素解码 + PNG 编码)住在这条线程上。
+///
+/// 平台线程只趁剪贴板开着把 DIB 字节拷出来——那是必须当场做的,句柄只在
+/// 剪贴板打开期间有效。之后的解码加编码动辄秒级,一张 4K 截图就能把热键、
+/// 托盘消息全吊在后面,所以挪到这里。单条线程串行消化,先后顺序与捕获
+/// 顺序一致,不重排。
+fn capture_tx() -> Option<&'static mpsc::Sender<(Capture, ClipContext)>> {
+    static TX: OnceLock<Option<mpsc::Sender<(Capture, ClipContext)>>> = OnceLock::new();
+
+    TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<(Capture, ClipContext)>();
+
+        let spawned = std::thread::Builder::new()
+            .name("clipplus-capture".into())
+            .spawn(move || {
+                while let Ok((capture, context)) = rx.recv() {
+                    handle_capture(capture, context);
+                }
+            });
+
+        match spawned {
+            Ok(_) => Some(tx),
+            Err(err) => {
+                log::error(&format!("capture worker could not be spawned: {err}"));
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// 捕获的收尾,在捕获线程上跑:开关核查 → 图片转 PNG → 进 writer 队列。
+fn handle_capture(capture: Capture, context: ClipContext) {
+    if !capture_enabled(&capture) {
+        log::info(&format!("ignored {} (switched off)", capture.description()));
+        return;
+    }
+
+    let payload = match capture {
+        Capture::Ready(payload) => payload,
+        Capture::RawDib(dib) => {
+            let Some(png) = clipboard::dib_to_png(&dib) else {
+                // 没转出来就是这条没捕获成,不是丢已存的记录;dib_to_png 记了原因。
+                return;
+            };
+            ClipPayload::Image(png)
+        }
+    };
+
+    log::info(&format!(
+        "captured {}",
+        clipboard::payload_description(&payload)
+    ));
+    if let Some(store) = crate::store() {
+        store.enqueue(payload, context);
+    }
+}
+
+/// The capture switches are consulted before the slow half of an image capture
+/// runs, which is what lets the settings window turn a kind off and have it
+/// cost nothing at all on the next copy.
+fn capture_enabled(capture: &Capture) -> bool {
     let Some(settings) = crate::current_settings() else {
         return true;
     };
 
-    let enabled = match payload {
-        ClipPayload::Text(_) => settings.capture_text,
-        ClipPayload::Image(_) => settings.capture_images,
-        ClipPayload::Files(_) => settings.capture_files,
+    let (enabled, needs_blob) = match capture {
+        Capture::Ready(payload) => (
+            match payload {
+                ClipPayload::Text(_) => settings.capture_text,
+                ClipPayload::Files(_) => settings.capture_files,
+                ClipPayload::Image(_) => settings.capture_images,
+            },
+            crate::store::needs_blob(payload, &settings),
+        ),
+        // 一张还没解码的 DIB 就是图片:整条要 .bin,跟着图片开关和 WriteBlobs 走。
+        Capture::RawDib(_) => (settings.capture_images, true),
     };
 
     // A clip that would need a `.bin` sibling is dropped whole when blobs are
     // off, rather than kept as a stub a search cannot see past.
-    enabled && (settings.write_blobs || !crate::store::needs_blob(payload, &settings))
+    enabled && (settings.write_blobs || !needs_blob)
 }
 
 /// (Re)registers the global hotkey from the current settings.

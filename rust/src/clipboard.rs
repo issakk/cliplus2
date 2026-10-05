@@ -1,7 +1,10 @@
 //! Reading and writing the Windows clipboard.
 //!
-//! Everything here runs on the window thread, because the clipboard is owned by
-//! the thread that opened it. Retries matter: any application holding the
+//! The clipboard is owned by the thread that opened it, so the open, the read
+//! and the write stay on the platform thread. The one exception is
+//! `dib_to_png`: only the byte copy needs the clipboard open, so an image's
+//! pixel decode and PNG encode run on a worker instead of the thread that also
+//! answers the global hotkey. Retries matter: any application holding the
 //! clipboard open makes `OpenClipboard` fail transiently, and a single failed
 //! attempt must never silently lose a copy.
 
@@ -19,13 +22,48 @@ const CF_DIBV5: u32 = 17;
 const OPEN_RETRIES: u32 = 6;
 const RETRY_DELAY: Duration = Duration::from_millis(20);
 
+/// What one clipboard read turned into.
+///
+/// Text and file lists are final payloads. An image is only *copied* here:
+/// the DIB bytes leave the clipboard while it is held open, and the slow
+/// conversion to PNG runs later on the capture worker — see `dib_to_png`.
+pub enum Capture {
+    Ready(ClipPayload),
+    /// Raw `CF_DIB` / `CF_DIBV5` bytes, waiting for `dib_to_png`.
+    RawDib(Vec<u8>),
+}
+
+impl Capture {
+    /// The log's name for what was read, before any conversion: a raw DIB
+    /// reports the bytes it holds rather than the PNG it may yet become.
+    pub fn description(&self) -> String {
+        match self {
+            Capture::Ready(payload) => payload_description(payload),
+            Capture::RawDib(dib) => format!("image, {} DIB bytes", dib.len()),
+        }
+    }
+}
+
+/// The log's name for a finished payload, as read off the clipboard.
+pub fn payload_description(payload: &ClipPayload) -> String {
+    match payload {
+        ClipPayload::Text(text) => format!("text, {} chars", text.chars().count()),
+        ClipPayload::Files(paths) => format!("{} file(s)", paths.len()),
+        ClipPayload::Image(png) => format!("image, {} PNG bytes", png.len()),
+    }
+}
+
 /// Reads whatever is currently on the clipboard.
 ///
 /// Priority: files, then text, then image. Explorer puts
 /// both a file drop and a text form on the clipboard, and the file drop is the
 /// more useful of the two; Excel puts both text and an image, and text is what
 /// people expect to paste back.
-pub fn read() -> Option<ClipPayload> {
+///
+/// The image comes back raw. This function runs on the platform thread, which
+/// also serves the global hotkey, so the decode-and-encode half of an image
+/// capture goes to `dib_to_png` on the capture worker instead.
+pub fn read() -> Option<Capture> {
     for attempt in 0..OPEN_RETRIES {
         if attempt > 0 {
             std::thread::sleep(RETRY_DELAY);
@@ -58,22 +96,25 @@ pub fn capture_context() -> ClipContext {
 }
 
 /// Caller must already hold the clipboard open.
-fn read_locked() -> Option<ClipPayload> {
+fn read_locked() -> Option<Capture> {
     if let Some(paths) = read_file_drop() {
         if !paths.is_empty() {
-            return Some(ClipPayload::Files(paths));
+            return Some(Capture::Ready(ClipPayload::Files(paths)));
         }
     }
 
     if let Some(text) = read_text() {
         if !text.is_empty() {
-            return Some(ClipPayload::Text(text));
+            return Some(Capture::Ready(ClipPayload::Text(text)));
         }
     }
 
-    if let Some(png) = read_image() {
-        if !png.is_empty() {
-            return Some(ClipPayload::Image(png));
+    // The image stays raw: only the byte copy needs the clipboard open, and
+    // the decode/encode must not run on the thread that answers the hotkey
+    // (see `dib_to_png`).
+    if let Some(dib) = read_dib() {
+        if !dib.is_empty() {
+            return Some(Capture::RawDib(dib));
         }
     }
 
@@ -148,7 +189,10 @@ fn read_file_drop() -> Option<Vec<String>> {
     Some(paths)
 }
 
-fn read_image() -> Option<Vec<u8>> {
+/// The raw DIB bytes, copied out while the clipboard is held open — the only
+/// window in which `GetClipboardData`'s handle is valid. Converting them is
+/// `dib_to_png`'s job, off this thread.
+fn read_dib() -> Option<Vec<u8>> {
     // CF_DIBV5 is the richer format; fall back to CF_DIB for sources that only
     // publish the older one.
     let handle = if available(CF_DIBV5) {
@@ -159,13 +203,20 @@ fn read_image() -> Option<Vec<u8>> {
         return None;
     };
 
-    let bytes = read_global(handle)?;
-    let image = match decode_dib(&bytes) {
+    read_global(handle)
+}
+
+/// DIB bytes → PNG: the slow half of an image capture, pixel decode and PNG
+/// encode together. Deliberately called off the thread that read the
+/// clipboard — a 4K screenshot costs this a second or two, and that thread
+/// also serves the global hotkey and the tray.
+pub fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
+    let image = match decode_dib(dib) {
         Some(image) => image,
         None => {
             log::warn(&format!(
                 "unsupported DIB layout ({} bytes); image not captured",
-                bytes.len()
+                dib.len()
             ));
             return None;
         }
@@ -252,8 +303,11 @@ pub fn decode_dib(bytes: &[u8]) -> Option<DecodedImage> {
     let top_down = raw_height < 0;
     let height = raw_height.unsigned_abs();
 
-    // Guard against a corrupt header asking for a gigantic allocation.
-    if width > 32_768 || height > 32_768 {
+    // Guard against a corrupt header asking for a gigantic allocation. The
+    // `needed` check below already ties the allocation to the bytes actually
+    // present, so this only keeps the absurd off the table: 16384² RGBA is a
+    // gigabyte, and no real clipboard image comes close.
+    if width > 16_384 || height > 16_384 {
         return None;
     }
 
@@ -547,4 +601,59 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
         writer.write_image_data(rgba).map_err(|e| e.to_string())?;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The capture worker's whole job, pinned end to end: a hand-built 32bpp
+    /// bottom-up DIB goes through `dib_to_png` and comes back as the same
+    /// pixels, top-down. Getting the row order backwards is exactly the kind
+    /// of mistake that looks fine on some screens and mirrored on others.
+    #[test]
+    fn a_dib_converts_to_a_png_of_the_same_pixels() {
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        dib.extend_from_slice(&1i32.to_le_bytes()); // width
+        dib.extend_from_slice(&2i32.to_le_bytes()); // height, positive = bottom-up
+        dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+        dib.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        dib.extend_from_slice(&8u32.to_le_bytes()); // biSizeImage
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+        // Rows bottom-up, BGRX in memory: the first row is the bottom one.
+        dib.extend_from_slice(&[255, 0, 0, 255]); // bottom row: blue
+        dib.extend_from_slice(&[0, 0, 255, 255]); // top row: red
+
+        let png = dib_to_png(&dib).expect("a 32bpp DIB converts");
+        let (width, height, rgba) = crate::thumb::decode_png_rgba(&png).expect("png decodes");
+        assert_eq!((width, height), (1, 2));
+        // Top-down RGBA out: red first, blue second.
+        assert_eq!(&rgba[..8], &[255, 0, 0, 255, 0, 0, 255, 255]);
+    }
+
+    /// A header claiming dimensions no real clipboard image has is refused
+    /// before the RGBA buffer is allocated. The header is complete enough to
+    /// pass the earlier layout checks, so the refusal is really the cap.
+    #[test]
+    fn an_absurd_dib_is_refused() {
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        dib.extend_from_slice(&20_000i32.to_le_bytes()); // width past the cap
+        dib.extend_from_slice(&1i32.to_le_bytes()); // height
+        dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+        dib.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biSizeImage
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+
+        assert!(dib_to_png(&dib).is_none());
+    }
 }
