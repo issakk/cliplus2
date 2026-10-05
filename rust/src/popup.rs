@@ -301,6 +301,7 @@ enum HydrateAction {
 
 /// One decoded thumbnail as the row will draw it: the GDI bitmap plus the
 /// pixel size to fit the square around.
+#[derive(Clone, Copy)]
 struct ThumbEntry {
     bmp: win::HBITMAP,
     width: i32,
@@ -652,7 +653,7 @@ fn hide_after_hotkey_release() {
     }
 
     p.hotkey_hide_deadline.store(
-        crate::settings::now_ms() + HOTKEY_RELEASE_WAIT_MS,
+        (crate::settings::now_ms() + HOTKEY_RELEASE_WAIT_MS) as isize,
         Ordering::SeqCst,
     );
     unsafe {
@@ -787,7 +788,8 @@ pub fn show() {
          foreground={foreground} active={active}"
     ));
     p.visible.store(true, Ordering::SeqCst);
-    p.shown_at.store(crate::settings::now_ms(), Ordering::SeqCst);
+    p.shown_at
+        .store(crate::settings::now_ms() as isize, Ordering::SeqCst);
 }
 
 pub fn hide() {
@@ -2095,7 +2097,7 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                 crate::current_settings().and_then(|s| crate::settings::parse_hotkey(&s.hotkey));
             let held = hotkey.is_some_and(hotkey_keys_held);
 
-            if !held || crate::settings::now_ms() >= deadline {
+            if !held || crate::settings::now_ms() >= deadline as i64 {
                 p.hotkey_hide_deadline.store(0, Ordering::SeqCst);
                 unsafe {
                     win::KillTimer(hwnd, HOTKEY_TIMER_ID);
@@ -2115,7 +2117,7 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             let modal_open = popup().is_some_and(|p| p.modal_open.load(Ordering::SeqCst));
             let gracing = popup().is_some_and(|p| {
                 let shown = p.shown_at.load(Ordering::SeqCst);
-                shown != 0 && crate::settings::now_ms() - shown < SHOW_GRACE_MS
+                shown != 0 && crate::settings::now_ms() - shown as i64 < SHOW_GRACE_MS
             });
             if inactive && !modal_open && !gracing {
                 hide();
@@ -2269,13 +2271,14 @@ fn draw_item(lparam: LPARAM) {
     let Some(summary) = summary else {
         let mut hint = item.rc_item;
         hint.left += scaled(10, current_scale());
-        let previous = win::SelectObject(item.hdc, p.font_meta.load(Ordering::SeqCst));
-        win::SetTextColor(item.hdc, COLOR_META);
-        let text = win::wide(HINT_WHEN_EMPTY);
+        let previous =
+            unsafe { win::SelectObject(item.hdc, p.font_meta.load(Ordering::SeqCst)) };
         unsafe {
+            win::SetTextColor(item.hdc, COLOR_META);
+            let text = win::wide(HINT_WHEN_EMPTY);
             win::DrawTextW(item.hdc, text.as_ptr(), -1, &mut hint, text_flags());
+            win::SelectObject(item.hdc, previous);
         }
-        win::SelectObject(item.hdc, previous);
         return;
     };
 

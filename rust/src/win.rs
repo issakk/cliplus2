@@ -14,7 +14,6 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 // --------------------------------------------------------------------- aliases
