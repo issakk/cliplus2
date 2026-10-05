@@ -347,8 +347,34 @@ impl Index {
 
     /// Drops every entry that came out of one container. Used when a database
     /// changed (its rows are re-read from scratch) or disappeared.
+    ///
+    /// One pass over the index rather than a `forget` per stem: this runs again for
+    /// every change to a database, and each of those scans the whole index.
+    ///
+    /// Deliberately NOT delegated to `retain_dbs`: the two are inverses, and that
+    /// is the trap. Here `db_path` names what *goes* and everything else stays;
+    /// there the set names what *stays*. Delegating this one wiped every other
+    /// database out of the index on each reload.
     pub fn forget_db(&mut self, db_path: &std::path::Path) {
-        self.retain_dbs(&std::iter::once(db_path.to_path_buf()).collect());
+        // Taken rather than borrowed, because the stem and hash sets are updated
+        // from inside the loop and holding a borrow of the items would not allow it.
+        let existing = std::mem::take(&mut self.items);
+        let mut kept = Vec::with_capacity(existing.len());
+        let mut dropped: HashSet<String> = HashSet::new();
+
+        for item in existing {
+            if item.db_path == db_path {
+                self.stems.remove(&item.stem);
+                if !item.hash.is_empty() {
+                    dropped.insert(item.hash);
+                }
+            } else {
+                kept.push(item);
+            }
+        }
+
+        self.items = kept;
+        self.forget_hashes(&dropped);
     }
 
     pub fn set_pinned(&mut self, stem: &str, pinned: bool) -> bool {
@@ -1286,6 +1312,55 @@ mod tests {
         assert_eq!(index.retain_dbs(&HashSet::<PathBuf>::new()), 2);
         assert!(index.query(None, None, &ChipFilter::default(), 10).is_empty());
         assert!(!index.has_hash("hash-a"));
+    }
+
+    /// `forget_db` is the inverse of `retain_dbs`: one path names what goes,
+    /// every other database stays. Pinned here because delegating it to
+    /// `retain_dbs` once inverted exactly that — each reload then wiped all
+    /// the *other* databases out of the index, and the store tests caught it.
+    #[test]
+    fn forget_db_takes_one_database_out_and_leaves_the_rest() {
+        let mut index = Index::default();
+        index.insert(item("a", "local", 300));
+
+        let record = ClipRecord {
+            id: "z".to_string(),
+            at: 400,
+            machine: "local".to_string(),
+            kind: "text".to_string(),
+            hash: "hash-z".to_string(),
+            text: Some("clip z".to_string()),
+            length: 6,
+            blob: None,
+            app: String::new(),
+            title: String::new(),
+        };
+        index.insert(ClipItem::from_record(
+            &record,
+            PathBuf::from("C:/sync/other.db"),
+            "z".to_string(),
+            false,
+            "local",
+            crate::settings::current_year(),
+        ));
+
+        // One database out, the other untouched, stems and hashes both ways.
+        index.forget_db(std::path::Path::new("C:/sync/clips.db"));
+        let listed: Vec<String> = index
+            .query(None, None, &ChipFilter::default(), 10)
+            .into_iter()
+            .map(|row| row.stem)
+            .collect();
+        assert_eq!(listed, vec!["z"]);
+        assert!(index.has_hash("hash-z"));
+        assert!(!index.has_hash("hash-a"));
+
+        // The reload path this serves: forget-then-insert brings the rows back.
+        index.insert(item("a", "local", 300));
+        assert_eq!(
+            index.query(None, None, &ChipFilter::default(), 10).len(),
+            2
+        );
     }
 
     /// A row is one line tall, so the preview is the only place that can say a clip
