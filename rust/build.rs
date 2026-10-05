@@ -13,6 +13,14 @@ fn main() {
         return;
     }
 
+    // src/win.rs lays the Win32 structs out by hand, and the ABI those layouts
+    // are counted against is exercised by the one target CI ships: x64. A
+    // 32-bit build would link and run until some INPUT or NOTIFYICONDATAW
+    // landed wrong; refuse it instead of shipping something nobody has run.
+    if std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() != Ok("64") {
+        panic!("ClipPlus builds for 64-bit Windows targets only: the hand-declared Win32 bindings in src/win.rs are counted for x64");
+    }
+
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
     let icon = std::path::Path::new(&manifest)
         .join("..")

@@ -177,7 +177,13 @@ impl Settings {
 
     pub fn save(&self) -> std::io::Result<()> {
         let text = serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string());
-        fs::write(self.app_dir.join(SETTINGS_FILE), text)
+        // Write-then-rename in the same directory: the rename is atomic, so a
+        // crash mid-write leaves the previous settings intact instead of a
+        // half JSON that loads as defaults. The storage layer runs on the same
+        // rule — bytes first, pointer second.
+        let temp = self.app_dir.join(format!("{SETTINGS_FILE}.tmp"));
+        fs::write(&temp, text)?;
+        fs::rename(&temp, self.app_dir.join(SETTINGS_FILE))
     }
 
     /// This machine's private sub-tree. Only this process ever writes here.

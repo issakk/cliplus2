@@ -98,9 +98,17 @@ pub fn paste_back(target: isize, payload: &ClipPayload) {
 
     // UIPI lets a process inject input only into windows of its own elevation
     // or lower: at an elevated target the strokes are dropped, or land wherever
-    // the system puts them instead. Say so rather than firing blanks.
-    if receiver != 0 {
-        let root = win::root_window(receiver);
+    // the system puts them instead. Say so rather than firing blanks. The
+    // window to check is the one the stroke will land in — the receiver that
+    // surfaced, or, when none did (the popup was opened with no captured
+    // target and focus never settled), whatever holds the input now.
+    let checked = if receiver != 0 {
+        receiver
+    } else {
+        unsafe { win::GetForegroundWindow() }
+    };
+    if checked != 0 {
+        let root = win::root_window(checked);
         if paste_blocked_by_uipi(win::own_process_is_elevated(), win::process_is_elevated(root)) {
             log::warn(
                 "paste target runs as administrator while ClipPlus does not; \
