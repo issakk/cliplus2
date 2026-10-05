@@ -2553,7 +2553,7 @@ fn tab_widths(p: &Popup, tabs: &[MachineTab], scale: f64) -> Vec<i32> {
         let previous = win::SelectObject(dc, font);
         let mut widths = Vec::with_capacity(tabs.len());
 
-        for tab in &tabs {
+        for tab in tabs {
             let text = win::wide(&tab.label);
             let mut size = win::SIZE::default();
             if win::GetTextExtentPoint32W(dc, text.as_ptr(), text.len() as i32, &mut size) != 0
