@@ -310,20 +310,9 @@ fn cancel() {
     notify_finished(None);
 }
 
-/// 编辑结束的去处。打开编辑器的 UI 在 `set_finish_callback` 里登记回调,
-/// 默认(没有 UI 登记)直接回弹窗。
-static FINISH_CALLBACK: Mutex<Option<Box<dyn Fn(Option<String>) + Send>>> = Mutex::new(None);
-
-pub fn set_finish_callback(callback: Box<dyn Fn(Option<String>) + Send>) {
-    *FINISH_CALLBACK.lock().unwrap_or_else(|e| e.into_inner()) = Some(callback);
-}
-
+/// 编辑结束的去处:直接回弹窗,由它收尾(释放 modal 占位、刷新列表、抢回焦点)。
 fn notify_finished(saved: Option<String>) {
-    let callback = FINISH_CALLBACK.lock().unwrap_or_else(|e| e.into_inner());
-    match callback.as_ref() {
-        Some(callback) => callback(saved),
-        None => crate::popup::edit_finished(saved),
-    }
+    crate::popup::edit_finished(saved)
 }
 
 /// Places every control for the scale and hands them the matching font.
