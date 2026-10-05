@@ -324,7 +324,8 @@ impl Index {
         // Taken rather than borrowed, because the stem and hash sets are updated
         // from inside the loop and holding a borrow of the items would not allow it.
         let existing = std::mem::take(&mut self.items);
-        let mut kept = Vec::with_capacity(existing.len());
+        let total = existing.len();
+        let mut kept = Vec::with_capacity(total);
         let mut dropped: HashSet<String> = HashSet::new();
 
         for item in existing {
@@ -338,7 +339,7 @@ impl Index {
             }
         }
 
-        let count = existing.len() - kept.len();
+        let count = total - kept.len();
         self.items = kept;
         self.forget_hashes(&dropped);
         count
