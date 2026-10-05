@@ -155,7 +155,7 @@ fn handle_command(command: i32) {
     // 0 means the menu was dismissed without a choice.
     match command {
         CMD_OPEN_FOLDER => open(SYNC_ROOT.get().map(String::as_str)),
-        // 走平台事件而不是直接碰窗口:对话框归主线程的 egui 循环所有。
+        // 走平台事件而不是直接碰窗口:对话框归主线程所有。
         CMD_SETTINGS => platform::emit(PlatformEvent::TraySettings),
         CMD_OPEN_SETTINGS_FILE => open(APP_DIR.get().map(String::as_str)),
         CMD_AUTOSTART => {

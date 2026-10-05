@@ -11,7 +11,9 @@ path = "src/main.rs"
 
 # Win32 is hand-declared in src/win.rs rather than pulled from windows-sys.
 # Those declarations are already known to work and are short enough to read; a
-# dependency would mean guessing at version and feature names instead.
+# dependency would mean guessing at version and feature names instead. The UI
+# is Win32 as well — a GDI owner-draw popup plus three system-control dialogs —
+# so there is no GUI framework in the dependency list at all.
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,13 +23,6 @@ notify = "8"
 # `bundled` compiles SQLite from source at build time, so the exe does not
 # depend on a sqlite3.dll the user would have to have.
 rusqlite = { version = "0.40", features = ["bundled"] }
-
-# The egui shell. glow is the smallest GPU backend; the Microsoft YaHei font
-# loads from the system at runtime rather than being packed into the exe.
-# The popup and the three secondary dialogs (settings/cleanup/edit) are all
-# egui viewports in one loop — see src/dialogs.rs.
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
-egui = "0.36"
 
 # The icon resource needs the platform resource compiler; this crate shells out
 # to rc.exe, which ships with the MSVC toolchain the build already requires.

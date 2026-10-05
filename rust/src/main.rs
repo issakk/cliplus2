@@ -1,16 +1,18 @@
 #![windows_subsystem = "windows"]
 
 mod autostart;
+mod cleanup_window;
 mod clip;
 mod clipboard;
-mod dialogs;
-mod egui_app;
+mod edit_window;
 mod index;
 mod log;
 mod paste;
 mod platform;
+mod popup;
 mod tray;
 mod settings;
+mod settings_window;
 mod store;
 mod thumb;
 mod win;
@@ -81,13 +83,49 @@ fn main() {
     // every filesystem event, and `let _ =` would drop it right here.
     let _watcher = store.start_watcher();
 
-    // Dark-mode hack for the tray menu, which is still a Win32 `TrackPopupMenu`;
-    // the egui windows paint their own dark theme and need none of it. A window
-    // keeps the theme it was made with, so this has to come before any window.
+    // Before the first control is created: a window keeps the theme it was made
+    // with, so this has to come first to matter. Undocumented and best-effort,
+    // see `win::allow_dark_mode` — the popup's scrollbar is the visible part.
     win::allow_dark_mode();
+
+    // Built once at startup so the first hotkey press has no window-creation
+    // latency in front of it.
+    if !popup::create(Arc::clone(&store)) {
+        log::error("popup could not be created; the hotkey will do nothing");
+    }
+
     win::set_per_monitor_dpi_aware();
 
-    egui_app::run(store);
+    if !settings_window::create() {
+        log::error("settings window could not be created; the tray entry will do nothing");
+    }
+
+    if !cleanup_window::create() {
+        log::error("cleanup window could not be created; the settings 清理 button will do nothing");
+    }
+
+    if !edit_window::create() {
+        log::error("edit window could not be created; the row menu 编辑 entry will do nothing");
+    }
+
+    // Hotkey, clipboard capture and the tray live on the platform thread: the
+    // main thread only runs the UI windows and pumps their messages. The sink
+    // turns platform events into window messages for the windows above, which
+    // keeps every window touched from the thread that created it.
+    platform::start(Box::new(|event| match event {
+        platform::PlatformEvent::Hotkey | platform::PlatformEvent::TrayToggle => {
+            popup::request_toggle();
+        }
+        platform::PlatformEvent::TraySettings => {
+            settings_window::request_show();
+        }
+        platform::PlatformEvent::Quit => platform::request_quit(),
+    }));
+
+    log::info("entering message loop");
+    win::run_message_loop();
+
+    platform::shutdown();
     log::info("=== ClipPlus stopping ===");
 }
 
