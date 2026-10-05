@@ -2116,8 +2116,8 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             let inactive = (wparam & 0xFFFF) == 0;
             let modal_open = popup().is_some_and(|p| p.modal_open.load(Ordering::SeqCst));
             let gracing = popup().is_some_and(|p| {
-                let shown = p.shown_at.load(Ordering::SeqCst);
-                shown != 0 && crate::settings::now_ms() - shown as i64 < SHOW_GRACE_MS
+                let shown = p.shown_at.load(Ordering::SeqCst) as i64;
+                shown != 0 && crate::settings::now_ms() - shown < SHOW_GRACE_MS
             });
             if inactive && !modal_open && !gracing {
                 hide();
