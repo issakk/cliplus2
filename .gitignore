@@ -11,3 +11,7 @@ desktop.ini
 
 ## Local scratch
 *.log
+
+## Agent workspace
+.zcode/
+skills-lock.json
