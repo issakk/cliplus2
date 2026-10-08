@@ -1263,8 +1263,13 @@ pub fn foreground_context() -> (String, String) {
     (process_name_of(hwnd), title)
 }
 
-/// The executable that owns `hwnd`, by name only.
-fn process_name_of(hwnd: HWND) -> String {
+/// The executable that owns `hwnd`, by name only — the same name a capture
+/// stores, and what the paste log names a window by.
+///
+/// Read-only, works on other processes' windows, and empty when the answer is
+/// unavailable: a capture stores whatever comes back, and the paste log spells
+/// an empty one `?`.
+pub fn process_name_of(hwnd: HWND) -> String {
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
     if pid == 0 {

@@ -90,6 +90,10 @@ pub fn paste_back(target: isize, payload: &ClipPayload) {
         receiver = target;
     }
 
+    // How long the focus took to come back: the part of a paste the user waits
+    // on, and the number that says whether the window was enough.
+    let settled = started.elapsed();
+
     // A floor: the foreground switch landing does not mean the target's focused
     // control is ready to receive the keystroke yet.
     std::thread::sleep(Duration::from_millis(10));
@@ -118,9 +122,21 @@ pub fn paste_back(target: isize, payload: &ClipPayload) {
 
     let shift_insert = receiver != 0 && is_console_window(receiver);
     win::send_paste_keystroke(shift_insert);
+
+    // Which window the paste actually landed in, and which chord carried it, is
+    // the one thing no other line records — and the first thing an "it pasted
+    // twice" report needs: the process and class on the receiving end say
+    // whether the app's own paste handling is at fault, and the chord says which
+    // of the two paths into it was taken. The recorded target rides along,
+    // because a paste that landed somewhere else entirely is what a missed
+    // capture looks like.
     log::info(&format!(
-        "paste-back took {} ms",
-        started.elapsed().as_millis()
+        "paste-back took {} ms: {} into {} (target {}, waited {} ms)",
+        started.elapsed().as_millis(),
+        if shift_insert { "Shift+Insert" } else { "Ctrl+V" },
+        describe_window(checked),
+        describe_window(target),
+        settled.as_millis(),
     ));
 }
 
@@ -164,6 +180,26 @@ fn is_console_window(hwnd: win::HWND) -> bool {
     false
 }
 
+/// One window named the way a paste log wants it: the executable, its class and
+/// the handle.
+///
+/// The handle is what makes two lines comparable — one app can have several
+/// windows, and a paste that landed in a different one is exactly what is being
+/// looked for. Zero is a real answer here (the popup was opened with nothing
+/// captured), so it is spelled out rather than left blank.
+fn describe_window(hwnd: win::HWND) -> String {
+    if hwnd == 0 {
+        return "no window".to_string();
+    }
+
+    let name = win::process_name_of(hwnd);
+    let class = win::window_class_name(hwnd);
+    let name = if name.is_empty() { "?" } else { name.as_str() };
+    let class = if class.is_empty() { "?" } else { class.as_str() };
+
+    format!("{name} [{class}] 0x{:x}", hwnd as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +221,13 @@ mod tests {
         // Prefix matching must not bleed into unrelated names.
         assert!(!is_console_class("PuttyNote"));
         assert!(!is_console_class("Minttyrus"));
+    }
+
+    /// Zero is not a failure here: a paste is legitimately logged with no
+    /// recorded target, and the line has to say so instead of naming nothing.
+    #[test]
+    fn an_unnamed_window_reads_as_one() {
+        assert_eq!(describe_window(0), "no window");
     }
 
     /// UIPI allows input only at equal or lower elevation, and an unreadable
